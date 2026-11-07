@@ -60,8 +60,12 @@ body {
 .app { max-width: 1280px; margin: 0 auto; padding: 18px 16px 40px; display: flex; flex-direction: column; gap: 14px; }
 
 /* ── 顶栏 ─────────────────────────────────────────────── */
+/* 顶栏：右侧按钮组不许被压缩，左侧品牌块允许收缩并用省略号收尾。
+   之前 .brand-text 没设 min-width:0，副标题又用 46vw 当上限 —— 结果副标题盒子
+   比 flex 实际分给它的宽度更宽，直接溢出到「实时」胶囊底下，胶囊还被挤成竖排。 */
 .topbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-.brand { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.brand { display: flex; align-items: center; gap: 12px; min-width: 0; flex: 1 1 auto; }
+.brand-text { min-width: 0; flex: 1 1 auto; }
 .logo {
   width: 40px; height: 40px; flex: 0 0 40px; border-radius: 12px; display: grid; place-items: center;
   color: #04121f; background: linear-gradient(135deg, var(--accent), var(--accent-2));
@@ -69,12 +73,17 @@ body {
 }
 .logo svg { width: 22px; height: 22px; }
 .brand-text h1 { margin: 0; font-size: 17px; letter-spacing: .3px; }
-.brand-text .sub { display: block; margin-top: 1px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 46vw; }
-.topbar-actions { display: flex; align-items: center; gap: 8px; }
+.brand-text h1 { white-space: nowrap; }
+.brand-text .sub {
+  display: block; margin-top: 1px; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; max-width: 100%;
+}
+.topbar-actions { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
 
 .pill {
   display: inline-flex; align-items: center; gap: 6px; padding: 5px 10px; border-radius: 999px;
   font-size: 12px; color: var(--text-dim); border: 1px solid var(--line); background: var(--card);
+  flex: 0 0 auto; white-space: nowrap;   /* 被压缩会把「实时」挤成竖排 */
 }
 .pill .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--text-mute); }
 .pill[data-state="live"] { color: var(--ok); }
@@ -95,7 +104,12 @@ body {
 .btn.tiny { padding: 3px 8px; font-size: 12px; border-radius: 8px; }
 .btn.danger { border-color: rgba(248, 113, 113, .5); color: var(--danger); }
 .btn.danger:hover { background: rgba(248, 113, 113, .12); }
-.icon-btn { width: 34px; height: 34px; padding: 0; display: grid; place-items: center; font-size: 15px; }
+.icon-btn {
+  width: 34px; height: 34px; padding: 0; display: grid; place-items: center;
+  font-size: 15px; line-height: 1; flex: 0 0 auto;
+}
+/* emoji 自带的内边距/字宽不一致，用固定行高和容器把三个图标的光学大小拉齐 */
+.icon-btn > span { display: block; font-size: 15px; line-height: 1; transform: translateY(0.5px); }
 
 /* ── KPI ──────────────────────────────────────────────── */
 .kpis { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 10px; }
@@ -441,7 +455,10 @@ select {
   .tree-table .tree-cell { max-width: none; }
   .svc-actions { flex-wrap: wrap; }
   .svc-desc { max-width: none; }
-  .brand-text .sub { max-width: 40vw; }
+  .brand-text .sub { max-width: 100%; font-size: 11px; }
+  .topbar { gap: 8px; }
+  .topbar-actions { gap: 6px; }
+  .icon-btn { width: 32px; height: 32px; }
   .procs-head { gap: 8px; }
   .search input { width: 100%; max-width: none; }
   .procs-tools { width: 100%; }

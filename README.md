@@ -2,6 +2,35 @@
 
 现代化的 Linux 进程与系统资源管理器，飞牛 fnOS (fnOS) 应用形态，Web 界面适配桌面与手机。
 
+## v0.6.1 更新
+
+### 修复：顶栏副标题被「实时」胶囊盖住，胶囊还被挤成竖排
+
+原因是 flex 收缩没配对：
+
+- `.brand-text` 少了 `min-width: 0`，副标题又用 `max-width: 46vw` 当上限 —— 盒子比
+  flex 实际分给它的宽度更宽，直接溢出到右侧控件底下；右侧控件在 DOM 里靠后，
+  于是画在文字上面，看起来就是「版本号被盖住」
+- 「实时」胶囊没有 `flex: 0 0 auto` / `white-space: nowrap`，宽度被挤到只剩两三个
+  字宽时，`实时` 就竖着排了下来，变成一个突兀的高条
+
+修法：
+- `.brand { flex: 1 1 auto }` + `.brand-text { min-width: 0; flex: 1 1 auto }`
+  + `.sub { max-width: 100%; overflow: hidden; text-overflow: ellipsis }`
+  —— 让副标题在「自己分到的宽度」里用省略号收尾，而不是溢出
+- `.topbar-actions { flex: 0 0 auto }`、`.pill { flex: 0 0 auto; white-space: nowrap }`
+  —— 按钮组和状态胶囊永远保持原尺寸
+- `.icon-btn > span` 统一定字号与行高，把 ❤ / ✉ / ☀ 三个 emoji 的光学大小拉齐
+- 移动端按钮间距 8px → 6px、图标按钮 34 → 32px，副标题字号降到 11px
+
+实测（Emulation 多宽度，量 rect 而不是靠眼看）
+| 宽度 | 副标题与按钮组重叠 | 胶囊尺寸 | 按钮间距 | 横向溢出 |
+|---|---|---|---|---|
+| 1150 | 0 px | 59×30（单行） | 8 px | 无 |
+| 900 | 0 px | 59×30 | 8 px | 无 |
+| 780 | 0 px | 59×30 | 8 px | 无 |
+| 375 | 0 px | 59×30 | 6 px | 无（副标题正常省略） |
+
 ## v0.6.0 更新
 
 ### 新增赞助与反馈入口
