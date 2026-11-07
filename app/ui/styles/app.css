@@ -155,7 +155,14 @@ body {
 .chart-card { padding: 12px 14px 10px; min-width: 0; }
 .card-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
 .card-head h2 { margin: 0; font-size: 13px; font-weight: 600; color: var(--text-dim); letter-spacing: .3px; }
-canvas { width: 100%; display: block; margin-top: 8px; }
+/* 图表用 SVG 而不是 canvas：canvas 在 fnOS WebView 里量不到宽度时缓冲区会被
+   锁成 1px（表现为「图表不显示」），SVG 靠 viewBox 自适应，不需要 JS 量尺寸。 */
+.chart {
+  width: 100%; height: 110px; display: block; margin-top: 8px; overflow: visible;
+}
+.chart .grid-line { stroke: var(--grid); stroke-width: 1; vector-effect: non-scaling-stroke; }
+.chart polyline { fill: none; stroke-width: 1.6; stroke-linejoin: round; stroke-linecap: round; vector-effect: non-scaling-stroke; }
+.chart polygon { stroke: none; }
 .cores { display: grid; grid-template-columns: repeat(auto-fit, minmax(112px, 1fr)); gap: 6px 12px; margin-top: 8px; }
 .core { display: flex; align-items: center; gap: 7px; min-width: 0; }
 .core-label { font-size: 11px; color: var(--text-mute); width: 40px; flex: 0 0 40px; }

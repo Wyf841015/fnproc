@@ -66,68 +66,70 @@ function applyTheme(t) {
   applyTheme(saved || (prefersLight ? 'light' : 'dark'));
 })();
 
-// ── 图表（原生 canvas，DPR 自适应）───────────────────────────────────────
-function makeChart(canvas, opts) {
-  const ctx = canvas.getContext('2d');
-  function resize() {
-    const dpr = window.devicePixelRatio || 1;
-    const w = canvas.clientWidth || 600;
-    const h = Number(canvas.getAttribute('height')) || 120;
-    canvas.width = Math.max(1, Math.floor(w * dpr));
-    canvas.height = Math.max(1, Math.floor(h * dpr));
-    canvas.style.height = h + 'px';
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  }
-  resize();
-  window.addEventListener('resize', resize);
+// ── 图表（SVG 实现）────────────────────────────────────────────────────
+// 为什么不用 canvas：fnOS WebView（CEF）里 canvas 自身 clientWidth 经常量到 0
+// （父级是 flex 项、布局晚于脚本时尤其明显）。一旦在 0 宽时把 canvas.width 定成 1，
+// 绘图缓冲区就被锁死在 1 个设备像素上，之后怎么画都只剩一条细线 —— 用户看到的就是
+// 「图表不显示」。SVG 靠 viewBox 自动缩放，完全不需要 JS 量尺寸，也天然适配 DPR，
+// 所以改成 SVG：一根 polyline 一条曲线，一个 polygon 做面积填充。
+const SVGNS = 'http://www.w3.org/2000/svg';
+const CH_W = 300;      // viewBox 宽度（虚拟坐标，与像素无关）
+const CH_H = 100;      // viewBox 高度
 
-  function line(series, color, maxV, fill) {
-    const w = canvas.clientWidth || 600, h = Number(canvas.getAttribute('height')) || 120;
-    const n = Math.max(2, series.length);
-    const stepX = w / (n - 1);
-    ctx.beginPath();
-    series.forEach((v, i) => {
-      const x = i * stepX;
-      const y = h - Math.max(0, Math.min(1, v / maxV)) * (h - 8) - 4;
-      i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
-    });
-    ctx.strokeStyle = color;
-    ctx.lineWidth = 1.8;
-    ctx.lineJoin = 'round';
-    ctx.stroke();
-    if (fill) {
-      ctx.lineTo(w, h); ctx.lineTo(0, h); ctx.closePath();
-      ctx.fillStyle = fill;
-      ctx.fill();
+function elNS(tag, attrs) {
+  const n = document.createElementNS(SVGNS, tag);
+  for (const k in attrs) n.setAttribute(k, attrs[k]);
+  return n;
+}
+
+function makeChart(svg, opts) {
+  if (!svg) return { draw() {}, redraw() {} };
+  svg.setAttribute('viewBox', `0 0 ${CH_W} ${CH_H}`);
+  svg.textContent = '';
+  // 背景网格（3 条水平线）
+  for (let i = 1; i <= 3; i++) {
+    svg.appendChild(elNS('line', {
+      class: 'grid-line', x1: 0, y1: (CH_H / 4) * i, x2: CH_W, y2: (CH_H / 4) * i,
+    }));
+  }
+  // 每条曲线：面积多边形在下，折线在上
+  const layers = opts.series.map((s) => {
+    let fillEl = null;
+    if (s.fill) {
+      fillEl = elNS('polygon', { fill: s.fill });
+      svg.appendChild(fillEl);
     }
+    const poly = elNS('polyline', { stroke: s.color });
+    svg.appendChild(poly);
+    return { s, poly, fillEl };
+  });
+
+  function pts(data, getter, maxV) {
+    const n = Math.max(2, data.length);
+    const stepX = CH_W / (n - 1);
+    return data.map((d, i) => {
+      const v = Math.max(0, Math.min(1, (getter(d) || 0) / maxV));
+      const x = i * stepX;
+      const y = CH_H - v * (CH_H - 8) - 4;
+      return [x, y];
+    });
   }
 
   return {
-    resize,
     draw(data) {
-      const w = canvas.clientWidth || 600, h = Number(canvas.getAttribute('height')) || 110;
-      ctx.clearRect(0, 0, w, h);
-      // 网格
-      ctx.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue('--grid') || 'rgba(255,255,255,.06)';
-      ctx.lineWidth = 1;
-      for (let i = 1; i <= 3; i++) {
-        const y = (h / 4) * i;
-        ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
-      }
-      opts.series.forEach((s) => {
-        const maxV = typeof s.max === 'function' ? s.max(data) : (s.max || 100);
-        line(data.map(s.get), s.color, maxV, s.fill);
-      });
-      // Y 轴刻度（只给百分比类图表画，避免 IO 图误导）
-      if (opts.yLabels) {
-        ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--text-mute') || '#6b7b95';
-        ctx.font = '10px ui-monospace, Menlo, monospace';
-        ctx.textAlign = 'left';
-        ctx.fillText('100%', 2, 10);
-        ctx.fillText('50%', 2, h / 2 - 2);
-        ctx.fillText('0', 2, h - 4);
+      const rows = Array.isArray(data) ? data : [];
+      for (const { s, poly, fillEl } of layers) {
+        const maxV = typeof s.max === 'function' ? s.max(rows) : (s.max || 100);
+        const p = pts(rows, s.get, maxV || 1);
+        poly.setAttribute('points', p.map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join(' '));
+        if (fillEl) {
+          const area = p.map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join(' ') + ` ${CH_W},${CH_H} 0,${CH_H}`;
+          fillEl.setAttribute('points', area);
+        }
       }
     },
+    // SVG 自适应，resize 不需要重算，保留接口对齐旧调用
+    redraw() {},
   };
 }
 

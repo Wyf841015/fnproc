@@ -2,6 +2,40 @@
 
 现代化的 Linux 进程与系统资源管理器，飞牛 fnOS (fnOS) 应用形态，Web 界面适配桌面与手机。
 
+## v0.5.1 更新
+
+### 修复：概览里的图表不显示（canvas → SVG）
+
+根因是 **canvas 在 fnOS WebView 里量不到宽度**。原实现用 `canvas.clientWidth` 定
+绘图缓冲区大小，而 fnOS 的 WebView（CEF）里这个值经常是 0（父级是 flex 项、或布局
+晚于脚本执行时尤其明显）。一旦在 0 宽时执行 `canvas.width = 0 * dpr` 兜底成 1，
+缓冲区就被永久锁死在 1 个设备像素上——之后每秒都在往这个 1px 宽的画布里画，CSS 把
+它拉伸到 330px，用户看到的就是一片空白。
+
+试过的补救（都在浏览器里"看起来正常"、到 WebView 里仍然栽）：
+强制按父元素 `getBoundingClientRect()` 量宽、每次绘制前重新量、缓存数据后 resize
+重绘、ResizeObserver + 多次延迟重试。这些能缓解，但只要有一次在 0 宽状态下先画了
+一帧，缓冲区就已经坏了。
+
+**最终改成 SVG**：一条曲线一个 `<polyline>`，面积用 `<polygon>`，坐标写进
+`viewBox="0 0 300 100"` 的虚拟坐标系，靠 `preserveAspectRatio="none"` 自适应容器
+宽度。SVG 根本不需要 JS 量尺寸，也就没有「缓冲区锁死」这个坑，顺带天然适配
+高分屏。线条用 `vector-effect: non-scaling-stroke` 保证拉伸后粗细不变。
+
+```
+<svg class="chart" viewBox="0 0 300 100" preserveAspectRatio="none">
+  <line class="grid-line">×3
+  <polygon fill="...">      ← 面积
+  <polyline stroke="...">   ← 曲线
+</svg>
+```
+
+实测（截图逐像素核验，不靠肉眼）：
+- CPU 图区域内蓝色曲线像素 727、颜色种类 225（纯背景时 <20）
+- 内存图紫线 444 像素、Swap 橙线 331 像素
+- 三张图 `viewBox` 正确、polyline 的 `points` 长度 211~1229 字符随数据量变化
+- 切走 tab 再切回、切「最近 1 小时」都正常重绘，控制台 0 报错
+
 ## v0.5.0 更新
 
 ### 修复：所有按钮点不动
