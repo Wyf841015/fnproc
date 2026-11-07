@@ -1,0 +1,51 @@
+#!/bin/bash
+# 进程管家 fnproc 启动脚本（fnOS 应用框架调用 start/stop/status）
+
+LOG_FILE="${TRIM_PKGVAR}/info.log"
+PID_FILE="${TRIM_PKGVAR}/app.pid"
+
+# Node.js 运行时（manifest 的 install_dep_apps 已声明 nodejs_v24）
+export PATH=/var/apps/nodejs_v24/target/bin:/var/apps/nodejs_v22/target/bin:$PATH
+
+# --max-old-space-size=96: 限制 V8 堆。进程采样每秒一次、对象很多，
+#   但快照是就地替换不留历史引用，96M 足够；上限能防止长期运行堆无限增长。
+CMD="node --max-old-space-size=96 --max-semi-space-size=8 ${TRIM_APPDEST}/ui/server.js"
+
+log_msg() { echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "${LOG_FILE}"; }
+
+status() {
+    if [ -f "${PID_FILE}" ]; then
+        pid=$(head -n 1 "${PID_FILE}" | tr -d '[:space:]')
+        if kill -0 "${pid}" 2>/dev/null; then return 0; else rm -f "${PID_FILE}"; fi
+    fi
+    return 1
+}
+
+start_process() {
+    if status; then log_msg "already running"; return 0; fi
+    log_msg "starting fnproc ..."
+    mkdir -p "${TRIM_PKGVAR}"
+    bash -c "${CMD}" >> "${LOG_FILE}" 2>&1 &
+    printf "%s" "$!" > "${PID_FILE}"
+    log_msg "pid=$!"
+}
+
+stop_process() {
+    [ -f "${PID_FILE}" ] || return 0
+    pid=$(head -n 1 "${PID_FILE}" | tr -d '[:space:]')
+    if kill -0 "${pid}" 2>/dev/null; then
+        log_msg "send TERM to PID:${pid}"
+        kill -TERM "${pid}" 2>/dev/null
+        count=0
+        while kill -0 "${pid}" 2>/dev/null && [ $count -lt 8 ]; do sleep 1; count=$((count+1)); done
+        kill -0 "${pid}" 2>/dev/null && { log_msg "send KILL to PID:${pid}"; kill -KILL "${pid}" 2>/dev/null; }
+    fi
+    rm -f "${PID_FILE}"
+}
+
+case $1 in
+  start)   start_process ;;
+  stop)    stop_process ;;
+  status)  if status; then exit 0; else exit 3; fi ;;
+  *)       exit 1 ;;
+esac

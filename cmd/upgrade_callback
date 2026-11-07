@@ -1,0 +1,3 @@
+#!/bin/bash
+### 升级完成回调
+echo "fnproc upgraded to $TRIM_APPVER"

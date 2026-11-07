@@ -1,0 +1,3 @@
+#!/bin/bash
+### 卸载前清理：停掉进程残留 socket
+echo "fnproc uninstall_callback"

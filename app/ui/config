@@ -1,0 +1,16 @@
+{
+    ".url": {
+        "fnproc.Application": {
+            "title": "进程管家",
+            "icon": "images/icon_{0}.png",
+            "type": "iframe",
+            "url": "/app/fnproc",
+            "gatewaySocket": "fnproc.sock",
+            "gatewayPrefix": "/app/fnproc",
+            "allUsers": true,
+            "control": {
+                "accessPerm": "editable"
+            }
+        }
+    }
+}

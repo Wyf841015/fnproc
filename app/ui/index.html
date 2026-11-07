@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<base href="/app/fnproc/">
+<title>进程管家 · fnproc</title>
+<link rel="icon" href="images/icon_64.png">
+<link rel="stylesheet" href="styles/app.css">
+</head>
+<body>
+<div class="app">
+
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+          <path d="M3 17l4-6 3 3 4-7 3 4 4-5"/>
+        </svg>
+      </div>
+      <div class="brand-text">
+        <h1>进程管家</h1>
+        <span class="sub" id="hostline">—</span>
+      </div>
+    </div>
+    <div class="topbar-actions">
+      <span class="pill" id="conn-pill" data-state="connecting"><i class="dot"></i><span id="conn-text">连接中</span></span>
+      <button class="btn ghost icon-btn" id="btn-theme" title="切换主题" type="button">
+        <span id="theme-icon">🌙</span>
+      </button>
+    </div>
+  </header>
+
+  <section class="kpis" id="kpis">
+    <article class="kpi kpi-cpu">
+      <div class="kpi-head"><span class="kpi-label">CPU</span><span class="kpi-sub" id="cpu-cores">—</span></div>
+      <div class="kpi-value"><span id="cpu-val">0</span><small>%</small></div>
+      <div class="bar"><i id="cpu-bar" style="width:0%"></i></div>
+    </article>
+    <article class="kpi kpi-mem">
+      <div class="kpi-head"><span class="kpi-label">内存</span><span class="kpi-sub" id="mem-sub">—</span></div>
+      <div class="kpi-value"><span id="mem-val">0</span><small>%</small></div>
+      <div class="bar"><i id="mem-bar" style="width:0%"></i></div>
+    </article>
+    <article class="kpi kpi-swap">
+      <div class="kpi-head"><span class="kpi-label">Swap</span><span class="kpi-sub" id="swap-sub">—</span></div>
+      <div class="kpi-value"><span id="swap-val">0</span><small>%</small></div>
+      <div class="bar"><i id="swap-bar" style="width:0%"></i></div>
+    </article>
+    <article class="kpi">
+      <div class="kpi-head"><span class="kpi-label">负载</span><span class="kpi-sub">1m · 5m · 15m</span></div>
+      <div class="kpi-value small" id="load-val">0 · 0 · 0</div>
+      <div class="kpi-foot" id="uptime-val">—</div>
+    </article>
+    <article class="kpi">
+      <div class="kpi-head"><span class="kpi-label">进程</span><span class="kpi-sub">总数</span></div>
+      <div class="kpi-value"><span id="proc-val">0</span></div>
+      <div class="kpi-foot" id="threads-val">—</div>
+    </article>
+    <article class="kpi">
+      <div class="kpi-head"><span class="kpi-label">磁盘 IO</span><span class="kpi-sub">读 / 写</span></div>
+      <div class="kpi-value small" id="io-val">—</div>
+      <div class="kpi-foot" id="net-val">网络 —</div>
+    </article>
+  </section>
+
+  <section class="charts">
+    <article class="card chart-card">
+      <div class="card-head"><h2>CPU 使用率</h2><span class="hint" id="cpu-model">—</span></div>
+      <canvas id="chart-cpu" height="120"></canvas>
+      <div class="cores" id="cores"></div>
+    </article>
+    <article class="card chart-card">
+      <div class="card-head"><h2>内存 / IO</h2><span class="hint">近 60 秒</span></div>
+      <canvas id="chart-mem" height="120"></canvas>
+      <div class="legend">
+        <span><i class="sw sw-mem"></i>内存%</span>
+        <span><i class="sw sw-rd"></i>磁盘读</span>
+        <span><i class="sw sw-wr"></i>磁盘写</span>
+      </div>
+    </article>
+  </section>
+
+  <section class="card procs-card">
+    <div class="card-head procs-head">
+      <h2>进程列表</h2>
+      <div class="procs-tools">
+        <div class="search">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
+          <input id="q" type="search" placeholder="搜索名称 / 命令行 / PID / 用户" autocomplete="off">
+        </div>
+        <select id="sort" title="排序">
+          <option value="cpu">按 CPU</option>
+          <option value="mem">按内存</option>
+          <option value="pid">按 PID</option>
+          <option value="name">按名称</option>
+          <option value="time">按 CPU 时间</option>
+          <option value="threads">按线程数</option>
+          <option value="start">按启动时间</option>
+        </select>
+        <button class="btn ghost" id="btn-refresh" type="button" title="立即刷新">刷新</button>
+      </div>
+    </div>
+
+    <div class="table-wrap">
+      <table class="ptable">
+        <thead>
+          <tr>
+            <th data-sort="pid" class="num">PID</th>
+            <th data-sort="name">名称</th>
+            <th data-sort="cpu" class="num">CPU%</th>
+            <th data-sort="mem" class="num">内存</th>
+            <th data-sort="threads" class="num hide-sm">线程</th>
+            <th class="hide-sm">用户</th>
+            <th class="hide-sm">状态</th>
+            <th data-sort="time" class="num hide-sm">CPU 时间</th>
+            <th>操作</th>
+          </tr>
+        </thead>
+        <tbody id="ptbody"></tbody>
+      </table>
+      <div class="empty" id="empty" hidden>没有匹配的进程</div>
+    </div>
+    <div class="table-foot">
+      <span id="table-info">—</span>
+      <span class="hint">点击行查看详情 · 数值每秒刷新</span>
+    </div>
+  </section>
+
+  <footer class="footer">
+    <span>进程管家 <b id="ver">0.1.0</b> · 数据来自 /proc</span>
+    <span id="ts-line">—</span>
+  </footer>
+</div>
+
+<!-- 进程详情抽屉 -->
+<div class="drawer-mask" id="drawer-mask" hidden></div>
+<aside class="drawer" id="drawer" hidden aria-label="进程详情">
+  <div class="drawer-head">
+    <div>
+      <h3 id="d-name">—</h3>
+      <span class="sub" id="d-meta">—</span>
+    </div>
+    <button class="btn ghost icon-btn" id="d-close" type="button" aria-label="关闭">✕</button>
+  </div>
+  <div class="drawer-body">
+    <div class="dgrid" id="d-grid"></div>
+    <div class="dblock">
+      <label>命令行</label>
+      <pre id="d-cmd">—</pre>
+    </div>
+    <div class="dblock">
+      <label>可执行文件 / 工作目录</label>
+      <pre id="d-paths">—</pre>
+    </div>
+    <div class="dblock">
+      <label>子进程</label>
+      <div id="d-children" class="chips">—</div>
+    </div>
+    <div class="dblock">
+      <label>发送信号</label>
+      <div class="signals">
+        <button class="btn sig" data-signal="SIGTERM" type="button">TERM 正常结束</button>
+        <button class="btn sig warn" data-signal="SIGKILL" type="button">KILL 强制结束</button>
+        <button class="btn sig" data-signal="SIGSTOP" type="button">STOP 暂停</button>
+        <button class="btn sig" data-signal="SIGCONT" type="button">CONT 继续</button>
+        <button class="btn sig" data-signal="SIGHUP" type="button">HUP 重载</button>
+      </div>
+      <p class="hint" id="d-signal-hint">发信号会立即生效，KILL 不给进程任何收尾机会。</p>
+    </div>
+  </div>
+</aside>
+
+<!-- 确认弹窗 -->
+<div class="modal-mask" id="modal-mask" hidden>
+  <div class="modal" role="dialog" aria-modal="true">
+    <h3 id="modal-title">确认操作</h3>
+    <p id="modal-body">—</p>
+    <div class="modal-actions">
+      <button class="btn ghost" id="modal-cancel" type="button">取消</button>
+      <button class="btn danger" id="modal-ok" type="button">确定</button>
+    </div>
+  </div>
+</div>
+
+<!-- 操作记录 -->
+<section class="card audit-card">
+  <div class="card-head"><h2>操作记录</h2><span class="hint">最近 20 条</span></div>
+  <ul class="audit" id="audit"><li class="hint">暂无操作</li></ul>
+</section>
+
+<div class="toast-wrap" id="toasts"></div>
+
+<script src="main.js" type="module"></script>
+</body>
+</html>
