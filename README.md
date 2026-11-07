@@ -2,6 +2,31 @@
 
 现代化的 Linux 进程与系统资源管理器，飞牛 fnOS (fnOS) 应用形态，Web 界面适配桌面与手机。
 
+## v0.2.0 更新
+
+### 新增四个视图
+
+- **列表**：原进程表，新增「容器」列（chips 可点击，点了只看该容器的进程）
+- **树**：按 `ppid` 还原进程树，可逐级折叠/展开，父节点显示「子树合计 CPU / 内存」
+- **端口**：按端口号列出所有监听端口（TCP LISTEN + UDP），含协议、监听地址、占用进程、用户、容器
+- **容器**：按 docker 容器聚合进程数 / CPU / 内存 / 线程，一键跳到该容器的进程列表
+
+### 端口归属是怎么算出来的
+
+`/proc/net/{tcp,tcp6,udp,udp6}` 只给出 socket 的 inode，没有 pid。要回答「谁占了 8080」
+得反过来扫 `/proc/<pid>/fd` 里的 `socket:[inode]` 去对表。这步比较贵（几百个进程 ×
+每个几十个 fd），所以放在 **10 秒**的独立定时器里跑，不塞进 1 秒的主采样循环。
+实测本机（root 运行）解析出 **107 个监听端口**，进程名、命令行、用户都对得上。
+
+已知限制：容器内的进程用的是自己的 network namespace，它的 socket inode 不出现在宿主的
+`/proc/net/tcp` 里，所以容器进程的端口列不出来 —— 这是 namespace 隔离的正常结果，不是 bug。
+
+### 容器归属
+
+从 `/proc/<pid>/cgroup` 里匹配 `docker/<64位hex>` 或 `docker-<64位hex>.scope`，取前 12 位；
+容器名通过 `docker ps --no-trunc` 解析（15 秒节流一次，docker 不可用时静默降级为短 ID）。
+只认 64 位 hex，避免把 systemd 的 slice 误判成容器。实测识别出 mtphotos、It-tools。
+
 ## 功能（v0.1.0 MVP）
 
 - 进程列表：PID / 名称 / 命令行 / CPU% / 内存 RSS / 线程 / 用户 / 状态 / CPU 时间，支持搜索与七种排序
@@ -28,6 +53,9 @@
 | POST | `/api/kill` | `{pid, signal, confirm:true}` 发信号 |
 | GET | `/api/audit` | 最近操作记录 |
 | GET | `/api/stream` | SSE 实时快照 |
+| GET | `/api/ports` | 监听端口（含占用进程 / 用户 / 容器） |
+| GET | `/api/containers` | 容器维度聚合（进程数 / CPU / 内存 / 线程） |
+| GET | `/api/processes?container=` | 按容器名或短 ID 过滤进程 |
 | GET | `/api/health` | 健康检查 |
 
 ## 安全约束

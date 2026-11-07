@@ -156,6 +156,9 @@ let lastSnapshot = null;
 let rowsCache = [];
 let sortKey = 'cpu';
 let query = '';
+let currentView = 'list';        // list | tree | ports | containers
+let containerFilter = '';        // 容器名或短 ID，非空时列表只显示该容器进程
+const collapsed = new Set();     // 树视图里被折叠的 pid
 let currentDetailPid = null;
 let es = null;
 let pollTimer = null;
@@ -248,6 +251,15 @@ function renderTable(rows) {
     const stTd = el('td', 'hide-sm');
     stTd.appendChild(el('span', 'state s-' + p.state, STATE_CN[p.state] || p.state));
     tr.appendChild(stTd);
+    const cTd = el('td', 'hide-md');
+    if (p.container) {
+      const chip = el('span', 'chip cont', p.container.name);
+      chip.title = '容器 ID ' + p.container.id + '（点击只看该容器）';
+      chip.dataset.action = 'filter-container';
+      chip.dataset.container = p.container.name;
+      cTd.appendChild(chip);
+    } else cTd.appendChild(el('span', 'hint', '—'));
+    tr.appendChild(cTd);
     tr.appendChild(el('td', 'num mono hide-sm', fmtCpuTime(p.cpuTime)));
     const actTd = el('td', 'act');
     const btn = el('button', 'btn tiny', '信号');
@@ -263,12 +275,196 @@ function renderTable(rows) {
   $('table-info').textContent = `${rows.length} 个进程${query ? `（已过滤，共 ${lastSnapshot?.procTotal ?? '?'} 个）` : ''}`;
 }
 
+// ── 视图：进程树 ────────────────────────────────────────────────────────
+// 用 ppid 建树。根节点 = 父进程不在当前结果集里（search/容器过滤后很常见，
+// 不能假设 pid 1 一定是唯一根，否则过滤后整棵树会消失）。
+function renderTree(rows) {
+  const byPid = new Map(rows.map((p) => [p.pid, p]));
+  const children = new Map();
+  const roots = [];
+  for (const p of rows) {
+    if (p.ppid && byPid.has(p.ppid) && p.ppid !== p.pid) {
+      if (!children.has(p.ppid)) children.set(p.ppid, []);
+      children.get(p.ppid).push(p);
+    } else roots.push(p);
+  }
+  // 子树聚合：父节点显示「自身 + 子孙」合计
+  const agg = new Map();
+  function sum(node) {
+    if (agg.has(node.pid)) return agg.get(node.pid);
+    let cpu = node.cpuPct, mem = node.rss, th = node.threads;
+    for (const c of children.get(node.pid) || []) {
+      const sub = sum(c);
+      cpu += sub.cpu; mem += sub.mem; th += sub.th;
+    }
+    const v = { cpu: r1x(cpu), mem, th };
+    agg.set(node.pid, v);
+    return v;
+  }
+  const r1x = (v) => Math.round(v * 10) / 10;
+  for (const r of roots) sum(r);
+
+  const tb = $('treebody');
+  tb.textContent = '';
+  const frag = document.createDocumentFragment();
+  const walk = (node, depth) => {
+    const kids = (children.get(node.pid) || []).sort((a, b) => b.cpuPct - a.cpuPct);
+    const hasKids = kids.length > 0;
+    const isCollapsed = collapsed.has(node.pid);
+    const tr = el('tr');
+    tr.dataset.pid = node.pid;
+    tr.appendChild(el('td', 'num mono', node.pid));
+
+    const nameTd = el('td', 'tree-cell');
+    const indent = el('span', 'indent');
+    indent.style.paddingLeft = (depth * 16) + 'px';
+    if (hasKids) {
+      const tg = el('button', 'toggle', isCollapsed ? '▶' : '▼');
+      tg.type = 'button';
+      tg.dataset.action = 'toggle';
+      tg.dataset.pid = node.pid;
+      indent.appendChild(tg);
+    } else {
+      indent.appendChild(el('span', 'toggle-ph', '·'));
+    }
+    indent.appendChild(el('span', 'nm', node.name));
+    const a = agg.get(node.pid);
+    if (hasKids && (a.cpu > node.cpuPct + 0.05 || a.mem > node.rss * 1.05)) {
+      indent.appendChild(el('span', 'agg', `子树 ${a.cpu}% / ${fmtBytes(a.mem)}`));
+    }
+    nameTd.appendChild(indent);
+    tr.appendChild(nameTd);
+
+    const cpuTd = el('td', 'num mono');
+    cpuTd.appendChild(el('span', 'cpuval', fmtPct(node.cpuPct)));
+    if (node.cpuPct > 10) cpuTd.dataset.hot = '1';
+    tr.appendChild(cpuTd);
+    tr.appendChild(el('td', 'num mono', fmtBytes(node.rss)));
+    tr.appendChild(el('td', 'num mono hide-sm', node.threads));
+    const cTd = el('td', 'hide-md');
+    if (node.container) cTd.appendChild(el('span', 'chip cont', node.container.name));
+    else cTd.appendChild(el('span', 'hint', '—'));
+    tr.appendChild(cTd);
+    const actTd = el('td', 'act');
+    const btn = el('button', 'btn tiny', '信号');
+    btn.type = 'button';
+    btn.dataset.action = 'signal';
+    btn.dataset.pid = node.pid;
+    actTd.appendChild(btn);
+    tr.appendChild(actTd);
+    frag.appendChild(tr);
+
+    if (!isCollapsed) for (const k of kids) walk(k, depth + 1);
+  };
+  roots.sort((a, b) => (agg.get(b.pid)?.cpu || 0) - (agg.get(a.pid)?.cpu || 0));
+  for (const r of roots) walk(r, 0);
+  tb.appendChild(frag);
+  $('table-info').textContent = `${rows.length} 个进程 · ${roots.length} 个根节点${collapsed.size ? ` · 已折叠 ${collapsed.size}` : ''}`;
+}
+
+// ── 视图：监听端口 ──────────────────────────────────────────────────────
+async function renderPorts() {
+  const r = await fetch(API + '/ports', { cache: 'no-store' });
+  if (!r.ok) throw new Error('端口列表请求失败: HTTP ' + r.status);
+  const d = await r.json();
+  const tb = $('portbody');
+  tb.textContent = '';
+  const frag = document.createDocumentFragment();
+  for (const p of d.ports || []) {
+    const tr = el('tr');
+    tr.dataset.pid = p.pid;
+    tr.appendChild(el('td', 'num mono port', p.port));
+    tr.appendChild(el('td', '', p.proto));
+    tr.appendChild(el('td', 'mono', p.addr));
+    tr.appendChild(el('td', 'num mono', p.pid));
+    const nm = el('td', 'pname');
+    nm.appendChild(el('span', 'nm', p.name));
+    if (p.cmd) nm.appendChild(el('span', 'cmd', p.cmd));
+    tr.appendChild(nm);
+    tr.appendChild(el('td', 'hide-sm', p.user));
+    const cTd = el('td', 'hide-md');
+    if (p.container) cTd.appendChild(el('span', 'chip cont', p.container.name));
+    else cTd.appendChild(el('span', 'hint', '—'));
+    tr.appendChild(cTd);
+    frag.appendChild(tr);
+  }
+  tb.appendChild(frag);
+  $('ports-empty').hidden = (d.ports || []).length > 0;
+  $('table-info').textContent = `${d.total} 个监听端口`;
+}
+
+// ── 视图：容器聚合 ──────────────────────────────────────────────────────
+async function renderContainers() {
+  const r = await fetch(API + '/containers', { cache: 'no-store' });
+  if (!r.ok) throw new Error('容器列表请求失败: HTTP ' + r.status);
+  const d = await r.json();
+  const tb = $('contbody');
+  tb.textContent = '';
+  const frag = document.createDocumentFragment();
+  for (const c of d.containers || []) {
+    const tr = el('tr');
+    const nm = el('td', 'pname');
+    nm.appendChild(el('span', 'nm', c.name));
+    tr.appendChild(nm);
+    tr.appendChild(el('td', 'num mono', c.procs));
+    tr.appendChild(el('td', 'num mono', fmtPct(c.cpuPct)));
+    tr.appendChild(el('td', 'num mono', fmtBytes(c.rss)));
+    tr.appendChild(el('td', 'num mono hide-sm', c.threads));
+    tr.appendChild(el('td', 'num mono small-id', c.id));
+    const act = el('td', 'act');
+    const btn = el('button', 'btn tiny', '看进程');
+    btn.type = 'button';
+    btn.dataset.action = 'filter-container';
+    btn.dataset.container = c.name;
+    act.appendChild(btn);
+    tr.appendChild(act);
+    frag.appendChild(tr);
+  }
+  tb.appendChild(frag);
+  $('containers-empty').hidden = (d.containers || []).length > 0;
+  $('table-info').textContent = `${d.total} 个容器${d.dockerAvailable ? '' : '（docker 名解析不可用，显示短 ID）'}`;
+}
+
+// ── 视图切换 ────────────────────────────────────────────────────────────
+function setView(v) {
+  currentView = v;
+  for (const b of $('views').querySelectorAll('.vbtn')) b.classList.toggle('active', b.dataset.view === v);
+  for (const id of ['view-list', 'view-tree', 'view-ports', 'view-containers']) {
+    $(id).hidden = (id !== 'view-' + v);
+  }
+  const showFilter = v === 'list' || v === 'tree';
+  $('cfilter').hidden = !(showFilter && containerFilter);
+  $('cfilter-name').textContent = containerFilter || '—';
+  return refreshView();
+}
+
+async function refreshView() {
+  try {
+    if (currentView === 'ports') { await renderPorts(); return; }
+    if (currentView === 'containers') { await renderContainers(); return; }
+    const u = new URL(API + '/processes', location.origin);
+    u.searchParams.set('sort', sortKey);
+    u.searchParams.set('limit', '2000');
+    if (query) u.searchParams.set('q', query);
+    if (containerFilter) u.searchParams.set('container', containerFilter);
+    const r = await fetch(u.toString(), { cache: 'no-store' });
+    if (!r.ok) throw new Error('进程列表请求失败: HTTP ' + r.status);
+    const d = await r.json();
+    rowsCache = d.rows || [];
+    if (currentView === 'tree') renderTree(rowsCache);
+    else renderTable(rowsCache);
+  } catch (e) {
+    toast(e.message, 'error');
+  }
+}
+
 // ── 数据获取 ────────────────────────────────────────────────────────────
 async function fetchProcesses() {
   const u = new URL(API + '/processes', location.origin);
   u.searchParams.set('sort', sortKey);
-  u.searchParams.set('limit', '500');
+  u.searchParams.set('limit', '2000');
   if (query) u.searchParams.set('q', query);
+  if (containerFilter) u.searchParams.set('container', containerFilter);
   const r = await fetch(u.toString(), { cache: 'no-store' });
   if (!r.ok) throw new Error('进程列表请求失败: HTTP ' + r.status);
   const d = await r.json();
@@ -323,13 +519,11 @@ function stopPolling() { if (pollTimer) { clearInterval(pollTimer); pollTimer = 
 
 async function refreshAll() {
   try {
-    const [o] = await Promise.all([
-      fetch(API + '/overview', { cache: 'no-store' }).then((r) => r.json()),
-      fetchProcesses(),
-    ]);
+    const o = await fetch(API + '/overview', { cache: 'no-store' }).then((r) => r.json());
     lastSnapshot = o;
     renderKpis(o);
     $('hostline').textContent = `${o.host?.name || ''} · ${o.host?.kernel || ''}`;
+    await refreshView();
   } catch (e) {
     toast('刷新失败：' + e.message, 'error');
   }
@@ -470,12 +664,61 @@ function bindEvents() {
   let qTimer = null;
   q.addEventListener('input', () => {
     clearTimeout(qTimer);
-    qTimer = setTimeout(() => { query = q.value.trim(); fetchProcesses().catch((e) => toast(e.message, 'error')); }, 220);
+    qTimer = setTimeout(() => { query = q.value.trim(); refreshView(); }, 220);
   });
 
   $('sort').addEventListener('change', (e) => {
     sortKey = e.target.value;
-    fetchProcesses().catch((err) => toast(err.message, 'error'));
+    refreshView();
+  });
+
+  // 视图切换
+  $('views').addEventListener('click', (e) => {
+    const b = e.target.closest('.vbtn');
+    if (b) setView(b.dataset.view);
+  });
+
+  // 容器筛选清除
+  $('cfilter-clear').addEventListener('click', () => {
+    containerFilter = '';
+    $('cfilter').hidden = true;
+    refreshView();
+  });
+
+  // 树视图：折叠/展开 + 行点击详情
+  $('treebody').addEventListener('click', (e) => {
+    const tg = e.target.closest('button[data-action="toggle"]');
+    if (tg) {
+      e.stopPropagation();
+      const pid = Number(tg.dataset.pid);
+      if (collapsed.has(pid)) collapsed.delete(pid); else collapsed.add(pid);
+      renderTree(rowsCache);
+      return;
+    }
+    const sig = e.target.closest('button[data-action="signal"]');
+    if (sig) { e.stopPropagation(); sendSignal(Number(sig.dataset.pid), 'SIGTERM'); return; }
+    const tr = e.target.closest('tr[data-pid]');
+    if (tr) openDetail(Number(tr.dataset.pid));
+  });
+
+  // 端口视图：点行看进程详情
+  $('portbody').addEventListener('click', (e) => {
+    const tr = e.target.closest('tr[data-pid]');
+    if (tr) openDetail(Number(tr.dataset.pid));
+  });
+
+  // 容器视图 / 列表里的容器标签：只看该容器进程
+  const applyContainerFilter = (name) => {
+    containerFilter = name || '';
+    setView('list');
+  };
+  $('contbody').addEventListener('click', (e) => {
+    const b = e.target.closest('button[data-action="filter-container"]');
+    if (b) applyContainerFilter(b.dataset.container);
+  });
+  $('ptbody').addEventListener('click', (e) => {
+    const chip = e.target.closest('[data-action="filter-container"]');
+    if (chip) { e.stopPropagation(); applyContainerFilter(chip.dataset.container); }
   });
 
   // 表头点击排序
@@ -484,7 +727,7 @@ function bindEvents() {
       const k = th.dataset.sort;
       sortKey = k;
       $('sort').value = k;
-      fetchProcesses().catch((e) => toast(e.message, 'error'));
+      refreshView();
     });
   }
 
@@ -531,9 +774,8 @@ function bindEvents() {
 (async function boot() {
   bindEvents();
   await refreshAll();
-  await fetchProcesses().catch((e) => toast(e.message, 'error'));
   loadAudit();
   startStream();
   // 表格数据 3 秒刷一次（SSE 只推概览与 top30，避免整表每秒重排导致选择/滚动丢失）
-  setInterval(() => { fetchProcesses().catch(() => {}); }, 3000);
+  setInterval(() => { refreshView(); }, 3000);
 })();

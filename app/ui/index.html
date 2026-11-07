@@ -97,7 +97,12 @@
 
   <section class="card procs-card">
     <div class="card-head procs-head">
-      <h2>进程列表</h2>
+      <div class="views" id="views">
+        <button class="vbtn active" data-view="list" type="button">列表</button>
+        <button class="vbtn" data-view="tree" type="button">树</button>
+        <button class="vbtn" data-view="ports" type="button">端口</button>
+        <button class="vbtn" data-view="containers" type="button">容器</button>
+      </div>
       <div class="procs-tools">
         <div class="search">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
@@ -116,7 +121,12 @@
       </div>
     </div>
 
-    <div class="table-wrap">
+    <div class="cfilter" id="cfilter" hidden>
+      <span>仅显示容器 <b id="cfilter-name">—</b> 的进程</span>
+      <button class="btn tiny ghost" id="cfilter-clear" type="button">清除</button>
+    </div>
+
+    <div class="table-wrap" id="view-list">
       <table class="ptable">
         <thead>
           <tr>
@@ -127,6 +137,7 @@
             <th data-sort="threads" class="num hide-sm">线程</th>
             <th class="hide-sm">用户</th>
             <th class="hide-sm">状态</th>
+            <th class="hide-md">容器</th>
             <th data-sort="time" class="num hide-sm">CPU 时间</th>
             <th>操作</th>
           </tr>
@@ -135,6 +146,59 @@
       </table>
       <div class="empty" id="empty" hidden>没有匹配的进程</div>
     </div>
+
+    <div class="table-wrap" id="view-tree" hidden>
+      <table class="ptable tree-table">
+        <thead>
+          <tr>
+            <th class="num">PID</th>
+            <th>进程树</th>
+            <th class="num">CPU%</th>
+            <th class="num">内存</th>
+            <th class="num hide-sm">线程</th>
+            <th class="hide-md">容器</th>
+            <th>操作</th>
+          </tr>
+        </thead>
+        <tbody id="treebody"></tbody>
+      </table>
+    </div>
+
+    <div class="table-wrap" id="view-ports" hidden>
+      <table class="ptable">
+        <thead>
+          <tr>
+            <th class="num">端口</th>
+            <th>协议</th>
+            <th>监听地址</th>
+            <th class="num">PID</th>
+            <th>进程</th>
+            <th class="hide-sm">用户</th>
+            <th class="hide-md">容器</th>
+          </tr>
+        </thead>
+        <tbody id="portbody"></tbody>
+      </table>
+      <div class="empty" id="ports-empty" hidden>没有采集到监听端口</div>
+    </div>
+
+    <div class="table-wrap" id="view-containers" hidden>
+      <table class="ptable">
+        <thead>
+          <tr>
+            <th>容器</th>
+            <th class="num">进程数</th>
+            <th class="num">CPU%</th>
+            <th class="num">内存</th>
+            <th class="num hide-sm">线程</th>
+            <th class="num">容器 ID</th>
+            <th>操作</th>
+          </tr>
+        </thead>
+        <tbody id="contbody"></tbody>
+      </table>
+      <div class="empty" id="containers-empty" hidden>没有检测到容器进程（docker 不可用或未运行容器）</div>
+    </div>
     <div class="table-foot">
       <span id="table-info">—</span>
       <span class="hint">点击行查看详情 · 数值每秒刷新</span>
@@ -142,7 +206,7 @@
   </section>
 
   <footer class="footer">
-    <span>进程管家 <b id="ver">0.1.0</b> · 数据来自 /proc</span>
+    <span>进程管家 <b id="ver">0.2.0</b> · 数据来自 /proc</span>
     <span id="ts-line">—</span>
   </footer>
 </div>

@@ -13,6 +13,7 @@ import { readFileSync, readdirSync, existsSync, unlinkSync, statSync, readlinkSy
 import { join, dirname, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createServer } from 'node:http';
+import { execFileSync } from 'node:child_process';
 import { gzipSync } from 'node:zlib';
 
 const UI_DIR = dirname(fileURLToPath(import.meta.url));
@@ -24,7 +25,7 @@ const PORT = parseInt(process.env.PORT || '47951', 10);
 const SOCK_DIR = process.env.FNPROC_SOCK_DIR || TARGET_DIR;
 const SOCK_PATH = join(SOCK_DIR, 'fnproc.sock');
 const GATEWAY_PREFIX = '/app/fnproc';
-const VERSION = '0.1.0';
+const VERSION = '0.2.0';
 const SAMPLE_MS = 1000;
 const HISTORY_MAX = 120;              // 内存里保留 120 个采样点，够前端画满图
 
@@ -119,6 +120,117 @@ let prevNet = null;                    // {rx, tx}
 const cmdCache = new Map();            // pid → {v, ts}
 const ioCache = new Map();             // pid → {v, ts}
 const uidOf = new Map();               // pid → uid（从 status 读，缓存 30s）
+
+// ── 监听端口：inode → 端口 ──────────────────────────────────────────────
+// /proc/net/tcp* 给出的每个 socket 只有 inode，没有 pid；要知道「哪个进程占了
+// 8080」必须反向扫 /proc/PID/fd 里的 socket:[inode]。分两步：
+//   1) refreshInodePorts()  解析 /proc/net/{tcp,tcp6,udp,udp6}   → inode → {port,proto,addr}
+//   2) refreshPidPorts()    扫每个进程的 fd，链接名形如 socket:[12345] → 反查上表
+// 第 2 步较贵（几百个进程 × 每个几十个 fd），所以拆到 10 秒一次的定时器里，
+// 不放在 1 秒的主采样里。
+let inodePort = new Map();
+let pidPorts = new Map();
+
+const TCP_STATE = { '01': 'ESTABLISHED', '0A': 'LISTEN', '06': 'TIME_WAIT', '08': 'CLOSE_WAIT', '09': 'LAST_ACK', '0B': 'CLOSING' };
+
+function hexToIpv4(h) {
+  if (!h || h.length !== 8) return h || '?';
+  const b = h.match(/../g).map((x) => parseInt(x, 16));
+  return b.reverse().join('.');
+}
+
+function refreshInodePorts() {
+  const map = new Map();
+  for (const [file, proto] of [
+    ['/proc/net/tcp', 'tcp'], ['/proc/net/tcp6', 'tcp6'],
+    ['/proc/net/udp', 'udp'], ['/proc/net/udp6', 'udp6'],
+  ]) {
+    const lines = readOr(file).split('\n');
+    for (let i = 1; i < lines.length; i++) {
+      const f = lines[i].trim().split(/\s+/);
+      if (f.length < 10) continue;
+      const [ipHex, portHex] = f[1].split(':');
+      const st = f[3];
+      const inode = f[9];
+      // TCP 只关心 LISTEN（0A）；UDP 没有监听状态，全收
+      if (proto.startsWith('tcp') && st !== '0A') continue;
+      const port = parseInt(portHex, 16);
+      if (!port) continue;
+      const addr = proto.endsWith('6') ? '::' : hexToIpv4(ipHex);
+      map.set(inode, { port, proto, addr, state: TCP_STATE[st] || st });
+    }
+  }
+  inodePort = map;
+}
+
+function refreshPidPorts() {
+  const out = new Map();
+  let pids = [];
+  try { pids = readdirSync('/proc').filter((n) => /^\d+$/.test(n)); } catch { return; }
+  for (const pidStr of pids) {
+    let fds = [];
+    try { fds = readdirSync(`/proc/${pidStr}/fd`); } catch { continue; }
+    const list = [];
+    for (const fd of fds) {
+      let link = '';
+      try { link = readlinkSync(`/proc/${pidStr}/fd/${fd}`); } catch { continue; }
+      if (!link.startsWith('socket:[')) continue;
+      const ino = link.slice(8, -1);
+      const info = inodePort.get(ino);
+      if (info) list.push(info);
+    }
+    if (list.length) out.set(num(pidStr), list);
+  }
+  // 按端口去重（同一进程可能多 fd 指向同一 socket）
+  for (const [pid, list] of out) {
+    const seenP = new Set();
+    out.set(pid, list.filter((p) => {
+      const k = p.proto + p.port + p.addr;
+      if (seenP.has(k)) return false;
+      seenP.add(k);
+      return true;
+    }).sort((a, b) => a.port - b.port));
+  }
+  pidPorts = out;
+}
+
+// ── 容器归属：cgroup → 容器短 ID → docker 容器名 ─────────────────────────
+// fnOS 上的 docker 容器进程，/proc/PID/cgroup 里带 docker/<64位hex> 或
+// docker-<64位hex>.scope。只认 64 位 hex，避免把 systemd 自己的 slice 误判成容器。
+const cgroupCache = new Map();          // pid → {v, ts}
+let dockerNames = new Map();            // 短ID(12) → 容器名
+let dockerAt = 0;
+
+function refreshDocker() {
+  const now = Date.now();
+  if (now - dockerAt < 15000) return;   // docker 命令有开销，15s 才跑一次
+  dockerAt = now;
+  const names = new Map();
+  try {
+    const out = execFileSync('docker', ['ps', '--no-trunc', '--format', '{{.ID}}\t{{.Names}}'],
+      { timeout: 4000, encoding: 'utf8' });
+    for (const line of out.split('\n')) {
+      const [id, name] = line.trim().split('\t');
+      if (id && name) names.set(id.slice(0, 12), name);
+    }
+  } catch { /* 没装 docker / 无权限：静默降级，不显示容器列即可 */ }
+  dockerNames = names;
+}
+
+function procContainer(pid) {
+  const now = Date.now();
+  const c = cgroupCache.get(pid);
+  if (c && now - c.ts < 30000) return c.v;
+  let v = null;
+  const m = readOr(`/proc/${pid}/cgroup`).match(/(?:docker[-/]|cri-containerd[-/]|libpod-)([0-9a-f]{64})/);
+  if (m) {
+    const id = m[1].slice(0, 12);
+    v = { id, name: dockerNames.get(id) || id };
+  }
+  cgroupCache.set(pid, { v, ts: now });
+  return v;
+}
+
 
 const CLK_TCK = 100;                   // Linux 上恒为 100（USER_HZ），getconf CLK_TCK 一致
 const PAGE = 4096;
@@ -334,6 +446,8 @@ function sampleProcs() {
       cmd: procCmdline(pid),
       ioRead: io.read,
       ioWrite: io.write,
+      ports: pidPorts.get(pid) || [],
+      container: procContainer(pid),
     });
     seen.add(pid);
     prevProc.set(pid, { ticks });
@@ -343,6 +457,8 @@ function sampleProcs() {
   for (const pid of cmdCache.keys()) if (!seen.has(pid)) cmdCache.delete(pid);
   for (const pid of ioCache.keys()) if (!seen.has(pid)) ioCache.delete(pid);
   for (const pid of uidOf.keys()) if (!seen.has(pid)) uidOf.delete(pid);
+  for (const pid of cgroupCache.keys()) if (!seen.has(pid)) cgroupCache.delete(pid);
+  for (const pid of pidPorts.keys()) if (!seen.has(pid)) pidPorts.delete(pid);
   procs = list;
   state.procTotal = list.length;
   state.ts = now;
@@ -455,6 +571,7 @@ async function handle(req, res, pathname, query) {
     const q = String(query.get('q') || '').toLowerCase().trim();
     const sortKey = SORTS[query.get('sort')] ? query.get('sort') : 'cpu';
     const limit = Math.min(2000, Math.max(1, num(query.get('limit')) || 500));
+    const cFilter = String(query.get('container') || '').trim();
     let rows = procs;
     if (q) {
       rows = rows.filter((p) => p.name.toLowerCase().includes(q)
@@ -462,8 +579,55 @@ async function handle(req, res, pathname, query) {
         || String(p.pid) === q
         || p.user.toLowerCase().includes(q));
     }
+    if (cFilter) {
+      rows = rows.filter((p) => p.container
+        && (p.container.id === cFilter || p.container.name === cFilter));
+    }
     rows = [...rows].sort(SORTS[sortKey]).slice(0, limit);
     sendJSON(res, 200, { ts: state.ts, total: procs.length, shown: rows.length, sort: sortKey, rows });
+    return;
+  }
+
+  // 监听端口视图：把 inode→port 的结果反查成 pid，再补进程名/用户/容器
+  if (pathname === '/api/ports') {
+    const byPid = new Map(procs.map((p) => [p.pid, p]));
+    const out = [];
+    for (const [pid, list] of pidPorts) {
+      const p = byPid.get(pid);
+      for (const s of list) {
+        out.push({
+          port: s.port, proto: s.proto, addr: s.addr,
+          pid, name: p?.name || '?', user: p?.user || '?',
+          cmd: p?.cmd ? p.cmd.slice(0, 120) : '',
+          container: p?.container || null,
+        });
+      }
+    }
+    out.sort((a, b) => a.port - b.port || a.proto.localeCompare(b.proto));
+    sendJSON(res, 200, { ts: state.ts, total: out.length, ports: out });
+    return;
+  }
+
+  // 容器维度聚合：进程数 / CPU / 内存（按容器名归堆，非容器进程单独一档 null）
+  if (pathname === '/api/containers') {
+    const map = new Map();
+    for (const p of procs) {
+      if (!p.container) continue;
+      const key = p.container.name || p.container.id;
+      const cur = map.get(key) || { id: p.container.id, name: key, procs: 0, cpuPct: 0, rss: 0, threads: 0 };
+      cur.procs += 1;
+      cur.cpuPct = r1(cur.cpuPct + p.cpuPct);
+      cur.rss += p.rss;
+      cur.threads += p.threads;
+      map.set(key, cur);
+    }
+    const list = [...map.values()].sort((a, b) => b.rss - a.rss);
+    sendJSON(res, 200, {
+      ts: state.ts,
+      dockerAvailable: dockerNames.size > 0,
+      total: list.length,
+      containers: list,
+    });
     return;
   }
 
@@ -564,6 +728,12 @@ httpServer.listen(PORT, '127.0.0.1', () => console.log(`fnproc HTTP on 127.0.0.1
 const sockServer = createServer((req, res) => httpServer.emit('request', req, res));
 if (existsSync(SOCK_PATH)) { try { unlinkSync(SOCK_PATH); } catch { /* 忽略 */ } }
 sockServer.listen(SOCK_PATH, () => console.log(`fnproc UNIX socket listening: ${SOCK_PATH}`));
+
+// 端口 / 容器：先建表，再按各自的节奏刷新（不进 1 秒主循环，避免拖慢采样）
+refreshDocker();
+refreshInodePorts();
+refreshPidPorts();
+setInterval(() => { refreshDocker(); refreshInodePorts(); refreshPidPorts(); }, 10000);
 
 // 先跑一轮采样，避免首屏全是 0（进程 CPU% 需要两次采样才有意义）
 tick();
