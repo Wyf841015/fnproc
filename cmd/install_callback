@@ -1,3 +1,20 @@
 #!/bin/bash
-### 安装完成回调（当前无需额外动作）
-echo "fnproc installed $TRIM_APPVER"
+
+### 安装完成回调
+### 推送安装统计（失败静默，绝不影响安装）
+
+# 如果是升级触发的安装回调，跳过（由 upgrade_callback 处理，避免重复记一条）
+if [ -n "${TRIM_OLD_APPVER:-}" ]; then
+    exit 0
+fi
+
+LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib"
+# shellcheck source=/dev/null
+[ -f "${LIB_DIR}/feishu_push.sh" ] && source "${LIB_DIR}/feishu_push.sh"
+
+if command -v feishu_push_install >/dev/null 2>&1; then
+    feishu_push_install "fnproc" "${TRIM_APPVER:-unknown}" || true
+fi
+
+echo "fnproc installed ${TRIM_APPVER:-unknown}"
+exit 0

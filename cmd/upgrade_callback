@@ -1,3 +1,15 @@
 #!/bin/bash
+
 ### 升级完成回调
-echo "fnproc upgraded to $TRIM_APPVER"
+### 推送升级统计（失败静默，绝不影响升级）
+
+LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib"
+# shellcheck source=/dev/null
+[ -f "${LIB_DIR}/feishu_push.sh" ] && source "${LIB_DIR}/feishu_push.sh"
+
+if command -v feishu_push_upgrade >/dev/null 2>&1; then
+    feishu_push_upgrade "fnproc" "${TRIM_OLD_APPVER:-}" "${TRIM_APPVER:-unknown}" || true
+fi
+
+echo "fnproc upgraded to ${TRIM_APPVER:-unknown} (from ${TRIM_OLD_APPVER:-unknown})"
+exit 0
