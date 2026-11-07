@@ -25,6 +25,12 @@
     </div>
     <div class="topbar-actions">
       <span class="pill" id="conn-pill" data-state="connecting"><i class="dot"></i><span id="conn-text">连接中</span></span>
+      <button class="btn ghost icon-btn" id="btn-sponsor" title="赞助作者" type="button">
+        <span aria-hidden="true">❤</span>
+      </button>
+      <button class="btn ghost icon-btn" id="btn-feedback" title="反馈与交流" type="button">
+        <span aria-hidden="true">✉️</span>
+      </button>
       <button class="btn ghost icon-btn" id="btn-theme" title="切换主题" type="button">
         <span id="theme-icon">🌙</span>
       </button>
@@ -300,7 +306,7 @@
   </section>
 
   <footer class="footer">
-    <span>进程管家 <b id="ver">0.5.1</b> · 数据来自 /proc</span>
+    <span>进程管家 <b id="ver">0.6.0</b> · 数据来自 /proc</span>
     <span id="table-info" class="hint">—</span>
     <span id="ts-line">—</span>
   </footer>
@@ -357,6 +363,62 @@
 </div>
 
 <div class="toast-wrap" id="toasts"></div>
+
+<!-- 赞助作者 -->
+<div class="sheet-mask" id="sponsor-mask" hidden>
+  <div class="sheet" role="dialog" aria-modal="true" aria-label="赞助作者">
+    <div class="sheet-head">
+      <h3>❤ 赞助作者</h3>
+      <button class="btn ghost icon-btn" data-close="sponsor-mask" type="button" aria-label="关闭">✕</button>
+    </div>
+    <p class="sub">进程管家完全免费、无广告、不联网，数据只在本机 <code>/proc</code> 里读。
+      如果它帮你省下了时间，欢迎请作者喝杯咖啡。</p>
+    <div class="qr-grid">
+      <figure>
+        <img src="images/sponsor_alipay.jpg" alt="支付宝收款码" data-zoom="1">
+        <figcaption>支付宝</figcaption>
+      </figure>
+      <figure>
+        <img src="images/sponsor_wechat.jpg" alt="微信收款码" data-zoom="1">
+        <figcaption>微信</figcaption>
+      </figure>
+    </div>
+    <p class="hint center">点击二维码可放大 · 手机上长按图片识别</p>
+  </div>
+</div>
+
+<!-- 反馈与交流 -->
+<div class="sheet-mask" id="feedback-mask" hidden>
+  <div class="sheet" role="dialog" aria-modal="true" aria-label="反馈与交流">
+    <div class="sheet-head">
+      <h3>✉️ 反馈与交流</h3>
+      <button class="btn ghost icon-btn" data-close="feedback-mask" type="button" aria-label="关闭">✕</button>
+    </div>
+    <p class="sub">遇到 bug、想要新功能，或者只是想聊聊，都可以来找我。</p>
+    <div class="fb-row">
+      <span class="fb-label">QQ 群</span>
+      <code class="fb-code" id="qq-num">745565752</code>
+      <button class="btn tiny" id="qq-copy" type="button">复制</button>
+    </div>
+    <div class="fb-row">
+      <span class="fb-label">项目主页</span>
+      <a class="fb-link" href="https://gitee.com/wyf1015" target="_blank" rel="noopener noreferrer">gitee.com/wyf1015</a>
+    </div>
+    <div class="fb-row column">
+      <span class="fb-label">提问题时建议带上</span>
+      <ul class="fb-tips">
+        <li>应用版本号（页脚）与 fnOS 版本</li>
+        <li>复现步骤，以及出问题时的现象</li>
+        <li>如果是进程相关问题：那行的 PID / 名称 / 命令行</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<!-- 二维码放大 -->
+<div class="lightbox" id="lightbox" hidden>
+  <img id="lightbox-img" alt="二维码放大">
+</div>
 
 <script src="main.js" type="module"></script>
 </body>

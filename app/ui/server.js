@@ -25,7 +25,7 @@ const PORT = parseInt(process.env.PORT || '47951', 10);
 const SOCK_DIR = process.env.FNPROC_SOCK_DIR || TARGET_DIR;
 const SOCK_PATH = join(SOCK_DIR, 'fnproc.sock');
 const GATEWAY_PREFIX = '/app/fnproc';
-const VERSION = '0.5.1';
+const VERSION = '0.6.0';
 const SAMPLE_MS = 1000;
 const HISTORY_MAX = 120;              // 内存里保留 120 个采样点，够前端画满图
 
@@ -77,6 +77,10 @@ const MIME = {
   '.json': 'application/json; charset=utf-8',
   '.svg': 'image/svg+xml',
   '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.webp': 'image/webp',
+  '.gif': 'image/gif',
   '.ico': 'image/x-icon',
 };
 

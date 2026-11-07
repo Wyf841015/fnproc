@@ -810,8 +810,91 @@ async function loadAudit() {
   } catch { /* 忽略 */ }
 }
 
+// ── 赞助 / 反馈弹层 ─────────────────────────────────────────────────────
+function openSheet(id) {
+  const m = $(id);
+  if (!m) return;
+  m.hidden = false;
+  requestAnimationFrame(() => m.classList.add('show'));
+}
+function closeSheet(id) {
+  const m = $(id);
+  if (!m) return;
+  m.classList.remove('show');
+  setTimeout(() => { m.hidden = true; }, 180);
+}
+function openLightbox(src) {
+  const lb = $('lightbox');
+  if (!lb || !src) return;
+  $('lightbox-img').src = src;
+  lb.hidden = false;
+}
+function closeLightbox() {
+  const lb = $('lightbox');
+  if (!lb) return;
+  lb.hidden = true;
+  $('lightbox-img').removeAttribute('src');
+}
+function closeSheets() {
+  closeSheet('sponsor-mask');
+  closeSheet('feedback-mask');
+  closeLightbox();
+}
+
+// 复制到剪贴板：fnOS WebView 里 navigator.clipboard 常常不可用（非 https 安全上下文），
+// 必须有 execCommand 兜底，否则点了「复制」毫无反应。
+async function copyText(txt) {
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(txt);
+      return true;
+    }
+  } catch { /* 落到下面的兜底 */ }
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = txt;
+    ta.setAttribute('readonly', '');
+    ta.style.cssText = 'position:fixed;top:-1000px;left:-1000px;opacity:0';
+    document.body.appendChild(ta);
+    ta.select();
+    ta.setSelectionRange(0, txt.length);
+    const ok = document.execCommand('copy');
+    ta.remove();
+    return ok;
+  } catch { return false; }
+}
+
 // ── 事件绑定（统一 addEventListener，不用 inline onclick）────────────────
 function bindEvents() {
+  // 赞助 / 反馈：走 DOM 0 级赋值（fnOS WebView 上比 addEventListener 更稳）
+  const btnSponsor = $('btn-sponsor');
+  if (btnSponsor) btnSponsor.onclick = () => openSheet('sponsor-mask');
+  const btnFeedback = $('btn-feedback');
+  if (btnFeedback) btnFeedback.onclick = () => openSheet('feedback-mask');
+
+  // 关闭按钮 / 点遮罩关闭
+  for (const b of document.querySelectorAll('[data-close]')) {
+    b.onclick = () => closeSheet(b.dataset.close);
+  }
+  for (const m of document.querySelectorAll('.sheet-mask')) {
+    m.addEventListener('click', (e) => { if (e.target === m) closeSheet(m.id); });
+  }
+
+  // 二维码点击放大
+  for (const img of document.querySelectorAll('img[data-zoom]')) {
+    img.onclick = () => openLightbox(img.getAttribute('src'));
+  }
+  const lb = $('lightbox');
+  if (lb) lb.onclick = closeLightbox;
+
+  // 复制 QQ 群号
+  const qqBtn = $('qq-copy');
+  if (qqBtn) qqBtn.onclick = async () => {
+    const qq = ($('qq-num')?.textContent || '').trim();
+    const ok = await copyText(qq);
+    toast(ok ? `已复制 QQ 群号 ${qq}` : `复制失败，请手动记录：${qq}`, ok ? 'ok' : 'error');
+  };
+
   $('btn-theme').addEventListener('click', () => {
     applyTheme(document.documentElement.dataset.theme === 'light' ? 'dark' : 'light');
     loadHistoryView();
@@ -944,7 +1027,7 @@ function bindEvents() {
   });
 
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') { closeModal(); closeDetail(); }
+    if (e.key === 'Escape') { closeModal(); closeDetail(); closeSheets(); }
     if (e.key === '/' && document.activeElement !== $('q')) { e.preventDefault(); $('q').focus(); }
   });
 

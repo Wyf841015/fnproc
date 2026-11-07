@@ -2,6 +2,32 @@
 
 现代化的 Linux 进程与系统资源管理器，飞牛 fnOS (fnOS) 应用形态，Web 界面适配桌面与手机。
 
+## v0.6.0 更新
+
+### 新增赞助与反馈入口
+
+顶栏加了两个按钮（和作者其它应用保持一致）：
+
+- **❤ 赞助作者**：弹窗展示支付宝 / 微信收款码，点击二维码可全屏放大，手机上长按即可识别
+- **✉️ 反馈与交流**：弹窗给出 QQ 群号（一键复制）、项目主页，以及提问题时建议附带的信息（版本号、
+  复现步骤、相关进程的 PID / 命令行）
+
+### 实现细节
+
+- 二维码图片按 **JPEG** 保存并登记 MIME（`.jpg → image/jpeg`）。原来是 `.png` 扩展名的 JPEG，
+  在带 `X-Content-Type-Options: nosniff` 的静态服务下容易被浏览器拒绝渲染
+- 复制走 `navigator.clipboard` → `document.execCommand('copy')` 双路径兜底：
+  fnOS WebView 经常不是安全上下文，只靠 Clipboard API 会「点了没反应」
+- 弹层按钮用 DOM 0 级 `element.onclick` 绑定（fnOS WebView 上比 addEventListener 稳）
+- Esc 键、点遮罩空白处都能关闭；`[hidden]` 由 v0.5.0 那条 `!important` 规则接管，不会再挡住页面
+
+实测（真实鼠标事件 Input.dispatchMouseEvent）
+- 点 ❤ → 弹层 display:grid / opacity:1，两张二维码 naturalSize 640×959 均已加载
+- 点二维码 → 放大层打开且图片已加载；点空白 → 关闭；Esc → 弹层关闭
+- 点 ✉ → QQ 群号 745565752、项目主页（target=_blank）、3 条提问建议齐全
+- 点「复制」→ toast「已复制 QQ 群号 745565752」
+- 控制台 0 报错
+
 ## v0.5.1 更新
 
 ### 修复：概览里的图表不显示（canvas → SVG）
