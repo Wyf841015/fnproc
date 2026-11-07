@@ -6,7 +6,7 @@
 <base href="/app/fnproc/">
 <title>进程管家 · fnproc</title>
 <link rel="icon" href="images/icon_64.png">
-<link rel="stylesheet" href="styles/app.css?v=0.6.2">
+<link rel="stylesheet" href="styles/app.css?v=0.1.0">
 </head>
 <body>
 <div class="app">
@@ -23,17 +23,20 @@
         <span class="sub" id="hostline">—</span>
       </div>
     </div>
+    <!-- 状态与操作独立成行：标题行只放名字和主机信息，按钮不再和标题抢宽度 -->
     <div class="topbar-actions">
       <span class="pill" id="conn-pill" data-state="connecting"><i class="dot"></i><span id="conn-text">连接中</span></span>
-      <button class="btn ghost icon-btn" id="btn-sponsor" title="赞助作者" type="button">
-        <span aria-hidden="true">❤</span>
-      </button>
-      <button class="btn ghost icon-btn" id="btn-feedback" title="反馈与交流" type="button">
-        <span aria-hidden="true">✉️</span>
-      </button>
-      <button class="btn ghost icon-btn" id="btn-theme" title="切换主题" type="button">
-        <span id="theme-icon">🌙</span>
-      </button>
+      <div class="action-btns">
+        <button class="btn ghost icon-btn" id="btn-sponsor" title="赞助作者" type="button">
+          <span aria-hidden="true">❤</span>
+        </button>
+        <button class="btn ghost icon-btn" id="btn-feedback" title="反馈与交流" type="button">
+          <span aria-hidden="true">✉️</span>
+        </button>
+        <button class="btn ghost icon-btn" id="btn-theme" title="切换主题" type="button">
+          <span id="theme-icon">🌙</span>
+        </button>
+      </div>
     </div>
   </header>
 
@@ -306,7 +309,7 @@
   </section>
 
   <footer class="footer">
-    <span>进程管家 <b id="ver">0.6.2</b> · 数据来自 /proc</span>
+    <span>进程管家 <b id="ver">0.1.0</b> · 数据来自 /proc</span>
     <span id="table-info" class="hint">—</span>
     <span id="ts-line">—</span>
   </footer>
@@ -402,7 +405,7 @@
     </div>
     <div class="fb-row">
       <span class="fb-label">项目主页</span>
-      <a class="fb-link" href="https://gitee.com/wyf1015" target="_blank" rel="noopener noreferrer">gitee.com/wyf1015</a>
+      <a class="fb-link" href="https://github.com/Wyf841015" target="_blank" rel="noopener noreferrer">github.com/Wyf841015</a>
     </div>
     <div class="fb-row column">
       <span class="fb-label">提问题时建议带上</span>
@@ -420,6 +423,6 @@
   <img id="lightbox-img" alt="二维码放大">
 </div>
 
-<script src="main.js?v=0.6.2" type="module"></script>
+<script src="main.js?v=0.1.0" type="module"></script>
 </body>
 </html>

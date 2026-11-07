@@ -67,12 +67,15 @@ body {
    grid 的第一列是 minmax(0, 1fr)，宽度上限就是「可用空间减去右列」，
    配合 overflow: hidden，子元素在物理上画不到右列上去 —— 重叠从此不可能发生。
    （之前用 flex + min-width:0 在个别 WebView 内核下仍会因内容溢出而叠字。） */
+/* 顶栏两行布局：
+   ① 标题行 —— 只有 logo + 名称 + 主机信息，独占整行，永远不会和按钮抢宽度
+   ② 操作行 —— 左边状态胶囊，右边赞助/反馈/主题三个按钮
+   用 flex column 而不是把按钮塞进标题行，重叠和挤压从结构上就不存在了。 */
 .topbar {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 12px;
-  min-height: 44px;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 10px;
 }
 .brand { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 12px; min-width: 0; overflow: hidden; }
 .brand-text { min-width: 0; overflow: hidden; }
@@ -88,7 +91,11 @@ body {
   display: block; margin-top: 1px; overflow: hidden; text-overflow: ellipsis;
   white-space: nowrap; max-width: 100%;
 }
-.topbar-actions { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
+.topbar-actions {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 8px; flex: 0 0 auto;
+}
+.action-btns { display: flex; align-items: center; gap: 8px; margin-left: auto; }
 
 .pill {
   display: inline-flex; align-items: center; gap: 6px; padding: 5px 10px; border-radius: 999px;
@@ -468,6 +475,7 @@ select {
   .brand-text .sub { max-width: 100%; font-size: 11px; }
   .topbar { gap: 8px; }
   .topbar-actions { gap: 6px; }
+  .action-btns { gap: 6px; }
   .icon-btn { width: 32px; height: 32px; }
   .procs-head { gap: 8px; }
   .search input { width: 100%; max-width: none; }
