@@ -105,7 +105,7 @@ function makeChart(canvas, opts) {
   return {
     resize,
     draw(data) {
-      const w = canvas.clientWidth || 600, h = Number(canvas.getAttribute('height')) || 120;
+      const w = canvas.clientWidth || 600, h = Number(canvas.getAttribute('height')) || 110;
       ctx.clearRect(0, 0, w, h);
       // 网格
       ctx.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue('--grid') || 'rgba(255,255,255,.06)';
@@ -114,19 +114,40 @@ function makeChart(canvas, opts) {
         const y = (h / 4) * i;
         ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
       }
-      opts.series.forEach((s) => line(data.map(s.get), s.color, s.max || 100, s.fill));
+      opts.series.forEach((s) => {
+        const maxV = typeof s.max === 'function' ? s.max(data) : (s.max || 100);
+        line(data.map(s.get), s.color, maxV, s.fill);
+      });
+      // Y 轴刻度（只给百分比类图表画，避免 IO 图误导）
+      if (opts.yLabels) {
+        ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--text-mute') || '#6b7b95';
+        ctx.font = '10px ui-monospace, Menlo, monospace';
+        ctx.textAlign = 'left';
+        ctx.fillText('100%', 2, 10);
+        ctx.fillText('50%', 2, h / 2 - 2);
+        ctx.fillText('0', 2, h - 4);
+      }
     },
   };
 }
 
 const chartCpu = makeChart($('chart-cpu'), {
-  series: [{ get: (d) => d.cpu, color: '#38bdf8', fill: 'rgba(56,189,248,.14)' }],
+  yLabels: true,
+  series: [{ get: (d) => d.cpu, color: '#38bdf8', fill: 'rgba(56,189,248,.14)', max: 100 }],
 });
 const chartMem = makeChart($('chart-mem'), {
+  yLabels: true,
   series: [
-    { get: (d) => d.mem, color: '#a78bfa', fill: 'rgba(167,139,250,.12)' },
-    { get: (d) => d.rd, color: '#34d399', max: 1, fill: null },
-    { get: (d) => d.wr, color: '#fbbf24', max: 1, fill: null },
+    { get: (d) => d.mem, color: '#a78bfa', fill: 'rgba(167,139,250,.12)', max: 100 },
+    { get: (d) => d.swap, color: '#fb923c', max: 100 },
+  ],
+});
+const chartIo = makeChart($('chart-io'), {
+  series: [
+    { get: (d) => d.rd, color: '#34d399', max: (rows) => Math.max(1024, ...rows.map((r) => r.rd || 0)) * 1.15 },
+    { get: (d) => d.wr, color: '#fbbf24', max: (rows) => Math.max(1024, ...rows.map((r) => r.wr || 0)) * 1.15 },
+    { get: (d) => d.rx, color: '#38bdf8', max: (rows) => Math.max(1024, ...rows.map((r) => r.rx || 0)) * 1.15 },
+    { get: (d) => d.tx, color: '#f472b6', max: (rows) => Math.max(1024, ...rows.map((r) => r.tx || 0)) * 1.15 },
   ],
 });
 
@@ -154,13 +175,26 @@ function renderKpis(s) {
   $('swap-bar').style.width = s.swap.usedPct + '%';
   $('swap-sub').textContent = s.swap.total ? `${fmtBytes(s.swap.used)} / ${fmtBytes(s.swap.total)}` : '未启用';
 
-  $('load-val').textContent = s.load.map((v) => v.toFixed(2)).join(' · ');
+  $('load-1').textContent = s.load[0].toFixed(2);
+  $('load-5').textContent = s.load[1].toFixed(2);
+  $('load-15').textContent = s.load[2].toFixed(2);
   $('uptime-val').textContent = fmtUptime(s.uptime);
   $('proc-val').textContent = s.procTotal;
   const threads = rowsCache.reduce((a, p) => a + (p.threads || 0), 0);
-  $('threads-val').textContent = threads ? `累计 ${threads} 线程` : '—';
-  $('io-val').textContent = `${fmtBps(s.io.readBps)} / ${fmtBps(s.io.writeBps)}`;
-  $('net-val').textContent = `网络 ↓${fmtBps(s.net.rxBps)} ↑${fmtBps(s.net.txBps)}`;
+  $('threads-val').textContent = threads ? `${threads} 线程` : '—';
+  $('io-val').textContent = `↓${fmtBps(s.io.readBps)} ↑${fmtBps(s.io.writeBps)}`;
+  $('net-val').textContent = `↓${fmtBps(s.net.rxBps)} ↑${fmtBps(s.net.txBps)}`;
+  $('cpu-legend').innerHTML = '';
+  $('cpu-legend').append('当前 ', Object.assign(document.createElement('b'), { textContent: fmtPct(s.cpu.totalPct) + '%' }));
+  $('lg-mem').textContent = fmtPct(s.mem.usedPct) + '%';
+  $('lg-swap').textContent = fmtPct(s.swap.usedPct) + '%';
+  $('lg-rd').textContent = fmtBps(s.io.readBps);
+  $('lg-wr').textContent = fmtBps(s.io.writeBps);
+  $('lg-rx').textContent = fmtBps(s.net.rxBps);
+  $('lg-tx').textContent = fmtBps(s.net.txBps);
+  const hist = s.history || [];
+  const peak = Math.max(1024, ...hist.map((h) => Math.max(h.rd || 0, h.wr || 0, h.rx || 0, h.tx || 0)));
+  $('io-scale').textContent = `纵轴峰值 ${fmtBps(peak)}`;
 
   // 每核
   const cores = $('cores');
@@ -184,11 +218,10 @@ function renderKpis(s) {
 
   $('ver').textContent = s.version;
   $('ts-line').textContent = '更新于 ' + new Date(s.ts).toLocaleTimeString();
-  chartCpu.draw(s.history || []);
-  chartMem.draw((s.history || []).map((h) => ({
-    ...h,
-    rd: h.rd, wr: h.wr,
-  })));
+  const hist2 = s.history || [];
+  chartCpu.draw(hist2);
+  chartMem.draw(hist2);
+  chartIo.draw(hist2);
 }
 
 // ── 渲染：进程表 ────────────────────────────────────────────────────────
@@ -427,8 +460,8 @@ async function loadAudit() {
 function bindEvents() {
   $('btn-theme').addEventListener('click', () => {
     applyTheme(document.documentElement.dataset.theme === 'light' ? 'dark' : 'light');
-    chartCpu.draw(lastSnapshot?.history || []);
-    chartMem.draw(lastSnapshot?.history || []);
+    const h = lastSnapshot?.history || [];
+    chartCpu.draw(h); chartMem.draw(h); chartIo.draw(h);
   });
 
   $('btn-refresh').addEventListener('click', () => refreshAll());

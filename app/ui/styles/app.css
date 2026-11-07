@@ -48,7 +48,7 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
-.hint { color: var(--text-mute); font-size: 12px; }
+.hint { color: var(--text-dim); font-size: 12px; }
 .sub { color: var(--text-dim); font-size: 12px; }
 
 .app { max-width: 1280px; margin: 0 auto; padding: 18px 16px 40px; display: flex; flex-direction: column; gap: 14px; }
@@ -99,7 +99,7 @@ body {
 }
 .kpi-head { display: flex; align-items: baseline; justify-content: space-between; gap: 6px; }
 .kpi-label { font-size: 12px; color: var(--text-dim); letter-spacing: .4px; }
-.kpi-sub { font-size: 11px; color: var(--text-mute); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.kpi-sub { font-size: 11.5px; color: var(--text-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .kpi-value { font-size: 26px; font-weight: 650; letter-spacing: -.5px; margin-top: 6px; line-height: 1.1; }
 .kpi-value small { font-size: 13px; font-weight: 500; color: var(--text-dim); margin-left: 2px; }
 .kpi-value.small { font-size: 15px; font-weight: 600; }
@@ -111,7 +111,7 @@ body {
 .kpi-swap .bar > i { background: linear-gradient(90deg, #fbbf24, #f97316); }
 
 /* ── 图表 ─────────────────────────────────────────────── */
-.charts { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; }
 .card { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); backdrop-filter: blur(8px); }
 .chart-card { padding: 12px 14px 10px; min-width: 0; }
 .card-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
@@ -127,6 +127,28 @@ canvas { width: 100%; display: block; margin-top: 8px; }
 .legend { display: flex; gap: 14px; margin-top: 6px; font-size: 11px; color: var(--text-mute); flex-wrap: wrap; }
 .legend .sw { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 5px; }
 .sw-mem { background: #a78bfa; } .sw-rd { background: #34d399; } .sw-wr { background: #fbbf24; }
+
+
+/* 负载三列（替代一长串数字，字号统一） */
+.triple { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin-top: 8px; }
+.triple > div { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.triple b { font-size: 17px; font-weight: 650; letter-spacing: -.3px; }
+.triple span { font-size: 10px; color: var(--text-mute); }
+
+/* 磁盘 / 网络两行式指标 */
+.duo { display: flex; flex-direction: column; gap: 5px; margin-top: 8px; }
+.duo > div { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.duo .dk { font-size: 10px; color: var(--text-mute); width: 28px; flex: 0 0 28px; }
+.duo b { font-size: 13px; font-weight: 600; font-family: ui-monospace, Menlo, Consolas, monospace; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* 图表轴提示：60 秒前 ←→ 现在 */
+.axis-hint { display: flex; justify-content: space-between; gap: 8px; margin-top: 4px; font-size: 10.5px; color: var(--text-mute); }
+
+/* 新增图例色 */
+.sw-swap { background: #fb923c; }
+.sw-rx { background: #38bdf8; }
+.sw-tx { background: #f472b6; }
+.legend b { color: var(--text-dim); font-weight: 600; font-family: ui-monospace, Menlo, monospace; }
 
 /* ── 进程表 ───────────────────────────────────────────── */
 .procs-card { padding: 12px 0 0; overflow: hidden; }
@@ -240,13 +262,17 @@ select {
 @keyframes tin { to { opacity: 1; transform: translateX(0); } }
 
 /* ── 响应式 ───────────────────────────────────────────── */
-@media (max-width: 1080px) {
+@media (max-width: 1180px) {
   .kpis { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+@media (max-width: 860px) {
+  .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 @media (max-width: 760px) {
   .app { padding: 12px 10px 32px; gap: 10px; }
   .charts { grid-template-columns: 1fr; }
   .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  .triple b { font-size: 15px; }
   .kpi { padding: 10px 11px; border-radius: 12px; }
   .kpi-value { font-size: 22px; }
   .hide-sm { display: none; }

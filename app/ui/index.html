@@ -48,35 +48,49 @@
       <div class="bar"><i id="swap-bar" style="width:0%"></i></div>
     </article>
     <article class="kpi">
-      <div class="kpi-head"><span class="kpi-label">负载</span><span class="kpi-sub">1m · 5m · 15m</span></div>
-      <div class="kpi-value small" id="load-val">0 · 0 · 0</div>
-      <div class="kpi-foot" id="uptime-val">—</div>
+      <div class="kpi-head"><span class="kpi-label">负载</span><span class="kpi-sub" id="uptime-val">—</span></div>
+      <div class="triple">
+        <div><b id="load-1">0.00</b><span>1m</span></div>
+        <div><b id="load-5">0.00</b><span>5m</span></div>
+        <div><b id="load-15">0.00</b><span>15m</span></div>
+      </div>
     </article>
     <article class="kpi">
-      <div class="kpi-head"><span class="kpi-label">进程</span><span class="kpi-sub">总数</span></div>
-      <div class="kpi-value"><span id="proc-val">0</span></div>
-      <div class="kpi-foot" id="threads-val">—</div>
+      <div class="kpi-head"><span class="kpi-label">进程</span><span class="kpi-sub" id="threads-val">—</span></div>
+      <div class="kpi-value"><span id="proc-val">0</span><small>个</small></div>
     </article>
     <article class="kpi">
-      <div class="kpi-head"><span class="kpi-label">磁盘 IO</span><span class="kpi-sub">读 / 写</span></div>
-      <div class="kpi-value small" id="io-val">—</div>
-      <div class="kpi-foot" id="net-val">网络 —</div>
+      <div class="kpi-head"><span class="kpi-label">磁盘 / 网络</span><span class="kpi-sub">读写 · 收发</span></div>
+      <div class="duo">
+        <div><span class="dk">磁盘</span><b id="io-val">—</b></div>
+        <div><span class="dk">网络</span><b id="net-val">—</b></div>
+      </div>
     </article>
   </section>
 
   <section class="charts">
     <article class="card chart-card">
       <div class="card-head"><h2>CPU 使用率</h2><span class="hint" id="cpu-model">—</span></div>
-      <canvas id="chart-cpu" height="120"></canvas>
+      <canvas id="chart-cpu" height="110"></canvas>
+      <div class="axis-hint"><span>60 秒前</span><span id="cpu-legend">当前 <b>0%</b></span><span>现在</span></div>
       <div class="cores" id="cores"></div>
     </article>
     <article class="card chart-card">
-      <div class="card-head"><h2>内存 / IO</h2><span class="hint">近 60 秒</span></div>
-      <canvas id="chart-mem" height="120"></canvas>
+      <div class="card-head"><h2>内存 / Swap</h2><span class="hint">百分比 · 60 秒</span></div>
+      <canvas id="chart-mem" height="110"></canvas>
       <div class="legend">
-        <span><i class="sw sw-mem"></i>内存%</span>
-        <span><i class="sw sw-rd"></i>磁盘读</span>
-        <span><i class="sw sw-wr"></i>磁盘写</span>
+        <span><i class="sw sw-mem"></i>内存 <b id="lg-mem">0%</b></span>
+        <span><i class="sw sw-swap"></i>Swap <b id="lg-swap">0%</b></span>
+      </div>
+    </article>
+    <article class="card chart-card">
+      <div class="card-head"><h2>磁盘 / 网络</h2><span class="hint" id="io-scale">自动缩放</span></div>
+      <canvas id="chart-io" height="110"></canvas>
+      <div class="legend">
+        <span><i class="sw sw-rd"></i>读 <b id="lg-rd">0</b></span>
+        <span><i class="sw sw-wr"></i>写 <b id="lg-wr">0</b></span>
+        <span><i class="sw sw-rx"></i>收 <b id="lg-rx">0</b></span>
+        <span><i class="sw sw-tx"></i>发 <b id="lg-tx">0</b></span>
       </div>
     </article>
   </section>
