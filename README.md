@@ -2,6 +2,42 @@
 
 现代化的 Linux 进程与系统资源管理器，飞牛 fnOS (fnOS) 应用形态，Web 界面适配桌面与手机。
 
+## v0.6.2 更新
+
+### 顶栏改成 CSS Grid，重叠在结构上不可能发生
+
+v0.6.1 用 flex + `min-width: 0` 修了一轮，但 flex 下只要内容比盒子宽就仍会溢出
+（不同 WebView 内核对收缩计算不一致）。v0.6.2 直接换成两列 grid：
+
+```css
+.topbar { display: grid; grid-template-columns: minmax(0, 1fr) auto; }
+.brand  { display: grid; grid-template-columns: auto minmax(0, 1fr); overflow: hidden; }
+.brand-text { min-width: 0; overflow: hidden; }
+```
+
+左列宽度上限 = 可用空间 − 右列宽度，再配 `overflow: hidden`，副标题在物理上画不到
+右侧按钮区上去。
+
+### 静态资源加版本号，避免 WebView 用旧 CSS
+
+```html
+<link rel="stylesheet" href="styles/app.css?v=0.6.2">
+<script src="main.js?v=0.6.2" type="module"></script>
+```
+
+fnOS 的 WebView 会缓存 CSS/JS（之前图表修复、按钮修复都遇到过「改完看不到」）。
+带版本查询串后，每次发版浏览器都必须重新取文件。
+
+### 实测：9 个宽度全覆盖，重叠元素对 0
+
+| 宽度 | topbar | 胶囊 | 副标题省略 | 溢出父级 | 重叠对 |
+|---|---|---|---|---|---|
+| 1280 / 1150 / 980 / 900 / 780 / 600 / 414 | grid | 59×30 | 否 | 0 px | 0 |
+| 375 / 320 | grid | 59×30 | 是 | 0 px | 0 |
+
+检测方法：把顶栏、KPI、tabs 里所有可见元素两两做 `getBoundingClientRect` 相交
+（排除父子关系），任一维度重叠 > 1px 即报。不是靠肉眼。
+
 ## v0.6.1 更新
 
 ### 修复：顶栏副标题被「实时」胶囊盖住，胶囊还被挤成竖排

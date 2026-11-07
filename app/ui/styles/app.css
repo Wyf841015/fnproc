@@ -63,9 +63,19 @@ body {
 /* 顶栏：右侧按钮组不许被压缩，左侧品牌块允许收缩并用省略号收尾。
    之前 .brand-text 没设 min-width:0，副标题又用 46vw 当上限 —— 结果副标题盒子
    比 flex 实际分给它的宽度更宽，直接溢出到「实时」胶囊底下，胶囊还被挤成竖排。 */
-.topbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-.brand { display: flex; align-items: center; gap: 12px; min-width: 0; flex: 1 1 auto; }
-.brand-text { min-width: 0; flex: 1 1 auto; }
+/* 顶栏用 CSS Grid 两列：左列可收缩并强制裁剪，右列按内容固定。
+   grid 的第一列是 minmax(0, 1fr)，宽度上限就是「可用空间减去右列」，
+   配合 overflow: hidden，子元素在物理上画不到右列上去 —— 重叠从此不可能发生。
+   （之前用 flex + min-width:0 在个别 WebView 内核下仍会因内容溢出而叠字。） */
+.topbar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  min-height: 44px;
+}
+.brand { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 12px; min-width: 0; overflow: hidden; }
+.brand-text { min-width: 0; overflow: hidden; }
 .logo {
   width: 40px; height: 40px; flex: 0 0 40px; border-radius: 12px; display: grid; place-items: center;
   color: #04121f; background: linear-gradient(135deg, var(--accent), var(--accent-2));
