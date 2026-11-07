@@ -68,6 +68,17 @@
     </article>
   </section>
 
+  <div class="charts-bar">
+    <span class="hint" id="range-hint">实时 · 最近 60 秒</span>
+    <select id="range" title="图表时间范围">
+      <option value="60s">实时 60 秒</option>
+      <option value="10">最近 10 分钟</option>
+      <option value="60">最近 1 小时</option>
+      <option value="360">最近 6 小时</option>
+      <option value="1440">最近 24 小时</option>
+    </select>
+  </div>
+
   <section class="charts">
     <article class="card chart-card">
       <div class="card-head"><h2>CPU 使用率</h2><span class="hint" id="cpu-model">—</span></div>
@@ -231,7 +242,7 @@
   </section>
 
   <footer class="footer">
-    <span>进程管家 <b id="ver">0.3.0</b> · 数据来自 /proc</span>
+    <span>进程管家 <b id="ver">0.4.0</b> · 数据来自 /proc</span>
     <span id="ts-line">—</span>
   </footer>
 </div>

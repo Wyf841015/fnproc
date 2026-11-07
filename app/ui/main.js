@@ -156,7 +156,8 @@ let lastSnapshot = null;
 let rowsCache = [];
 let sortKey = 'cpu';
 let query = '';
-let currentView = 'list';        // list | tree | ports | containers
+let currentView = 'list';        // list | tree | ports | services | containers
+let historyRange = '60s';        // 60s = 实时内存数据；其它 = 从 /api/history 读落盘数据
 let containerFilter = '';        // 容器名或短 ID，非空时列表只显示该容器进程
 const collapsed = new Set();     // 树视图里被折叠的 pid
 let currentDetailPid = null;
@@ -221,10 +222,12 @@ function renderKpis(s) {
 
   $('ver').textContent = s.version;
   $('ts-line').textContent = '更新于 ' + new Date(s.ts).toLocaleTimeString();
-  const hist2 = s.history || [];
-  chartCpu.draw(hist2);
-  chartMem.draw(hist2);
-  chartIo.draw(hist2);
+  if (historyRange === '60s') {
+    const hist2 = s.history || [];
+    chartCpu.draw(hist2);
+    chartMem.draw(hist2);
+    chartIo.draw(hist2);
+  }
 }
 
 // ── 渲染：进程表 ────────────────────────────────────────────────────────
@@ -545,6 +548,30 @@ async function fetchProcesses() {
   renderTable(d.rows || []);
 }
 
+// ── 历史曲线（从落盘的 history.jsonl 读）───────────────────────────────
+async function loadHistoryView() {
+  if (historyRange === '60s') {
+    loadHistoryView();
+    $('range-hint').textContent = '实时 · 最近 60 秒';
+    return;
+  }
+  try {
+    const r = await fetch(`${API}/history?minutes=${historyRange}`, { cache: 'no-store' });
+    const d = await r.json();
+    const rows = (d.rows || []).map((x) => ({
+      ts: x.ts, cpu: x.cpu, mem: x.mem, swap: x.swap,
+      rd: x.rd, wr: x.wr, rx: x.rx, tx: x.tx,
+    }));
+    chartCpu.draw(rows); chartMem.draw(rows); chartIo.draw(rows);
+    const span = rows.length
+      ? `${new Date(rows[0].ts).toLocaleTimeString()} → ${new Date(rows[rows.length - 1].ts).toLocaleTimeString()}`
+      : '暂无历史数据';
+    $('range-hint').textContent = `${span} · ${rows.length} 个采样点（每 30 秒）`;
+  } catch (e) {
+    $('range-hint').textContent = '历史数据读取失败：' + e.message;
+  }
+}
+
 function setConn(mode, text) {
   const pill = $('conn-pill');
   pill.dataset.state = mode;
@@ -730,11 +757,16 @@ async function loadAudit() {
 function bindEvents() {
   $('btn-theme').addEventListener('click', () => {
     applyTheme(document.documentElement.dataset.theme === 'light' ? 'dark' : 'light');
-    const h = lastSnapshot?.history || [];
-    chartCpu.draw(h); chartMem.draw(h); chartIo.draw(h);
+    loadHistoryView();
   });
 
-  $('btn-refresh').addEventListener('click', () => refreshAll());
+  $('btn-refresh').addEventListener('click', () => { refreshAll(); loadHistoryView(); });
+
+  // 图表时间范围
+  $('range').addEventListener('change', (e) => {
+    historyRange = e.target.value;
+    loadHistoryView();
+  });
 
   const q = $('q');
   let qTimer = null;
@@ -863,4 +895,5 @@ function bindEvents() {
   startStream();
   // 表格数据 3 秒刷一次（SSE 只推概览与 top30，避免整表每秒重排导致选择/滚动丢失）
   setInterval(() => { refreshView(); }, 3000);
+  setInterval(() => { if (historyRange !== '60s') loadHistoryView(); }, 30000);
 })();

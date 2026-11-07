@@ -2,6 +2,20 @@
 
 现代化的 Linux 进程与系统资源管理器，飞牛 fnOS (fnOS) 应用形态，Web 界面适配桌面与手机。
 
+## v0.4.0 更新
+
+### 历史数据落盘（重启不再清空）
+
+- 每 30 秒把当前指标追加一行 JSON 到 `<PKGVAR>/data/history.jsonl`
+  （字段：ts / cpu / mem / swap / load1 / rd / wr / rx / tx）
+- 图表新增时间范围选择：**实时 60 秒**（内存数据，1 秒粒度）/ 10 分钟 / 1 小时 / 6 小时 / 24 小时
+- 长时段从文件读，超过 240 点自动下采样，避免把曲线画花
+- 文件超过 8MB 自动轮转，只保留最后 3000 行（约 25 小时）
+- 写盘失败只记一条警告、不影响监控主功能；`/api/history?minutes=N` 返回区间数据
+
+为什么 30 秒而不是 1 秒：24 小时 × 1 秒 = 8.6 万行，磁盘和读取都不划算；
+监控趋势看 30 秒粒度足够，实时那 60 秒仍由内存里的 1 秒采样提供。
+
 ## v0.3.0 更新
 
 ### 新增「服务」视图（systemd）
@@ -75,6 +89,7 @@
 | GET | `/api/stream` | SSE 实时快照 |
 | GET | `/api/ports` | 监听端口（含占用进程 / 用户 / 容器） |
 | GET | `/api/containers` | 容器维度聚合（进程数 / CPU / 内存 / 线程） |
+| GET | `/api/history?minutes=` | 历史曲线数据（落盘，最多 24 小时，下采样到 240 点） |
 | GET | `/api/services?q=&state=` | systemd 服务列表（state: running/stopped/failed） |
 | POST | `/api/service` | `{name, action: start\|stop\|restart, confirm:true}` |
 | GET | `/api/processes?container=` | 按容器名或短 ID 过滤进程 |

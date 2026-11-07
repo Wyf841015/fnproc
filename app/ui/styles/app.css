@@ -110,6 +110,10 @@ body {
 .kpi-mem .bar > i { background: linear-gradient(90deg, #818cf8, #a78bfa); }
 .kpi-swap .bar > i { background: linear-gradient(90deg, #fbbf24, #f97316); }
 
+
+/* ── 图表时间范围条 ───────────────────────────────────── */
+.charts-bar { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 0 4px; margin-top: 2px; }
+.charts-bar select { padding: 5px 9px; font-size: 12.5px; }
 /* ── 图表 ─────────────────────────────────────────────── */
 .charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; }
 .card { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); backdrop-filter: blur(8px); }

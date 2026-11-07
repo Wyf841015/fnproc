@@ -9,7 +9,7 @@
 //   · cmdline / io 是较贵的读（每进程一个文件），用 TTL 缓存：
 //     cmdline 10s、io 5s，详情页则强制刷新。
 //   · 所有 /proc 读取都 try/catch：进程在扫描过程中消失是常态，不能因此 500。
-import { readFileSync, readdirSync, existsSync, unlinkSync, statSync, readlinkSync } from 'node:fs';
+import { readFileSync, readdirSync, existsSync, unlinkSync, statSync, readlinkSync, mkdirSync, appendFileSync, writeFileSync } from 'node:fs';
 import { join, dirname, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createServer } from 'node:http';
@@ -25,7 +25,7 @@ const PORT = parseInt(process.env.PORT || '47951', 10);
 const SOCK_DIR = process.env.FNPROC_SOCK_DIR || TARGET_DIR;
 const SOCK_PATH = join(SOCK_DIR, 'fnproc.sock');
 const GATEWAY_PREFIX = '/app/fnproc';
-const VERSION = '0.3.0';
+const VERSION = '0.4.0';
 const SAMPLE_MS = 1000;
 const HISTORY_MAX = 120;              // 内存里保留 120 个采样点，够前端画满图
 
@@ -527,6 +527,68 @@ function auditPush(entry) {
   if (audit.length > 100) audit.pop();
 }
 
+
+// ── 历史落盘 ────────────────────────────────────────────────────────────
+// 内存里的 history 只有 120 个点（2 分钟），进程一重启就没了。这里每 30 秒
+// 追加一行 JSON 到 <PKGVAR>/data/history.jsonl，供「最近 10 分钟 / 1 小时 /
+// 6 小时 / 24 小时」的长时段曲线读取。
+// 文件超过 8MB 就只保留最后 3000 行（约 25 小时），避免无限增长。
+const PKGVAR = process.env.TRM_PKGVAR || process.env.TRIM_PKGVAR || join(TARGET_DIR, 'data');
+const DATA_DIR = join(PKGVAR, 'data');
+const HISTORY_FILE = join(DATA_DIR, 'history.jsonl');
+const HISTORY_MAX_BYTES = 8 * 1024 * 1024;
+const HISTORY_KEEP_LINES = 3000;
+
+try { mkdirSync(DATA_DIR, { recursive: true }); } catch { /* 只读环境就静默降级 */ }
+
+function appendHistory() {
+  const row = {
+    ts: Date.now(),
+    cpu: state.cpu.totalPct,
+    mem: state.mem.usedPct,
+    swap: state.swap.usedPct,
+    load1: state.load[0],
+    rd: state.io.readBps,
+    wr: state.io.writeBps,
+    rx: state.net.rxBps,
+    tx: state.net.txBps,
+  };
+  try {
+    appendFileSync(HISTORY_FILE, JSON.stringify(row) + '\n');
+    const size = statSync(HISTORY_FILE).size;
+    if (size > HISTORY_MAX_BYTES) {
+      const lines = readFileSync(HISTORY_FILE, 'utf8').trim().split('\n');
+      writeFileSync(HISTORY_FILE, lines.slice(-HISTORY_KEEP_LINES).join('\n') + '\n');
+      console.log(`[history] rotated ${lines.length} → ${HISTORY_KEEP_LINES} 行`);
+    }
+  } catch (e) {
+    // 写盘失败不影响监控主功能
+    if (!globalThis.__histWarned) { console.error('[history] 写入失败:', e.message); globalThis.__histWarned = true; }
+  }
+}
+
+function readHistory(minutes) {
+  const since = Date.now() - Math.min(1440, Math.max(1, minutes)) * 60000;
+  let lines = [];
+  try { lines = readFileSync(HISTORY_FILE, 'utf8').trim().split('\n'); } catch { return []; }
+  const out = [];
+  for (const line of lines) {
+    if (!line) continue;
+    try {
+      const r = JSON.parse(line);
+      if (r.ts >= since) out.push(r);
+    } catch { /* 跳过坏行 */ }
+  }
+  // 下采样到 ≤240 点，避免 6/24 小时把前端画花
+  if (out.length > 240) {
+    const step = Math.ceil(out.length / 240);
+    const d = [];
+    for (let i = 0; i < out.length; i += step) d.push(out[i]);
+    return d;
+  }
+  return out;
+}
+
 const SIGNALS = new Set(['SIGTERM', 'SIGKILL', 'SIGSTOP', 'SIGCONT', 'SIGHUP', 'SIGINT', 'SIGUSR1', 'SIGUSR2']);
 
 // ── systemd 服务 ────────────────────────────────────────────────────────
@@ -746,6 +808,16 @@ async function handle(req, res, pathname, query) {
     return;
   }
 
+  if (pathname === '/api/history') {
+    const minutes = num(query.get('minutes')) || 60;
+    const rows = readHistory(minutes);
+    sendJSON(res, 200, {
+      ts: Date.now(), minutes, count: rows.length,
+      file: HISTORY_FILE, rows,
+    });
+    return;
+  }
+
   if (pathname === '/api/services') {
     const q = String(query.get('q') || '').toLowerCase().trim();
     const state = String(query.get('state') || '').trim();
@@ -822,6 +894,7 @@ sockServer.listen(SOCK_PATH, () => console.log(`fnproc UNIX socket listening: ${
 refreshDocker();
 refreshInodePorts();
 refreshPidPorts();
+setInterval(appendHistory, 30000);   // 历史每 30 秒一行
 setInterval(() => { refreshDocker(); refreshInodePorts(); refreshPidPorts(); }, 10000);
 
 // 先跑一轮采样，避免首屏全是 0（进程 CPU% 需要两次采样才有意义）
