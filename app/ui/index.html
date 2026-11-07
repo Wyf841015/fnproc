@@ -102,6 +102,7 @@
         <button class="vbtn" data-view="tree" type="button">树</button>
         <button class="vbtn" data-view="ports" type="button">端口</button>
         <button class="vbtn" data-view="containers" type="button">容器</button>
+        <button class="vbtn" data-view="services" type="button">服务</button>
       </div>
       <div class="procs-tools">
         <div class="search">
@@ -199,6 +200,30 @@
       </table>
       <div class="empty" id="containers-empty" hidden>没有检测到容器进程（docker 不可用或未运行容器）</div>
     </div>
+
+    <div class="table-wrap" id="view-services" hidden>
+      <div class="svc-tools">
+        <span class="hint" id="svc-counts">—</span>
+        <select id="svc-state" title="状态筛选">
+          <option value="">全部状态</option>
+          <option value="running">运行中</option>
+          <option value="stopped">未运行</option>
+          <option value="failed">失败</option>
+        </select>
+      </div>
+      <table class="ptable">
+        <thead>
+          <tr>
+            <th>服务</th>
+            <th>状态</th>
+            <th class="hide-sm">说明</th>
+            <th>操作</th>
+          </tr>
+        </thead>
+        <tbody id="svcbody"></tbody>
+      </table>
+      <div class="empty" id="services-empty" hidden>没有匹配的服务</div>
+    </div>
     <div class="table-foot">
       <span id="table-info">—</span>
       <span class="hint">点击行查看详情 · 数值每秒刷新</span>
@@ -206,7 +231,7 @@
   </section>
 
   <footer class="footer">
-    <span>进程管家 <b id="ver">0.2.0</b> · 数据来自 /proc</span>
+    <span>进程管家 <b id="ver">0.3.0</b> · 数据来自 /proc</span>
     <span id="ts-line">—</span>
   </footer>
 </div>

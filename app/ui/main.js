@@ -425,11 +425,84 @@ async function renderContainers() {
   $('table-info').textContent = `${d.total} 个容器${d.dockerAvailable ? '' : '（docker 名解析不可用，显示短 ID）'}`;
 }
 
+// ── 视图：systemd 服务 ──────────────────────────────────────────────────
+async function renderServices() {
+  const q = new URL(API + '/services', location.origin);
+  if (query) q.searchParams.set('q', query);
+  const st = $('svc-state').value;
+  if (st) q.searchParams.set('state', st);
+  const r = await fetch(q.toString(), { cache: 'no-store' });
+  if (!r.ok) throw new Error('服务列表请求失败: HTTP ' + r.status);
+  const d = await r.json();
+  const tb = $('svcbody');
+  tb.textContent = '';
+  const frag = document.createDocumentFragment();
+  for (const u of d.units || []) {
+    const tr = el('tr');
+    tr.dataset.unit = u.name;
+    const nm = el('td', 'svc-name mono', u.name.replace(/\.service$/, ''));
+    tr.appendChild(nm);
+    const stTd = el('td');
+    const cls = u.active === 'active' ? 's-R' : (u.active === 'failed' ? 's-Z' : 's-T');
+    stTd.appendChild(el('span', 'state ' + cls, u.active === 'active' ? '运行中' : (u.active === 'failed' ? '失败' : '未运行')));
+    if (u.sub && u.sub !== u.active) stTd.appendChild(el('span', 'hint svc-sub', u.sub));
+    tr.appendChild(stTd);
+    tr.appendChild(el('td', 'hide-sm svc-desc', u.desc || '—'));
+    const act = el('td', 'act svc-actions');
+    const mk = (label, action, cls2) => {
+      const b = el('button', 'btn tiny' + (cls2 ? ' ' + cls2 : ''), label);
+      b.type = 'button';
+      b.dataset.action = 'service';
+      b.dataset.unit = u.name;
+      b.dataset.op = action;
+      if (u.protected && action !== 'start') { b.disabled = true; b.title = '关键服务，禁止该操作'; }
+      return b;
+    };
+    if (u.active === 'active') {
+      act.append(mk('重启', 'restart'), mk('停止', 'stop', 'warn'));
+    } else {
+      act.append(mk('启动', 'start'));
+    }
+    tr.appendChild(act);
+    frag.appendChild(tr);
+  }
+  tb.appendChild(frag);
+  $('services-empty').hidden = (d.units || []).length > 0;
+  const c = d.counts || {};
+  $('svc-counts').textContent = `共 ${c.all ?? 0} 个服务 · 运行中 ${c.running ?? 0}${c.failed ? ` · 失败 ${c.failed}` : ''}`;
+  $('table-info').textContent = `${d.total} 个服务`;
+}
+
+async function doServiceAction(name, action) {
+  const label = { start: '启动', stop: '停止', restart: '重启' }[action] || action;
+  confirmModal(
+    `${label}服务`,
+    `目标：${name}\n操作：${label}${action === 'stop' ? '\n\n停止后依赖它的功能会中断。' : ''}`,
+    '确定' + label,
+    async () => {
+      try {
+        const r = await fetch(API + '/service', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name, action, confirm: true }),
+        });
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+        toast(`${name} ${label}成功`, 'ok');
+        loadAudit();
+        renderServices();
+      } catch (e) {
+        toast(`${label}失败：` + e.message, 'error');
+      }
+    },
+  );
+}
+
 // ── 视图切换 ────────────────────────────────────────────────────────────
 function setView(v) {
   currentView = v;
   for (const b of $('views').querySelectorAll('.vbtn')) b.classList.toggle('active', b.dataset.view === v);
-  for (const id of ['view-list', 'view-tree', 'view-ports', 'view-containers']) {
+  for (const id of ['view-list', 'view-tree', 'view-ports', 'view-containers', 'view-services']) {
     $(id).hidden = (id !== 'view-' + v);
   }
   const showFilter = v === 'list' || v === 'tree';
@@ -442,6 +515,7 @@ async function refreshView() {
   try {
     if (currentView === 'ports') { await renderPorts(); return; }
     if (currentView === 'containers') { await renderContainers(); return; }
+    if (currentView === 'services') { await renderServices(); return; }
     const u = new URL(API + '/processes', location.origin);
     u.searchParams.set('sort', sortKey);
     u.searchParams.set('limit', '2000');
@@ -639,10 +713,12 @@ async function loadAudit() {
       const li = el('li', a.ok ? 'ok' : 'err');
       const t = new Date(a.at);
       const hhmm = `${String(t.getHours()).padStart(2, '0')}:${String(t.getMinutes()).padStart(2, '0')}:${String(t.getSeconds()).padStart(2, '0')}`;
+      const what = a.kind === 'service' ? a.signal : a.signal;
+      const target = a.kind === 'service' ? a.name : `${a.name} (${a.pid})`;
       li.append(
         el('span', 'mono', hhmm),
-        el('span', 'mono', a.signal),
-        el('span', 'audit-name', `${a.name} (${a.pid})`),
+        el('span', 'mono', what),
+        el('span', 'audit-name', target),
         el('span', 'hint', a.ok ? '成功' : (a.error || '失败')),
       );
       ul.appendChild(li);
@@ -700,6 +776,15 @@ function bindEvents() {
     const tr = e.target.closest('tr[data-pid]');
     if (tr) openDetail(Number(tr.dataset.pid));
   });
+
+  // 服务视图：启动 / 停止 / 重启
+  $('svcbody').addEventListener('click', (e) => {
+    const b = e.target.closest('button[data-action="service"]');
+    if (!b || b.disabled) return;
+    e.stopPropagation();
+    doServiceAction(b.dataset.unit, b.dataset.op);
+  });
+  $('svc-state').addEventListener('change', () => renderServices().catch((e) => toast(e.message, 'error')));
 
   // 端口视图：点行看进程详情
   $('portbody').addEventListener('click', (e) => {

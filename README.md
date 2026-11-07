@@ -2,6 +2,26 @@
 
 现代化的 Linux 进程与系统资源管理器，飞牛 fnOS (fnOS) 应用形态，Web 界面适配桌面与手机。
 
+## v0.3.0 更新
+
+### 新增「服务」视图（systemd）
+
+- 列出全部 service（本机 239 个：运行中 129 / 失败 3），支持按状态筛选（全部 / 运行中 / 未运行 / 失败）与关键字搜索
+- 每行可直接 **启动 / 停止 / 重启**，全部走二次确认，并写入操作审计
+- 状态徽章区分 运行中 / 未运行 / 失败，并显示 systemd 的 sub 状态（running / exited / failed / dead）
+
+### 安全约束（服务操作比杀进程更危险，所以卡得更死）
+
+- 服务名必须匹配 `^[A-Za-z0-9@._:\-]+\.service$`，路径穿越、分号注入、不带 `.service` 后缀的一律拒绝
+- 关键服务黑名单禁止 stop/restart（只允许 start，用于救回来）：
+  `ssh/sshd`、`dbus`、`systemd-logind`、`systemd-journald`、`systemd-udevd`、
+  `systemd-networkd`、`networking`、`NetworkManager`、`cron`
+- 动作白名单只有 start/stop/restart；必须带 `confirm: true`
+- 界面上这些按钮直接置灰并带提示，不是只在后端拦
+
+实测拒绝用例：`../../../etc/passwd`、`trim_app_center`（无 .service）、`ssh.service;id`、
+`sshd.service` 的 stop/restart、`action=nuke`、缺 confirm —— 全部 400 且给出中文原因。
+
 ## v0.2.0 更新
 
 ### 新增四个视图
@@ -55,6 +75,8 @@
 | GET | `/api/stream` | SSE 实时快照 |
 | GET | `/api/ports` | 监听端口（含占用进程 / 用户 / 容器） |
 | GET | `/api/containers` | 容器维度聚合（进程数 / CPU / 内存 / 线程） |
+| GET | `/api/services?q=&state=` | systemd 服务列表（state: running/stopped/failed） |
+| POST | `/api/service` | `{name, action: start\|stop\|restart, confirm:true}` |
 | GET | `/api/processes?container=` | 按容器名或短 ID 过滤进程 |
 | GET | `/api/health` | 健康检查 |
 

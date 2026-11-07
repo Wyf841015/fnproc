@@ -234,6 +234,18 @@ select {
 .ptable td.port { font-weight: 650; }
 .ptable td.small-id { font-size: 11px; color: var(--text-mute); }
 
+
+/* ── systemd 服务视图 ─────────────────────────────────── */
+.svc-tools { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 14px 4px; flex-wrap: wrap; }
+.svc-name { font-weight: 600; font-size: 12.5px; }
+.svc-desc { color: var(--text-mute); font-size: 12px; max-width: 460px; overflow: hidden; text-overflow: ellipsis; }
+.svc-sub { margin-left: 6px; font-size: 11px; }
+.svc-actions { display: flex; gap: 6px; justify-content: flex-end; }
+.btn.warn { border-color: rgba(251, 191, 36, .45); color: var(--warn); }
+.btn.warn:hover { background: rgba(251, 191, 36, .12); }
+.btn:disabled { opacity: .45; cursor: not-allowed; }
+.btn:disabled:hover { transform: none; border-color: var(--line); }
+
 /* ── 抽屉 ─────────────────────────────────────────────── */
 .drawer-mask {
   position: fixed; inset: 0; background: rgba(2, 8, 23, .5); backdrop-filter: blur(2px);
@@ -321,6 +333,8 @@ select {
   .views { width: 100%; justify-content: space-between; }
   .vbtn { flex: 1; text-align: center; padding: 6px 4px; }
   .tree-table .tree-cell { max-width: none; }
+  .svc-actions { flex-wrap: wrap; }
+  .svc-desc { max-width: none; }
   .brand-text .sub { max-width: 40vw; }
   .procs-head { gap: 8px; }
   .search input { width: 100%; max-width: none; }

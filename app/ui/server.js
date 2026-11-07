@@ -25,7 +25,7 @@ const PORT = parseInt(process.env.PORT || '47951', 10);
 const SOCK_DIR = process.env.FNPROC_SOCK_DIR || TARGET_DIR;
 const SOCK_PATH = join(SOCK_DIR, 'fnproc.sock');
 const GATEWAY_PREFIX = '/app/fnproc';
-const VERSION = '0.2.0';
+const VERSION = '0.3.0';
 const SAMPLE_MS = 1000;
 const HISTORY_MAX = 120;              // 内存里保留 120 个采样点，够前端画满图
 
@@ -529,6 +529,61 @@ function auditPush(entry) {
 
 const SIGNALS = new Set(['SIGTERM', 'SIGKILL', 'SIGSTOP', 'SIGCONT', 'SIGHUP', 'SIGINT', 'SIGUSR1', 'SIGUSR2']);
 
+// ── systemd 服务 ────────────────────────────────────────────────────────
+// systemctl 调用有开销（几十到几百毫秒），所以结果缓存 5 秒；名字进 URL/JSON
+// 都要先过白名单，防止把 "ssh.service; rm -rf /" 这种塞进 execFile 的参数。
+let unitsCache = { at: 0, list: [] };
+const UNIT_RE = /^[A-Za-z0-9@._:\\-]+\.service$/;
+
+// 停掉这些会让机器失联或直接瘫痪，禁止 stop/restart（start 允许，用于救回来）
+const PROTECTED_UNITS = new Set([
+  'ssh.service', 'sshd.service', 'dbus.service', 'systemd-logind.service',
+  'systemd-journald.service', 'systemd-udevd.service', 'systemd-networkd.service',
+  'networking.service', 'NetworkManager.service', 'cron.service',
+]);
+
+function listUnits(force = false) {
+  const now = Date.now();
+  if (!force && now - unitsCache.at < 5000) return unitsCache.list;
+  let list = [];
+  try {
+    const out = execFileSync('systemctl',
+      ['list-units', '--type=service', '--all', '--no-legend', '--no-pager', '--plain'],
+      { timeout: 6000, encoding: 'utf8' });
+    for (const line of out.split('\n')) {
+      const t = line.trim();
+      if (!t) continue;
+      const f = t.split(/\s+/);
+      if (f.length < 4) continue;
+      const [name, load, active, sub] = f;
+      if (!name.endsWith('.service')) continue;
+      const desc = t.slice(t.indexOf(sub, name.length + load.length + active.length) + sub.length).trim();
+      list.push({ name, load, active, sub, desc, protected: PROTECTED_UNITS.has(name) });
+    }
+  } catch { /* 非 systemd 环境：返回空表，前端提示即可 */ }
+  unitsCache = { at: now, list };
+  return list;
+}
+
+const SERVICE_ACTIONS = new Set(['start', 'stop', 'restart']);
+
+function runServiceAction(name, action) {
+  if (!UNIT_RE.test(name)) return { ok: false, error: '服务名不合法' };
+  if (!SERVICE_ACTIONS.has(action)) return { ok: false, error: '不支持的操作：' + action };
+  if (PROTECTED_UNITS.has(name) && action !== 'start') {
+    return { ok: false, error: `${name} 属于关键服务，禁止 ${action}（会导致失联或系统不可用）` };
+  }
+  try {
+    execFileSync('systemctl', [action, name], { timeout: 20000, encoding: 'utf8' });
+    unitsCache.at = 0;   // 让下一次查询重新拉取
+    return { ok: true };
+  } catch (e) {
+    const msg = String(e.stderr || e.message || e).trim().split('\n').slice(0, 2).join(' ');
+    return { ok: false, error: msg.slice(0, 200) || 'systemctl 执行失败' };
+  }
+}
+
+
 // ── 路由 ────────────────────────────────────────────────────────────────
 const SORTS = {
   cpu: (a, b) => b.cpuPct - a.cpuPct,
@@ -688,6 +743,40 @@ async function handle(req, res, pathname, query) {
       auditPush(entry);
       sendJSON(res, 400, { success: false, error: e.code === 'EPERM' ? '权限不足（EPERM）' : (e.code === 'ESRCH' ? '进程不存在（ESRCH）' : e.message), ...entry });
     }
+    return;
+  }
+
+  if (pathname === '/api/services') {
+    const q = String(query.get('q') || '').toLowerCase().trim();
+    const state = String(query.get('state') || '').trim();
+    let list = listUnits();
+    if (q) list = list.filter((u) => u.name.toLowerCase().includes(q) || u.desc.toLowerCase().includes(q));
+    if (state === 'running') list = list.filter((u) => u.active === 'active');
+    else if (state === 'stopped') list = list.filter((u) => u.active !== 'active');
+    else if (state === 'failed') list = list.filter((u) => u.active === 'failed' || u.sub === 'failed');
+    const counts = { all: unitsCache.list.length, running: 0, failed: 0 };
+    for (const u of unitsCache.list) {
+      if (u.active === 'active') counts.running += 1;
+      if (u.active === 'failed' || u.sub === 'failed') counts.failed += 1;
+    }
+    sendJSON(res, 200, { ts: state.ts, total: list.length, counts, units: list.slice(0, 400) });
+    return;
+  }
+
+  if (pathname === '/api/service' && req.method === 'POST') {
+    const body = await parseBody(req);
+    const name = String(body.name || '').trim();
+    const action = String(body.action || '').trim();
+    if (body.confirm !== true) { sendJSON(res, 400, { error: '需要 confirm: true 才会执行' }); return; }
+    const r = runServiceAction(name, action);
+    if (!r.ok) {
+      auditPush({ at: new Date().toISOString(), kind: 'service', pid: null, signal: action, name, user: 'root', ok: false, error: r.error });
+      sendJSON(res, 400, { error: r.error });
+      return;
+    }
+    auditPush({ at: new Date().toISOString(), kind: 'service', pid: null, signal: action, name, user: 'root', ok: true });
+    console.log(`[service] ${action} ${name}`);
+    sendJSON(res, 200, { success: true, name, action });
     return;
   }
 
