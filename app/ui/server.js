@@ -15,6 +15,7 @@ import { fileURLToPath } from 'node:url';
 import { createServer } from 'node:http';
 import { execFileSync } from 'node:child_process';
 import { gzipSync } from 'node:zlib';
+import { openAuditStore } from './audit-db.js';
 
 const UI_DIR = dirname(fileURLToPath(import.meta.url));
 const TARGET_DIR = dirname(UI_DIR);
@@ -25,7 +26,7 @@ const PORT = parseInt(process.env.PORT || '47951', 10);
 const SOCK_DIR = process.env.FNPROC_SOCK_DIR || TARGET_DIR;
 const SOCK_PATH = join(SOCK_DIR, 'fnproc.sock');
 const GATEWAY_PREFIX = '/app/fnproc';
-const VERSION = '0.1.0';
+const VERSION = '0.1.1';
 const SAMPLE_MS = 1000;
 const HISTORY_MAX = 120;              // 内存里保留 120 个采样点，够前端画满图
 
@@ -524,12 +525,10 @@ function snapshot(topN = 30) {
   };
 }
 
-// ── 审计（谁杀了谁，内存保留最近 100 条）─────────────────────────────────
-const audit = [];
-function auditPush(entry) {
-  audit.unshift(entry);
-  if (audit.length > 100) audit.pop();
-}
+// ── 审计 ────────────────────────────────────────────────────────────────
+// 审计原先只是内存里最近 100 条的环形数组，进程一重启（或崩溃、掉电）就全没了，
+// 「事后可追」等于空话。现在全部落到 SQLite（见 audit-db.js）：WAL + synchronous=FULL，
+// 同步写入且在回 HTTP 响应之前完成，只增不删。store 在 DATA_DIR 定义之后创建。
 
 
 // ── 历史落盘 ────────────────────────────────────────────────────────────
@@ -544,6 +543,31 @@ const HISTORY_MAX_BYTES = 8 * 1024 * 1024;
 const HISTORY_KEEP_LINES = 3000;
 
 try { mkdirSync(DATA_DIR, { recursive: true }); } catch { /* 只读环境就静默降级 */ }
+
+// ── 审计库 ──────────────────────────────────────────────────────────────
+const AUDIT_DB = join(DATA_DIR, 'audit.db');
+const auditStore = openAuditStore(AUDIT_DB, { version: VERSION });
+if (auditStore.enabled) {
+  const h = auditStore.health();
+  console.log(`[audit] SQLite 已启用: ${AUDIT_DB} journal=${h.journalMode} sync=${h.synchronous} rows=${h.total}`);
+} else {
+  console.error('[audit] SQLite 打开失败，降级为内存待写队列:', auditStore.health().error);
+}
+
+// 记录一条操作。在回 HTTP 响应之前调用 —— 客户端看到成功，就等于库里已有这条记录。
+function auditRecord({ action, target = '', result = 'ok', message = '', client = '', detail = {} }) {
+  const id = auditStore.record({ action, target, result, message, client, detail });
+  const line = `[audit] ${action} target=${target || '-'} result=${result}${message ? ' msg=' + message : ''}`;
+  if (result === 'ok') console.log(line); else console.error(line);
+  return id;
+}
+
+// 客户端标识：网关会注入 X-Trim-Userid（fnOS 登录用户），socket 请求没有对端 IP
+function clientOf(req) {
+  const uid = req.headers['x-trim-userid'] || req.headers['x-trim-uid'];
+  const addr = req.socket?.remoteAddress || 'unix-socket';
+  return uid ? `uid:${uid}` : addr;
+}
 
 function appendHistory() {
   const row = {
@@ -634,10 +658,11 @@ function listUnits(force = false) {
 const SERVICE_ACTIONS = new Set(['start', 'stop', 'restart']);
 
 function runServiceAction(name, action) {
-  if (!UNIT_RE.test(name)) return { ok: false, error: '服务名不合法' };
-  if (!SERVICE_ACTIONS.has(action)) return { ok: false, error: '不支持的操作：' + action };
+  // kind 用来区分审计里的分类：rejected = 被规则拦住（没真的执行），error = 执行了但失败
+  if (!UNIT_RE.test(name)) return { ok: false, kind: 'rejected', error: '服务名不合法' };
+  if (!SERVICE_ACTIONS.has(action)) return { ok: false, kind: 'rejected', error: '不支持的操作：' + action };
   if (PROTECTED_UNITS.has(name) && action !== 'start') {
-    return { ok: false, error: `${name} 属于关键服务，禁止 ${action}（会导致失联或系统不可用）` };
+    return { ok: false, kind: 'rejected', error: `${name} 属于关键服务，禁止 ${action}（会导致失联或系统不可用）` };
   }
   try {
     execFileSync('systemctl', [action, name], { timeout: 20000, encoding: 'utf8' });
@@ -645,7 +670,7 @@ function runServiceAction(name, action) {
     return { ok: true };
   } catch (e) {
     const msg = String(e.stderr || e.message || e).trim().split('\n').slice(0, 2).join(' ');
-    return { ok: false, error: msg.slice(0, 200) || 'systemctl 执行失败' };
+    return { ok: false, kind: 'error', error: msg.slice(0, 200) || 'systemctl 执行失败' };
   }
 }
 
@@ -793,21 +818,28 @@ async function handle(req, res, pathname, query) {
     const body = await parseBody(req);
     const pid = num(body.pid);
     const sig = String(body.signal || 'SIGTERM').toUpperCase();
-    if (!pid || pid <= 1) { sendJSON(res, 400, { error: '拒绝：PID 必须 > 1（不能动 init）' }); return; }
-    if (pid === process.pid) { sendJSON(res, 400, { error: '拒绝：不能结束进程管家自身' }); return; }
-    if (!SIGNALS.has(sig)) { sendJSON(res, 400, { error: `拒绝：不支持的信号 ${sig}` }); return; }
-    if (body.confirm !== true) { sendJSON(res, 400, { error: '需要 confirm: true 才会执行' }); return; }
+    const client = clientOf(req);
     const target = procs.find((p) => p.pid === pid);
+    const tName = target?.name || '?';
+    const tUser = target?.user || '?';
+    const detail = { pid, signal: sig, name: tName, user: tUser };
+    // 拒绝也要记 —— 审计的价值一半在于「谁试图做了什么但被拦了」
+    const reject = (msg) => {
+      auditRecord({ action: 'kill', target: String(pid), result: 'rejected', message: msg, client, detail });
+      sendJSON(res, 400, { error: msg });
+    };
+    if (!pid || pid <= 1) return reject('拒绝：PID 必须 > 1（不能动 init）');
+    if (pid === process.pid) return reject('拒绝：不能结束进程管家自身');
+    if (!SIGNALS.has(sig)) return reject(`拒绝：不支持的信号 ${sig}`);
+    if (body.confirm !== true) return reject('需要 confirm: true 才会执行');
     try {
       process.kill(pid, sig);
-      const entry = { at: new Date().toISOString(), pid, signal: sig, name: target?.name || '?', user: target?.user || '?', ok: true };
-      auditPush(entry);
-      console.log(`[kill] pid=${pid} sig=${sig} name=${entry.name}`);
-      sendJSON(res, 200, { success: true, ...entry });
+      const id = auditRecord({ action: 'kill', target: String(pid), result: 'ok', message: `${sig} ${tName}`, client, detail });
+      sendJSON(res, 200, { success: true, id, at: new Date().toISOString(), pid, signal: sig, name: tName, user: tUser, ok: true });
     } catch (e) {
-      const entry = { at: new Date().toISOString(), pid, signal: sig, name: target?.name || '?', user: target?.user || '?', ok: false, error: e.code || e.message };
-      auditPush(entry);
-      sendJSON(res, 400, { success: false, error: e.code === 'EPERM' ? '权限不足（EPERM）' : (e.code === 'ESRCH' ? '进程不存在（ESRCH）' : e.message), ...entry });
+      const msg = e.code === 'EPERM' ? '权限不足（EPERM）' : (e.code === 'ESRCH' ? '进程不存在（ESRCH）' : e.message);
+      const id = auditRecord({ action: 'kill', target: String(pid), result: 'error', message: msg, client, detail });
+      sendJSON(res, 400, { success: false, id, at: new Date().toISOString(), pid, signal: sig, name: tName, user: tUser, ok: false, error: msg });
     }
     return;
   }
@@ -843,21 +875,43 @@ async function handle(req, res, pathname, query) {
     const body = await parseBody(req);
     const name = String(body.name || '').trim();
     const action = String(body.action || '').trim();
-    if (body.confirm !== true) { sendJSON(res, 400, { error: '需要 confirm: true 才会执行' }); return; }
-    const r = runServiceAction(name, action);
-    if (!r.ok) {
-      auditPush({ at: new Date().toISOString(), kind: 'service', pid: null, signal: action, name, user: 'root', ok: false, error: r.error });
-      sendJSON(res, 400, { error: r.error });
+    const client = clientOf(req);
+    const tag = 'service.' + (action || 'unknown');
+    if (body.confirm !== true) {
+      auditRecord({ action: tag, target: name, result: 'rejected', message: '需要 confirm: true 才会执行', client });
+      sendJSON(res, 400, { error: '需要 confirm: true 才会执行' });
       return;
     }
-    auditPush({ at: new Date().toISOString(), kind: 'service', pid: null, signal: action, name, user: 'root', ok: true });
-    console.log(`[service] ${action} ${name}`);
-    sendJSON(res, 200, { success: true, name, action });
+    const r = runServiceAction(name, action);
+    if (!r.ok) {
+      const id = auditRecord({ action: tag, target: name, result: r.kind || 'error', message: r.error, client });
+      sendJSON(res, 400, { error: r.error, id });
+      return;
+    }
+    const id = auditRecord({ action: tag, target: name, result: 'ok', message: `${action} ${name}`, client });
+    sendJSON(res, 200, { success: true, id, name, action });
     return;
   }
 
+  // 操作审计：从 SQLite 分页查，支持按动作 / 结果 / 关键字过滤
   if (pathname === '/api/audit') {
-    sendJSON(res, 200, { actions: audit });
+    const limit = num(query.get('limit')) || 50;
+    const offset = num(query.get('offset')) || 0;
+    const q = String(query.get('q') || '').trim();
+    const action = String(query.get('action') || '').trim();
+    const result = String(query.get('result') || '').trim();
+    const { rows, total, degraded } = auditStore.list({ limit, offset, q, action, result });
+    sendJSON(res, 200, {
+      actions: rows, total, limit, offset, degraded,
+      stats: auditStore.stats(),
+      db: { path: AUDIT_DB, enabled: auditStore.enabled },
+    });
+    return;
+  }
+
+  // 审计库自身健康状态：库路径、WAL 模式、fsync 策略、完整性检查、待写队列
+  if (pathname === '/api/audit/health') {
+    sendJSON(res, 200, auditStore.health());
     return;
   }
 
@@ -905,9 +959,38 @@ setInterval(() => { refreshDocker(); refreshInodePorts(); refreshPidPorts(); }, 
 tick();
 setInterval(tick, SAMPLE_MS);
 
-for (const sig of ['SIGTERM', 'SIGINT']) {
+// 应用自身的启停也进审计 —— 这样「谁在什么时候重启过这个应用」也查得到
+auditRecord({
+  action: 'app.start', target: `pid:${process.pid}`, result: 'ok',
+  message: `fnproc ${VERSION} 启动`, client: `pid:${process.ppid}`,
+  detail: { version: VERSION, node: process.version, uptimeSec: Math.round(process.uptime()) },
+});
+
+for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP']) {
   process.on(sig, () => {
+    try {
+      auditRecord({
+        action: 'app.stop', target: `pid:${process.pid}`, result: 'ok',
+        message: `收到 ${sig}，正常退出`, client: 'systemd',
+        detail: { signal: sig, uptimeSec: Math.round(process.uptime()) },
+      });
+    } catch { /* 退出路径不抛错 */ }
+    try { auditStore.close(); } catch { /* 忽略 */ }   // 关闭时会把 WAL checkpoint 进主库
     try { unlinkSync(SOCK_PATH); } catch { /* 忽略 */ }
     process.exit(0);
   });
 }
+
+// 未捕获异常也要留痕：先落一条记录再退出，避免「莫名其妙重启但查不到原因」
+process.on('uncaughtException', (e) => {
+  try {
+    auditRecord({
+      action: 'app.crash', target: `pid:${process.pid}`, result: 'error',
+      message: String(e?.message || e).slice(0, 400), client: 'self',
+      detail: { stack: String(e?.stack || '').slice(0, 3000) },
+    });
+    auditStore.close();
+  } catch { /* 忽略 */ }
+  console.error('[fatal]', e);
+  process.exit(1);
+});

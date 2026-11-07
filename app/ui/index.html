@@ -6,7 +6,7 @@
 <base href="/app/fnproc/">
 <title>进程管家 · fnproc</title>
 <link rel="icon" href="images/icon_64.png">
-<link rel="stylesheet" href="styles/app.css?v=0.1.0">
+<link rel="stylesheet" href="styles/app.css?v=0.1.1">
 </head>
 <body>
 <div class="app">
@@ -298,14 +298,38 @@
     <article class="card audit-card">
       <div class="card-head panel-head">
         <h2>操作记录</h2>
-        <span class="hint">发信号 / 服务操作 · 最近 20 条</span>
+        <span class="hint" id="audit-summary">全部操作 · 落盘 SQLite，重启不丢</span>
       </div>
+
+      <div class="audit-toolbar">
+        <select id="audit-action" aria-label="按操作筛选">
+          <option value="">全部操作</option>
+          <option value="kill">发信号</option>
+          <option value="service">服务启停</option>
+          <option value="app">应用启停</option>
+        </select>
+        <select id="audit-result" aria-label="按结果筛选">
+          <option value="">全部结果</option>
+          <option value="ok">成功</option>
+          <option value="rejected">被拒绝</option>
+          <option value="error">失败</option>
+        </select>
+        <input class="au-input" id="audit-q" type="search" placeholder="搜索目标 / 说明…" aria-label="搜索记录">
+        <button class="btn tiny" id="audit-refresh" type="button">刷新</button>
+      </div>
+
+      <div class="audit-meta" id="audit-meta"></div>
       <ul class="audit" id="audit"><li class="hint">暂无操作</li></ul>
+      <div class="audit-pager" id="audit-pager" hidden>
+        <button class="btn tiny" id="audit-prev" type="button">上一页</button>
+        <span class="hint" id="audit-page">1 / 1</span>
+        <button class="btn tiny" id="audit-next" type="button">下一页</button>
+      </div>
     </article>
   </section>
 
   <footer class="footer">
-    <span>进程管家 <b id="ver">0.1.0</b> · 数据来自 /proc</span>
+    <span>进程管家 <b id="ver">0.1.1</b> · 数据来自 /proc</span>
     <span id="table-info" class="hint">—</span>
     <span id="ts-line">—</span>
   </footer>
@@ -419,6 +443,6 @@
   <img id="lightbox-img" alt="二维码放大">
 </div>
 
-<script src="main.js?v=0.1.0" type="module"></script>
+<script src="main.js?v=0.1.1" type="module"></script>
 </body>
 </html>

@@ -1,5 +1,5 @@
 appname               = fnproc
-version               = 0.1.0
+version               = 0.1.1
 display_name          = 进程管家
 desc                  = 现代化的进程与系统资源管理器：实时进程列表、每核 CPU/内存/IO 曲线、进程树、一键发信号（TERM/KILL/STOP），Web 界面适配桌面与手机
 platform              = all

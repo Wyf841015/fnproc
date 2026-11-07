@@ -147,7 +147,41 @@ fnpack build .
 
 ---
 
+## 操作审计（SQLite）
+
+发信号、服务启停、应用启停、被拒绝的尝试，**全部落到 SQLite**，重启/崩溃/掉电都不丢。
+
+| 项 | 值 |
+|---|---|
+| 库文件 | `<TRM_PKGVAR>/data/audit.db` |
+| 表 | `audit(id, ts, action, target, result, message, client, detail, version)` |
+| 索引 | `ts DESC`、`action`、`result` |
+| 落盘模式 | `journal_mode=WAL` + `synchronous=FULL` |
+| 保留策略 | **只增不删**（不设保留期、不做条数轮转） |
+
+「不丢失」靠四件事：
+
+1. **WAL** —— 写日志文件而不是重写整个库，进程被 kill -9 也能恢复到最后一个已提交事务
+2. **synchronous = FULL** —— 每次 COMMIT 都 fsync，掉电也不会丢已提交记录
+3. **同步写入且在回 HTTP 响应之前完成** —— 客户端收到 200 就代表库里已有这条，不存在「操作成功但没记下来」
+4. **连被拒绝的操作也记** —— 谁试图 kill init、谁试图停 ssh.service，全都有据可查
+
+库打不开时（目录只读、磁盘满）不会拖垮业务：记录进内存待写队列，下次写入成功时补写，
+并在 `/api/audit/health` 明确报 `degraded` 与原因，不静默丢。
+
+界面侧：记录 tab 支持按操作 / 结果筛选、关键字搜索、每页 50 条翻页，
+顶部汇总显示总数与成功 / 拒绝 / 失败分布。
+
 ## 版本历史
+
+### v0.1.1
+
+- **操作审计改用 SQLite 持久化**（原来只有内存里最近 100 条，重启即清空）：
+  发信号 / 服务启停 / 应用启停 / 被拒绝的尝试全部落库，WAL + `synchronous=FULL` 同步落盘
+- 记录 tab 升级：筛选（操作 / 结果）、搜索、分页（50 条/页）、总数与结果分布汇总、
+  库健康状态（`degraded` 时显著提示）
+- 新增 `/api/audit/health`：库路径、WAL 模式、fsync 策略、`integrity_check`、待写队列长度
+- 服务操作审计细分 `rejected`（被规则拦住）与 `error`（真的执行了但失败）
 
 ### v0.1.0 首发
 

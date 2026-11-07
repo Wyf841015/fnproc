@@ -786,28 +786,110 @@ async function sendSignal(pid, signal) {
   );
 }
 
+// ── 操作记录（SQLite 落盘，分页 + 筛选）──────────────────────────────────
+const ACTION_LABEL = {
+  kill: '发信号',
+  'service.start': '服务启动',
+  'service.stop': '服务停止',
+  'service.restart': '服务重启',
+  'app.start': '应用启动',
+  'app.stop': '应用停止',
+  'app.crash': '应用崩溃',
+};
+const RESULT_LABEL = { ok: '成功', rejected: '拒绝', error: '失败' };
+
+const auditState = { page: 0, pageSize: 50, action: '', result: '', q: '', total: 0 };
+
+function fmtAuditTime(ts) {
+  const t = new Date(ts);
+  const now = new Date();
+  const sameDay = t.toDateString() === now.toDateString();
+  const p = (n) => String(n).padStart(2, '0');
+  const hm = `${p(t.getHours())}:${p(t.getMinutes())}:${p(t.getSeconds())}`;
+  return sameDay ? hm : `${t.getMonth() + 1}/${t.getDate()} ${hm}`;
+}
+
+function actionLabel(a) {
+  return ACTION_LABEL[a] || a;
+}
+
 async function loadAudit() {
+  const params = new URLSearchParams({
+    limit: String(auditState.pageSize),
+    offset: String(auditState.page * auditState.pageSize),
+  });
+  if (auditState.action) params.set('action', auditState.action);
+  if (auditState.result) params.set('result', auditState.result);
+  if (auditState.q) params.set('q', auditState.q);
+  const ul = $('audit');
   try {
-    const r = await fetch(API + '/audit', { cache: 'no-store' });
+    const r = await fetch(API + '/audit?' + params.toString(), { cache: 'no-store' });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
     const d = await r.json();
-    const ul = $('audit');
+    auditState.total = d.total || 0;
+    renderAudit(d);
+  } catch (e) {
     ul.textContent = '';
-    if (!d.actions || !d.actions.length) { ul.appendChild(el('li', 'hint', '暂无操作')); return; }
-    for (const a of d.actions.slice(0, 20)) {
-      const li = el('li', a.ok ? 'ok' : 'err');
-      const t = new Date(a.at);
-      const hhmm = `${String(t.getHours()).padStart(2, '0')}:${String(t.getMinutes()).padStart(2, '0')}:${String(t.getSeconds()).padStart(2, '0')}`;
-      const what = a.kind === 'service' ? a.signal : a.signal;
-      const target = a.kind === 'service' ? a.name : `${a.name} (${a.pid})`;
-      li.append(
-        el('span', 'mono', hhmm),
-        el('span', 'mono', what),
-        el('span', 'audit-name', target),
-        el('span', 'hint', a.ok ? '成功' : (a.error || '失败')),
-      );
-      ul.appendChild(li);
-    }
-  } catch { /* 忽略 */ }
+    ul.appendChild(el('li', 'hint', '读取记录失败：' + (e.message || e)));
+  }
+}
+
+function renderAudit(d) {
+  const ul = $('audit');
+  const rows = d.actions || [];
+  ul.textContent = '';
+
+  // 顶部一行汇总：总数 + 结果分布 + 库状态
+  const st = d.stats || {};
+  const byResult = Object.fromEntries((st.byResult || []).map((x) => [x.result, x.count]));
+  const filtered = !!(auditState.action || auditState.result || auditState.q);
+  const all = st.total ?? d.total ?? 0;
+  const bits = filtered ? [`筛选出 ${d.total} 条 · 共 ${all} 条`] : [`共 ${all} 条`];
+  if (byResult.ok) bits.push(`成功 ${byResult.ok}`);
+  if (byResult.rejected) bits.push(`拒绝 ${byResult.rejected}`);
+  if (byResult.error) bits.push(`失败 ${byResult.error}`);
+  if (st.lastTs) bits.push(`最后一次 ${fmtAuditTime(st.lastTs)}`);
+  const meta = $('audit-meta');
+  if (meta) {
+    meta.textContent = '';
+    for (const b of bits) meta.appendChild(el('span', 'audit-chip', b));
+    const dbChip = el('span', 'audit-chip db', d.degraded ? '⚠ 库降级（暂存内存）' : '🗄 SQLite · 重启不丢');
+    if (d.db?.path) dbChip.title = d.db.path;
+    meta.appendChild(dbChip);
+    $('audit-summary').textContent = `全部操作 · 落盘 SQLite，重启不丢`;
+  }
+
+  if (!rows.length) {
+    ul.appendChild(el('li', 'hint', auditState.action || auditState.result || auditState.q
+      ? '没有符合筛选条件的记录' : '暂无操作'));
+    $('audit-pager').hidden = true;
+    return;
+  }
+
+  for (const a of rows) {
+    const li = el('li', a.result === 'ok' ? 'ok' : 'err');
+    const sigText = (a.detail && a.detail.signal) ? a.detail.signal : '';
+    const main = a.action.startsWith('service.')
+      ? `${a.detail?.signal || a.action.split('.')[1]} ${a.target}`
+      : (a.action.startsWith('app.') ? a.target : `${a.target}${a.detail?.name && a.detail.name !== '?' ? ' · ' + a.detail.name : ''}`);
+    li.append(
+      el('span', 'mono audit-time', fmtAuditTime(a.ts)),
+      el('span', 'audit-act', actionLabel(a.action)),
+      el('span', 'audit-name', main),
+      el('span', 'audit-msg hint', a.message || ''),
+      el('span', 'audit-res ' + a.result, RESULT_LABEL[a.result] || a.result),
+    );
+    li.title = `${new Date(a.ts).toLocaleString()}  ${actionLabel(a.action)}  ${main}\n${a.message || ''}\nclient: ${a.client || '-'}`;
+    ul.appendChild(li);
+  }
+
+  // 分页
+  const pages = Math.max(1, Math.ceil((d.total || 0) / auditState.pageSize));
+  const pager = $('audit-pager');
+  pager.hidden = pages <= 1;
+  $('audit-page').textContent = `${auditState.page + 1} / ${pages}`;
+  $('audit-prev').disabled = auditState.page <= 0;
+  $('audit-next').disabled = auditState.page >= pages - 1;
 }
 
 // ── 赞助 / 反馈弹层 ─────────────────────────────────────────────────────
@@ -894,6 +976,25 @@ function bindEvents() {
     const ok = await copyText(qq);
     toast(ok ? `已复制 QQ 群号 ${qq}` : `复制失败，请手动记录：${qq}`, ok ? 'ok' : 'error');
   };
+
+  // 操作记录：筛选 / 搜索 / 刷新 / 翻页
+  const auditApply = () => { auditState.page = 0; loadAudit(); };
+  if ($('audit-action')) $('audit-action').onchange = (e) => { auditState.action = e.target.value; auditApply(); };
+  if ($('audit-result')) $('audit-result').onchange = (e) => { auditState.result = e.target.value; auditApply(); };
+  if ($('audit-refresh')) $('audit-refresh').onclick = () => loadAudit();
+  if ($('audit-prev')) $('audit-prev').onclick = () => { if (auditState.page > 0) { auditState.page -= 1; loadAudit(); } };
+  if ($('audit-next')) $('audit-next').onclick = () => { auditState.page += 1; loadAudit(); };
+  if ($('audit-q')) {
+    let t = null;
+    $('audit-q').oninput = (e) => {
+      const v = e.target.value.trim();
+      clearTimeout(t);
+      t = setTimeout(() => { auditState.q = v; auditApply(); }, 250);
+    };
+    $('audit-q').onkeydown = (e) => {
+      if (e.key === 'Enter') { clearTimeout(t); auditState.q = e.target.value.trim(); auditApply(); }
+    };
+  }
 
   $('btn-theme').addEventListener('click', () => {
     applyTheme(document.documentElement.dataset.theme === 'light' ? 'dark' : 'light');
