@@ -156,7 +156,8 @@ let lastSnapshot = null;
 let rowsCache = [];
 let sortKey = 'cpu';
 let query = '';
-let currentView = 'list';        // list | tree | ports | services | containers
+let currentTab = 'overview';     // overview | process | ports | containers | services | audit
+let processView = 'list';        // list | tree（仅「进程」tab 内的子视图）
 let historyRange = '60s';        // 60s = 实时内存数据；其它 = 从 /api/history 读落盘数据
 let containerFilter = '';        // 容器名或短 ID，非空时列表只显示该容器进程
 const collapsed = new Set();     // 树视图里被折叠的 pid
@@ -394,6 +395,7 @@ async function renderPorts() {
   tb.appendChild(frag);
   $('ports-empty').hidden = (d.ports || []).length > 0;
   $('table-info').textContent = `${d.total} 个监听端口`;
+  $('badge-ports').textContent = d.total ?? 0;
 }
 
 // ── 视图：容器聚合 ──────────────────────────────────────────────────────
@@ -426,6 +428,7 @@ async function renderContainers() {
   tb.appendChild(frag);
   $('containers-empty').hidden = (d.containers || []).length > 0;
   $('table-info').textContent = `${d.total} 个容器${d.dockerAvailable ? '' : '（docker 名解析不可用，显示短 ID）'}`;
+  $('badge-containers').textContent = d.total ?? 0;
 }
 
 // ── 视图：systemd 服务 ──────────────────────────────────────────────────
@@ -474,6 +477,9 @@ async function renderServices() {
   const c = d.counts || {};
   $('svc-counts').textContent = `共 ${c.all ?? 0} 个服务 · 运行中 ${c.running ?? 0}${c.failed ? ` · 失败 ${c.failed}` : ''}`;
   $('table-info').textContent = `${d.total} 个服务`;
+  const badge = $('badge-services');
+  badge.textContent = c.failed ? `${c.failed} 失败` : `${c.running ?? 0} 运行`;
+  badge.classList.toggle('alert', !!c.failed);
 }
 
 async function doServiceAction(name, action) {
@@ -501,24 +507,39 @@ async function doServiceAction(name, action) {
   );
 }
 
-// ── 视图切换 ────────────────────────────────────────────────────────────
+// ── 一级 tab（功能分类）──────────────────────────────────────────────────
+const TAB_NAMES = ['overview', 'process', 'ports', 'containers', 'services', 'audit'];
+
+function setTab(name) {
+  if (!TAB_NAMES.includes(name)) name = 'overview';
+  currentTab = name;
+  for (const b of $('tabs').querySelectorAll('.tab')) b.classList.toggle('active', b.dataset.tab === name);
+  for (const t of TAB_NAMES) $('panel-' + t).hidden = (t !== name);
+  // 切到概览要立刻画一次图，否则 canvas 尺寸为 0 时画出来是空的
+  if (name === 'overview') requestAnimationFrame(() => loadHistoryView());
+  if (name === 'audit') loadAudit();
+  return refreshView();
+}
+
+// 「进程」tab 内的子视图
 function setView(v) {
-  currentView = v;
-  for (const b of $('views').querySelectorAll('.vbtn')) b.classList.toggle('active', b.dataset.view === v);
-  for (const id of ['view-list', 'view-tree', 'view-ports', 'view-containers', 'view-services']) {
-    $(id).hidden = (id !== 'view-' + v);
-  }
-  const showFilter = v === 'list' || v === 'tree';
-  $('cfilter').hidden = !(showFilter && containerFilter);
+  processView = v === 'tree' ? 'tree' : 'list';
+  for (const b of $('views').querySelectorAll('.vbtn')) b.classList.toggle('active', b.dataset.view === processView);
+  $('view-list').hidden = processView !== 'list';
+  $('view-tree').hidden = processView !== 'tree';
+  $('cfilter').hidden = !containerFilter;
   $('cfilter-name').textContent = containerFilter || '—';
+  if (currentTab !== 'process') return setTab('process');
   return refreshView();
 }
 
 async function refreshView() {
   try {
-    if (currentView === 'ports') { await renderPorts(); return; }
-    if (currentView === 'containers') { await renderContainers(); return; }
-    if (currentView === 'services') { await renderServices(); return; }
+    if (currentTab === 'ports') { await renderPorts(); return; }
+    if (currentTab === 'containers') { await renderContainers(); return; }
+    if (currentTab === 'services') { await renderServices(); return; }
+    if (currentTab === 'audit') { await loadAudit(); return; }
+    if (currentTab === 'overview') { updateBadges(); return; }
     const u = new URL(API + '/processes', location.origin);
     u.searchParams.set('sort', sortKey);
     u.searchParams.set('limit', '2000');
@@ -528,11 +549,41 @@ async function refreshView() {
     if (!r.ok) throw new Error('进程列表请求失败: HTTP ' + r.status);
     const d = await r.json();
     rowsCache = d.rows || [];
-    if (currentView === 'tree') renderTree(rowsCache);
+    if (processView === 'tree') renderTree(rowsCache);
     else renderTable(rowsCache);
+    updateBadges(rowsCache.length);
   } catch (e) {
     toast(e.message, 'error');
   }
+}
+
+// tab 上的角标：进程数 / 端口数 / 容器数 / 失败服务数
+// 启动时把端口 / 容器 / 服务三个角标先填上（各请求一次，失败就保持 —）
+async function primeBadges() {
+  const fill = async (url, id, pick) => {
+    try {
+      const r = await fetch(API + url, { cache: 'no-store' });
+      if (!r.ok) return;
+      const d = await r.json();
+      const v = pick(d);
+      if (v !== undefined && v !== null) $(id).textContent = v;
+    } catch { /* 忽略，留 — */ }
+  };
+  fill('/ports', 'badge-ports', (d) => d.total);
+  fill('/containers', 'badge-containers', (d) => d.total);
+  const r = await fetch(API + '/services', { cache: 'no-store' }).catch(() => null);
+  if (r && r.ok) {
+    const d = await r.json();
+    const b = $('badge-services');
+    b.textContent = d.counts?.failed ? `${d.counts.failed} 失败` : `${d.counts?.running ?? 0} 运行`;
+    b.classList.toggle('alert', !!d.counts?.failed);
+  }
+}
+
+function updateBadges(procCount) {
+  const set = (id, v) => { const e = $(id); if (e && v !== undefined && v !== null) e.textContent = v; };
+  if (procCount !== undefined) set('badge-process', procCount);
+  else if (lastSnapshot) set('badge-process', lastSnapshot.procTotal);
 }
 
 // ── 数据获取 ────────────────────────────────────────────────────────────
@@ -551,7 +602,11 @@ async function fetchProcesses() {
 // ── 历史曲线（从落盘的 history.jsonl 读）───────────────────────────────
 async function loadHistoryView() {
   if (historyRange === '60s') {
-    loadHistoryView();
+    // 实时模式：直接用 SSE 快照里的 60 个采样点（1 秒粒度）
+    const h = lastSnapshot?.history || [];
+    chartCpu.draw(h);
+    chartMem.draw(h);
+    chartIo.draw(h);
     $('range-hint').textContent = '实时 · 最近 60 秒';
     return;
   }
@@ -780,7 +835,13 @@ function bindEvents() {
     refreshView();
   });
 
-  // 视图切换
+  // 一级 tab 切换
+  $('tabs').addEventListener('click', (e) => {
+    const b = e.target.closest('.tab');
+    if (b) setTab(b.dataset.tab);
+  });
+
+  // 「进程」tab 内的 列表/树 切换
   $('views').addEventListener('click', (e) => {
     const b = e.target.closest('.vbtn');
     if (b) setView(b.dataset.view);
@@ -827,6 +888,7 @@ function bindEvents() {
   // 容器视图 / 列表里的容器标签：只看该容器进程
   const applyContainerFilter = (name) => {
     containerFilter = name || '';
+    setTab('process');
     setView('list');
   };
   $('contbody').addEventListener('click', (e) => {
@@ -891,6 +953,8 @@ function bindEvents() {
 (async function boot() {
   bindEvents();
   await refreshAll();
+  setTab('overview');
+  primeBadges();
   loadAudit();
   startStream();
   // 表格数据 3 秒刷一次（SSE 只推概览与 top30，避免整表每秒重排导致选择/滚动丢失）

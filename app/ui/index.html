@@ -31,6 +31,7 @@
     </div>
   </header>
 
+  <!-- 全局资源概览：任何 tab 下都可见 -->
   <section class="kpis" id="kpis">
     <article class="kpi kpi-cpu">
       <div class="kpi-head"><span class="kpi-label">CPU</span><span class="kpi-sub" id="cpu-cores">—</span></div>
@@ -68,181 +69,239 @@
     </article>
   </section>
 
-  <div class="charts-bar">
-    <span class="hint" id="range-hint">实时 · 最近 60 秒</span>
-    <select id="range" title="图表时间范围">
-      <option value="60s">实时 60 秒</option>
-      <option value="10">最近 10 分钟</option>
-      <option value="60">最近 1 小时</option>
-      <option value="360">最近 6 小时</option>
-      <option value="1440">最近 24 小时</option>
-    </select>
-  </div>
+  <!-- 功能分类 tab -->
+  <nav class="tabs" id="tabs" role="tablist">
+    <button class="tab active" data-tab="overview" type="button" role="tab">
+      <span class="tab-icon">📈</span><span class="tab-text">概览</span>
+    </button>
+    <button class="tab" data-tab="process" type="button" role="tab">
+      <span class="tab-icon">⚙️</span><span class="tab-text">进程</span><span class="tab-badge" id="badge-process">—</span>
+    </button>
+    <button class="tab" data-tab="ports" type="button" role="tab">
+      <span class="tab-icon">🔌</span><span class="tab-text">端口</span><span class="tab-badge" id="badge-ports">—</span>
+    </button>
+    <button class="tab" data-tab="containers" type="button" role="tab">
+      <span class="tab-icon">📦</span><span class="tab-text">容器</span><span class="tab-badge" id="badge-containers">—</span>
+    </button>
+    <button class="tab" data-tab="services" type="button" role="tab">
+      <span class="tab-icon">🛠</span><span class="tab-text">服务</span><span class="tab-badge" id="badge-services">—</span>
+    </button>
+    <button class="tab" data-tab="audit" type="button" role="tab">
+      <span class="tab-icon">📝</span><span class="tab-text">记录</span>
+    </button>
+  </nav>
 
-  <section class="charts">
-    <article class="card chart-card">
-      <div class="card-head"><h2>CPU 使用率</h2><span class="hint" id="cpu-model">—</span></div>
-      <canvas id="chart-cpu" height="110"></canvas>
-      <div class="axis-hint"><span>60 秒前</span><span id="cpu-legend">当前 <b>0%</b></span><span>现在</span></div>
-      <div class="cores" id="cores"></div>
-    </article>
-    <article class="card chart-card">
-      <div class="card-head"><h2>内存 / Swap</h2><span class="hint">百分比 · 60 秒</span></div>
-      <canvas id="chart-mem" height="110"></canvas>
-      <div class="legend">
-        <span><i class="sw sw-mem"></i>内存 <b id="lg-mem">0%</b></span>
-        <span><i class="sw sw-swap"></i>Swap <b id="lg-swap">0%</b></span>
+  <!-- ── 概览 ── -->
+  <section class="tab-panel" id="panel-overview" role="tabpanel">
+    <div class="charts-bar">
+      <span class="hint" id="range-hint">实时 · 最近 60 秒</span>
+      <select id="range" title="图表时间范围">
+        <option value="60s">实时 60 秒</option>
+        <option value="10">最近 10 分钟</option>
+        <option value="60">最近 1 小时</option>
+        <option value="360">最近 6 小时</option>
+        <option value="1440">最近 24 小时</option>
+      </select>
+    </div>
+    <div class="charts">
+      <article class="card chart-card">
+        <div class="card-head"><h2>CPU 使用率</h2><span class="hint" id="cpu-model">—</span></div>
+        <canvas id="chart-cpu" height="110"></canvas>
+        <div class="axis-hint"><span>窗口起点</span><span id="cpu-legend">当前 <b>0%</b></span><span>现在</span></div>
+        <div class="cores" id="cores"></div>
+      </article>
+      <article class="card chart-card">
+        <div class="card-head"><h2>内存 / Swap</h2><span class="hint">百分比</span></div>
+        <canvas id="chart-mem" height="110"></canvas>
+        <div class="legend">
+          <span><i class="sw sw-mem"></i>内存 <b id="lg-mem">0%</b></span>
+          <span><i class="sw sw-swap"></i>Swap <b id="lg-swap">0%</b></span>
+        </div>
+      </article>
+      <article class="card chart-card">
+        <div class="card-head"><h2>磁盘 / 网络</h2><span class="hint" id="io-scale">自动缩放</span></div>
+        <canvas id="chart-io" height="110"></canvas>
+        <div class="legend">
+          <span><i class="sw sw-rd"></i>读 <b id="lg-rd">0</b></span>
+          <span><i class="sw sw-wr"></i>写 <b id="lg-wr">0</b></span>
+          <span><i class="sw sw-rx"></i>收 <b id="lg-rx">0</b></span>
+          <span><i class="sw sw-tx"></i>发 <b id="lg-tx">0</b></span>
+        </div>
+      </article>
+    </div>
+  </section>
+
+  <!-- ── 进程 ── -->
+  <section class="tab-panel" id="panel-process" role="tabpanel" hidden>
+    <article class="card procs-card">
+      <div class="card-head procs-head">
+        <div class="views" id="views">
+          <button class="vbtn active" data-view="list" type="button">列表</button>
+          <button class="vbtn" data-view="tree" type="button">树</button>
+        </div>
+        <div class="procs-tools">
+          <div class="search">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
+            <input id="q" type="search" placeholder="搜索名称 / 命令行 / PID / 用户" autocomplete="off">
+          </div>
+          <select id="sort" title="排序">
+            <option value="cpu">按 CPU</option>
+            <option value="mem">按内存</option>
+            <option value="pid">按 PID</option>
+            <option value="name">按名称</option>
+            <option value="time">按 CPU 时间</option>
+            <option value="threads">按线程数</option>
+            <option value="start">按启动时间</option>
+          </select>
+          <button class="btn ghost" id="btn-refresh" type="button" title="立即刷新">刷新</button>
+        </div>
       </div>
-    </article>
-    <article class="card chart-card">
-      <div class="card-head"><h2>磁盘 / 网络</h2><span class="hint" id="io-scale">自动缩放</span></div>
-      <canvas id="chart-io" height="110"></canvas>
-      <div class="legend">
-        <span><i class="sw sw-rd"></i>读 <b id="lg-rd">0</b></span>
-        <span><i class="sw sw-wr"></i>写 <b id="lg-wr">0</b></span>
-        <span><i class="sw sw-rx"></i>收 <b id="lg-rx">0</b></span>
-        <span><i class="sw sw-tx"></i>发 <b id="lg-tx">0</b></span>
+
+      <div class="cfilter" id="cfilter" hidden>
+        <span>仅显示容器 <b id="cfilter-name">—</b> 的进程</span>
+        <button class="btn tiny ghost" id="cfilter-clear" type="button">清除</button>
+      </div>
+
+      <div class="table-wrap" id="view-list">
+        <table class="ptable">
+          <thead>
+            <tr>
+              <th data-sort="pid" class="num">PID</th>
+              <th data-sort="name">名称</th>
+              <th data-sort="cpu" class="num">CPU%</th>
+              <th data-sort="mem" class="num">内存</th>
+              <th data-sort="threads" class="num hide-sm">线程</th>
+              <th class="hide-sm">用户</th>
+              <th class="hide-sm">状态</th>
+              <th class="hide-md">容器</th>
+              <th data-sort="time" class="num hide-sm">CPU 时间</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="ptbody"></tbody>
+        </table>
+        <div class="empty" id="empty" hidden>没有匹配的进程</div>
+      </div>
+
+      <div class="table-wrap" id="view-tree" hidden>
+        <table class="ptable tree-table">
+          <thead>
+            <tr>
+              <th class="num">PID</th>
+              <th>进程树</th>
+              <th class="num">CPU%</th>
+              <th class="num">内存</th>
+              <th class="num hide-sm">线程</th>
+              <th class="hide-md">容器</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="treebody"></tbody>
+        </table>
       </div>
     </article>
   </section>
 
-  <section class="card procs-card">
-    <div class="card-head procs-head">
-      <div class="views" id="views">
-        <button class="vbtn active" data-view="list" type="button">列表</button>
-        <button class="vbtn" data-view="tree" type="button">树</button>
-        <button class="vbtn" data-view="ports" type="button">端口</button>
-        <button class="vbtn" data-view="containers" type="button">容器</button>
-        <button class="vbtn" data-view="services" type="button">服务</button>
+  <!-- ── 端口 ── -->
+  <section class="tab-panel" id="panel-ports" role="tabpanel" hidden>
+    <article class="card">
+      <div class="card-head panel-head">
+        <h2>监听端口</h2>
+        <span class="hint">TCP LISTEN + UDP · 每 10 秒刷新</span>
       </div>
-      <div class="procs-tools">
-        <div class="search">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
-          <input id="q" type="search" placeholder="搜索名称 / 命令行 / PID / 用户" autocomplete="off">
+      <div class="table-wrap">
+        <table class="ptable">
+          <thead>
+            <tr>
+              <th class="num">端口</th>
+              <th>协议</th>
+              <th>监听地址</th>
+              <th class="num">PID</th>
+              <th>进程</th>
+              <th class="hide-sm">用户</th>
+              <th class="hide-md">容器</th>
+            </tr>
+          </thead>
+          <tbody id="portbody"></tbody>
+        </table>
+        <div class="empty" id="ports-empty" hidden>没有采集到监听端口</div>
+      </div>
+    </article>
+  </section>
+
+  <!-- ── 容器 ── -->
+  <section class="tab-panel" id="panel-containers" role="tabpanel" hidden>
+    <article class="card">
+      <div class="card-head panel-head">
+        <h2>容器</h2>
+        <span class="hint">按 docker 容器聚合进程占用</span>
+      </div>
+      <div class="table-wrap">
+        <table class="ptable">
+          <thead>
+            <tr>
+              <th>容器</th>
+              <th class="num">进程数</th>
+              <th class="num">CPU%</th>
+              <th class="num">内存</th>
+              <th class="num hide-sm">线程</th>
+              <th class="num hide-md">容器 ID</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="contbody"></tbody>
+        </table>
+        <div class="empty" id="containers-empty" hidden>没有检测到容器进程（docker 不可用或未运行容器）</div>
+      </div>
+    </article>
+  </section>
+
+  <!-- ── 服务 ── -->
+  <section class="tab-panel" id="panel-services" role="tabpanel" hidden>
+    <article class="card">
+      <div class="card-head panel-head">
+        <h2>systemd 服务</h2>
+        <div class="procs-tools">
+          <span class="hint" id="svc-counts">—</span>
+          <select id="svc-state" title="状态筛选">
+            <option value="">全部状态</option>
+            <option value="running">运行中</option>
+            <option value="stopped">未运行</option>
+            <option value="failed">失败</option>
+          </select>
         </div>
-        <select id="sort" title="排序">
-          <option value="cpu">按 CPU</option>
-          <option value="mem">按内存</option>
-          <option value="pid">按 PID</option>
-          <option value="name">按名称</option>
-          <option value="time">按 CPU 时间</option>
-          <option value="threads">按线程数</option>
-          <option value="start">按启动时间</option>
-        </select>
-        <button class="btn ghost" id="btn-refresh" type="button" title="立即刷新">刷新</button>
       </div>
-    </div>
-
-    <div class="cfilter" id="cfilter" hidden>
-      <span>仅显示容器 <b id="cfilter-name">—</b> 的进程</span>
-      <button class="btn tiny ghost" id="cfilter-clear" type="button">清除</button>
-    </div>
-
-    <div class="table-wrap" id="view-list">
-      <table class="ptable">
-        <thead>
-          <tr>
-            <th data-sort="pid" class="num">PID</th>
-            <th data-sort="name">名称</th>
-            <th data-sort="cpu" class="num">CPU%</th>
-            <th data-sort="mem" class="num">内存</th>
-            <th data-sort="threads" class="num hide-sm">线程</th>
-            <th class="hide-sm">用户</th>
-            <th class="hide-sm">状态</th>
-            <th class="hide-md">容器</th>
-            <th data-sort="time" class="num hide-sm">CPU 时间</th>
-            <th>操作</th>
-          </tr>
-        </thead>
-        <tbody id="ptbody"></tbody>
-      </table>
-      <div class="empty" id="empty" hidden>没有匹配的进程</div>
-    </div>
-
-    <div class="table-wrap" id="view-tree" hidden>
-      <table class="ptable tree-table">
-        <thead>
-          <tr>
-            <th class="num">PID</th>
-            <th>进程树</th>
-            <th class="num">CPU%</th>
-            <th class="num">内存</th>
-            <th class="num hide-sm">线程</th>
-            <th class="hide-md">容器</th>
-            <th>操作</th>
-          </tr>
-        </thead>
-        <tbody id="treebody"></tbody>
-      </table>
-    </div>
-
-    <div class="table-wrap" id="view-ports" hidden>
-      <table class="ptable">
-        <thead>
-          <tr>
-            <th class="num">端口</th>
-            <th>协议</th>
-            <th>监听地址</th>
-            <th class="num">PID</th>
-            <th>进程</th>
-            <th class="hide-sm">用户</th>
-            <th class="hide-md">容器</th>
-          </tr>
-        </thead>
-        <tbody id="portbody"></tbody>
-      </table>
-      <div class="empty" id="ports-empty" hidden>没有采集到监听端口</div>
-    </div>
-
-    <div class="table-wrap" id="view-containers" hidden>
-      <table class="ptable">
-        <thead>
-          <tr>
-            <th>容器</th>
-            <th class="num">进程数</th>
-            <th class="num">CPU%</th>
-            <th class="num">内存</th>
-            <th class="num hide-sm">线程</th>
-            <th class="num">容器 ID</th>
-            <th>操作</th>
-          </tr>
-        </thead>
-        <tbody id="contbody"></tbody>
-      </table>
-      <div class="empty" id="containers-empty" hidden>没有检测到容器进程（docker 不可用或未运行容器）</div>
-    </div>
-
-    <div class="table-wrap" id="view-services" hidden>
-      <div class="svc-tools">
-        <span class="hint" id="svc-counts">—</span>
-        <select id="svc-state" title="状态筛选">
-          <option value="">全部状态</option>
-          <option value="running">运行中</option>
-          <option value="stopped">未运行</option>
-          <option value="failed">失败</option>
-        </select>
+      <div class="table-wrap">
+        <table class="ptable">
+          <thead>
+            <tr>
+              <th>服务</th>
+              <th>状态</th>
+              <th class="hide-sm">说明</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="svcbody"></tbody>
+        </table>
+        <div class="empty" id="services-empty" hidden>没有匹配的服务</div>
       </div>
-      <table class="ptable">
-        <thead>
-          <tr>
-            <th>服务</th>
-            <th>状态</th>
-            <th class="hide-sm">说明</th>
-            <th>操作</th>
-          </tr>
-        </thead>
-        <tbody id="svcbody"></tbody>
-      </table>
-      <div class="empty" id="services-empty" hidden>没有匹配的服务</div>
-    </div>
-    <div class="table-foot">
-      <span id="table-info">—</span>
-      <span class="hint">点击行查看详情 · 数值每秒刷新</span>
-    </div>
+    </article>
+  </section>
+
+  <!-- ── 记录 ── -->
+  <section class="tab-panel" id="panel-audit" role="tabpanel" hidden>
+    <article class="card audit-card">
+      <div class="card-head panel-head">
+        <h2>操作记录</h2>
+        <span class="hint">发信号 / 服务操作 · 最近 20 条</span>
+      </div>
+      <ul class="audit" id="audit"><li class="hint">暂无操作</li></ul>
+    </article>
   </section>
 
   <footer class="footer">
-    <span>进程管家 <b id="ver">0.4.0</b> · 数据来自 /proc</span>
+    <span>进程管家 <b id="ver">0.5.0</b> · 数据来自 /proc</span>
+    <span id="table-info" class="hint">—</span>
     <span id="ts-line">—</span>
   </footer>
 </div>
@@ -296,12 +355,6 @@
     </div>
   </div>
 </div>
-
-<!-- 操作记录 -->
-<section class="card audit-card">
-  <div class="card-head"><h2>操作记录</h2><span class="hint">最近 20 条</span></div>
-  <ul class="audit" id="audit"><li class="hint">暂无操作</li></ul>
-</section>
 
 <div class="toast-wrap" id="toasts"></div>
 

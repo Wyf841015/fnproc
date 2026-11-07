@@ -1,4 +1,10 @@
 /* app/ui/styles/app.css — 进程管家样式（单文件，无外部依赖） */
+/* 关键：hidden 属性必须压过类里显式写的 display。
+   .modal-mask 写了 display:grid，而 UA 的 [hidden]{display:none} 优先级更低，
+   结果这个 fixed 全屏遮罩虽然 opacity:0 却一直盖在页面上吃掉所有点击 —— 表现就是
+   「按钮都点不动」。所以这条 !important 是功能性的，不是样式洁癖。 */
+[hidden] { display: none !important; }
+
 :root {
   --radius: 14px;
   --radius-sm: 9px;
@@ -110,6 +116,35 @@ body {
 .kpi-mem .bar > i { background: linear-gradient(90deg, #818cf8, #a78bfa); }
 .kpi-swap .bar > i { background: linear-gradient(90deg, #fbbf24, #f97316); }
 
+
+
+/* ── 功能分类 tab ─────────────────────────────────────── */
+.tabs {
+  display: flex; gap: 6px; padding: 5px; border-radius: 14px;
+  background: var(--card); border: 1px solid var(--line); box-shadow: var(--shadow);
+  overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none;
+}
+.tabs::-webkit-scrollbar { display: none; }
+.tab {
+  appearance: none; border: 1px solid transparent; background: transparent; color: var(--text-dim);
+  display: inline-flex; align-items: center; gap: 6px; padding: 8px 14px; border-radius: 10px;
+  font-size: 13.5px; cursor: pointer; transition: .16s; white-space: nowrap; flex: 0 0 auto;
+}
+.tab:hover { color: var(--text); background: var(--bg-2); }
+.tab.active {
+  color: var(--text); font-weight: 600; background: var(--bg-2);
+  border-color: var(--line); box-shadow: inset 0 -2px 0 var(--accent);
+}
+.tab-icon { font-size: 14px; line-height: 1; }
+.tab-badge {
+  font-size: 11px; padding: 1px 6px; border-radius: 999px; background: rgba(148, 163, 184, .18);
+  color: var(--text-dim); font-family: ui-monospace, Menlo, monospace;
+}
+.tab.active .tab-badge { background: rgba(56, 189, 248, .18); color: var(--accent); }
+.tab-badge.alert { background: rgba(248, 113, 113, .18); color: var(--danger); }
+.tab-panel { display: flex; flex-direction: column; gap: 12px; }
+.panel-head { padding: 12px 14px 0; flex-wrap: wrap; }
+.panel-head h2 { margin: 0; font-size: 13px; font-weight: 600; color: var(--text-dim); letter-spacing: .3px; }
 
 /* ── 图表时间范围条 ───────────────────────────────────── */
 .charts-bar { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 0 4px; margin-top: 2px; }
@@ -335,6 +370,9 @@ select {
   .hide-sm { display: none; }
   .hide-md { display: none; }
   .views { width: 100%; justify-content: space-between; }
+  .tab { padding: 7px 10px; font-size: 12.5px; }
+  .tab-icon { display: none; }
+  .tabs { padding: 4px; gap: 3px; }
   .vbtn { flex: 1; text-align: center; padding: 6px 4px; }
   .tree-table .tree-cell { max-width: none; }
   .svc-actions { flex-wrap: wrap; }
