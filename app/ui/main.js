@@ -234,49 +234,114 @@ function renderKpis(s) {
 }
 
 // ── 渲染：进程表 ────────────────────────────────────────────────────────
-function renderTable(rows) {
-  rowsCache = rows;
-  const tb = $('ptbody');
-  tb.textContent = '';
-  const frag = document.createDocumentFragment();
-  for (const p of rows) {
-    const tr = el('tr');
-    tr.dataset.pid = p.pid;
-    tr.appendChild(el('td', 'num mono', p.pid));
-    const nameTd = el('td', 'pname');
-    nameTd.appendChild(el('span', 'nm', p.name));
-    if (p.cmd && p.cmd !== p.name) nameTd.appendChild(el('span', 'cmd', p.cmd));
-    tr.appendChild(nameTd);
-    const cpuTd = el('td', 'num mono');
-    cpuTd.appendChild(el('span', 'cpuval', fmtPct(p.cpuPct)));
-    if (p.cpuPct > 10) cpuTd.dataset.hot = '1';
-    tr.appendChild(cpuTd);
-    tr.appendChild(el('td', 'num mono', fmtBytes(p.rss)));
-    tr.appendChild(el('td', 'num mono hide-sm', p.threads));
-    tr.appendChild(el('td', 'hide-sm', p.user));
-    const stTd = el('td', 'hide-sm');
-    stTd.appendChild(el('span', 'state s-' + p.state, STATE_CN[p.state] || p.state));
-    tr.appendChild(stTd);
-    const cTd = el('td', 'hide-md');
+// 行级增量渲染：390 行 × 10 列的表格每次刷新都重建 DOM，会掉帧、丢滚动位置、
+// 打断正在进行的点击。pid 顺序没变时只改变化的单元格文本。
+let tablePids = [];
+const rowRefs = new Map();          // pid → 该行需要更新的节点引用
+
+function buildRow(p) {
+  const tr = el('tr');
+  tr.dataset.pid = p.pid;
+  tr.appendChild(el('td', 'num mono', p.pid));
+  const nameTd = el('td', 'pname');
+  const nm = el('span', 'nm', p.name);
+  let cmdEl = null;
+  if (p.cmd && p.cmd !== p.name) { cmdEl = el('span', 'cmd', p.cmd); nameTd.append(nm, cmdEl); }
+  else nameTd.appendChild(nm);
+  tr.appendChild(nameTd);
+  const cpuTd = el('td', 'num mono');
+  const cpuSpan = el('span', 'cpuval', fmtPct(p.cpuPct));
+  cpuTd.appendChild(cpuSpan);
+  if (p.cpuPct > 10) cpuTd.dataset.hot = '1';
+  tr.appendChild(cpuTd);
+  const rssTd = el('td', 'num mono', fmtBytes(p.rss));
+  tr.appendChild(rssTd);
+  const thTd = el('td', 'num mono hide-sm', p.threads);
+  tr.appendChild(thTd);
+  const userTd = el('td', 'hide-sm', p.user);
+  tr.appendChild(userTd);
+  const stTd = el('td', 'hide-sm');
+  const stSpan = el('span', 'state s-' + p.state, STATE_CN[p.state] || p.state);
+  stTd.appendChild(stSpan);
+  tr.appendChild(stTd);
+  const cTd = el('td', 'hide-md');
+  if (p.container) {
+    const chip = el('span', 'chip cont', p.container.name);
+    chip.title = '容器 ID ' + p.container.id + '（点击只看该容器）';
+    chip.dataset.action = 'filter-container';
+    chip.dataset.container = p.container.name;
+    cTd.appendChild(chip);
+  } else cTd.appendChild(el('span', 'hint', '—'));
+  tr.appendChild(cTd);
+  const ctTd = el('td', 'num mono hide-sm', fmtCpuTime(p.cpuTime));
+  tr.appendChild(ctTd);
+  const actTd = el('td', 'act');
+  const btn = el('button', 'btn tiny', '信号');
+  btn.type = 'button';
+  btn.dataset.action = 'signal';
+  btn.dataset.pid = p.pid;
+  actTd.appendChild(btn);
+  tr.appendChild(actTd);
+  rowRefs.set(p.pid, { tr, cpuTd, cpuSpan, rssTd, thTd, userTd, stSpan, stTd, cTd, ctTd, nm, nameTd, cmdEl, container: p.container ? p.container.name : '' });
+  return tr;
+}
+
+function setText(node, v) {
+  if (!node) return;
+  const s = String(v);
+  if (node.textContent !== s) node.textContent = s;
+}
+
+function patchRow(p, r) {
+  if (!r) return;
+  setText(r.cpuSpan, fmtPct(p.cpuPct) );
+  if (p.cpuPct > 10) r.cpuTd.dataset.hot = '1'; else delete r.cpuTd.dataset.hot;
+  setText(r.rssTd, fmtBytes(p.rss));
+  setText(r.thTd, p.threads);
+  setText(r.userTd, p.user);
+  const stLabel = STATE_CN[p.state] || p.state;
+  if (r.stSpan.textContent !== stLabel) r.stSpan.textContent = stLabel;
+  const stCls = 'state s-' + p.state;
+  if (r.stSpan.className !== stCls) r.stSpan.className = stCls;
+  setText(r.ctTd, fmtCpuTime(p.cpuTime));
+  // 容器归属可能变（进程刚被 container 认领），变了才重建这一个 chip
+  const cName = p.container ? p.container.name : '';
+  if (cName !== r.container) {
+    r.cTd.textContent = '';
     if (p.container) {
       const chip = el('span', 'chip cont', p.container.name);
       chip.title = '容器 ID ' + p.container.id + '（点击只看该容器）';
       chip.dataset.action = 'filter-container';
       chip.dataset.container = p.container.name;
-      cTd.appendChild(chip);
-    } else cTd.appendChild(el('span', 'hint', '—'));
-    tr.appendChild(cTd);
-    tr.appendChild(el('td', 'num mono hide-sm', fmtCpuTime(p.cpuTime)));
-    const actTd = el('td', 'act');
-    const btn = el('button', 'btn tiny', '信号');
-    btn.type = 'button';
-    btn.dataset.action = 'signal';
-    btn.dataset.pid = p.pid;
-    actTd.appendChild(btn);
-    tr.appendChild(actTd);
-    frag.appendChild(tr);
+      r.cTd.appendChild(chip);
+    } else r.cTd.appendChild(el('span', 'hint', '—'));
+    r.container = cName;
   }
-  tb.appendChild(frag);
+  // 名称/命令行：一般不变，变了才动
+  if (r.nm.textContent !== p.name) r.nm.textContent = p.name;
+  if (p.cmd && p.cmd !== p.name) {
+    if (!r.cmdEl) { r.cmdEl = el('span', 'cmd', p.cmd); r.nameTd.appendChild(r.cmdEl); }
+    else setText(r.cmdEl, p.cmd);
+  } else if (r.cmdEl) {
+    r.cmdEl.remove();
+    r.cmdEl = null;
+  }
+}
+
+function renderTable(rows) {
+  rowsCache = rows;
+  const tb = $('ptbody');
+  const sameShape = rows.length === tablePids.length && rows.every((p, i) => p.pid === tablePids[i]);
+  if (sameShape && rowRefs.size) {
+    for (const p of rows) patchRow(p, rowRefs.get(p.pid));
+  } else {
+    tb.textContent = '';
+    rowRefs.clear();
+    const frag = document.createDocumentFragment();
+    for (const p of rows) frag.appendChild(buildRow(p));
+    tb.appendChild(frag);
+    tablePids = rows.map((p) => p.pid);
+  }
   $('empty').hidden = rows.length > 0;
   $('table-info').textContent = `${rows.length} 个进程${query ? `（已过滤，共 ${lastSnapshot?.procTotal ?? '?'} 个）` : ''}`;
 }
@@ -658,6 +723,18 @@ function startStream() {
   es.onmessage = (ev) => {
     try {
       const s = JSON.parse(ev.data);
+      // 服务端为了省带宽把历史点压成数组（hk = 字段名表），这里还原成对象，
+      // 后面的绘图代码就不用关心传输格式。实测一帧 16.5KB → 3.6KB。
+      if (Array.isArray(s.hk) && Array.isArray(s.h)) {
+        const keys = s.hk;
+        s.history = s.h.map((row) => {
+          const o = {};
+          for (let i = 0; i < keys.length; i += 1) o[keys[i]] = row[i];
+          return o;
+        });
+        delete s.hk;
+        delete s.h;
+      }
       lastSnapshot = s;
       renderKpis(s);
       // SSE 里只带 top 30；表格数据单独取，保证排序/过滤一致
@@ -1275,6 +1352,11 @@ function bindEvents() {
   loadAudit();
   startStream();
   // 表格数据 3 秒刷一次（SSE 只推概览与 top30，避免整表每秒重排导致选择/滚动丢失）
-  setInterval(() => { refreshView(); }, 3000);
+  // SSE 通着的时候页面已经是实时的，表格没必要再每 3 秒重拉一次 107KB。
+  // 10 秒兜底刷新 + 页面不可见时完全跳过（后台标签页不该占带宽和 CPU）。
+  setInterval(() => {
+    if (document.visibilityState === 'hidden') return;
+    refreshView();
+  }, 10000);
   setInterval(() => { if (historyRange !== '60s') loadHistoryView(); }, 30000);
 })();

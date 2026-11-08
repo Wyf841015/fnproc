@@ -13,7 +13,8 @@ import { readFileSync, readdirSync, existsSync, unlinkSync, statSync, readlinkSy
 import { join, dirname, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createServer } from 'node:http';
-import { execFileSync } from 'node:child_process';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { gzipSync } from 'node:zlib';
 import { openAuditStore } from './audit-db.js';
 import { openHistoryStore } from './history-db.js';
@@ -27,23 +28,36 @@ const PORT = parseInt(process.env.PORT || '47951', 10);
 const SOCK_DIR = process.env.FNPROC_SOCK_DIR || TARGET_DIR;
 const SOCK_PATH = join(SOCK_DIR, 'fnproc.sock');
 const GATEWAY_PREFIX = '/app/fnproc';
-const VERSION = '0.2.0';
+const VERSION = '0.2.1';
 const SAMPLE_MS = 1000;
 const HISTORY_MAX = 120;              // 内存里保留 120 个采样点，够前端画满图
 
 // ── 小工具 ──────────────────────────────────────────────────────────────
+// execFileSync 会把事件循环卡住：systemctl（超时 20s）或 docker（无响应）一旦变慢，
+// 整个服务连 /api/health 都不响应。统一改成异步 execFile。
+const execFileP = promisify(execFile);
 const readOr = (p, dflt = '') => { try { return readFileSync(p, 'utf8'); } catch { return dflt; } };
 const num = (v) => { const n = Number(v); return Number.isFinite(n) ? n : 0; };
 const r1 = (v) => Math.round(v * 10) / 10;
 
 function sendJSON(res, code, obj) {
-  const body = JSON.stringify(obj);
-  res.writeHead(code, {
+  const buf = Buffer.from(JSON.stringify(obj));
+  const req = res.__req;
+  const ae = String((req && req.headers['accept-encoding']) || '');
+  const headers = {
     'Content-Type': 'application/json; charset=utf-8',
-    'Content-Length': Buffer.byteLength(body),
     'Cache-Control': 'no-store',
-  });
-  res.end(body);
+    Vary: 'Accept-Encoding',
+  };
+  let out = buf;
+  // 只压大响应：小 JSON 压完可能更大，还白花 CPU。/api/processes 实测 107KB→16KB。
+  if (buf.length > 1024 && /gzip/.test(ae)) {
+    out = gzipSync(buf);
+    headers['Content-Encoding'] = 'gzip';
+  }
+  headers['Content-Length'] = out.length;
+  res.writeHead(code, headers);
+  res.end(out);
 }
 
 function parseBody(req, limit = 64 * 1024) {
@@ -90,11 +104,25 @@ function serveStatic(req, res, pathname) {
   const rel = pathname === '/' || pathname === '' ? 'index.html' : pathname.replace(/^\/+/, '');
   if (rel.includes('..')) { sendJSON(res, 403, { error: '路径越界' }); return; }
   const fp = join(UI_DIR, rel);
-  if (!existsSync(fp) || !statSync(fp).isFile()) { sendJSON(res, 404, { error: 'not found: ' + rel }); return; }
+  let st;
+  try { st = statSync(fp); } catch { sendJSON(res, 404, { error: 'not found: ' + rel }); return; }
+  if (!st.isFile()) { sendJSON(res, 404, { error: 'not found: ' + rel }); return; }
+  const type = MIME[extname(fp).toLowerCase()] || 'application/octet-stream';
+  // ETag 用 size+mtime：部署新版本必然变，文件没变则命中 304 不用重下。
+  // 保留 no-cache（每次都回源校验）—— fnOS WebView 缓存旧 main.js 的坑还在，
+  // 不能用强缓存；304 只是把「未改动的整包传输」省掉。
+  const etag = '"' + st.size.toString(16) + '-' + Math.floor(st.mtimeMs).toString(16) + '"';
+  const headers = {
+    'Content-Type': type, 'Cache-Control': 'no-cache',
+    ETag: etag, 'X-Content-Type-Options': 'nosniff',
+  };
+  if (String(req.headers['if-none-match'] || '') === etag) {
+    res.writeHead(304, headers);
+    res.end();
+    return;
+  }
   let data;
   try { data = readFileSync(fp); } catch { sendJSON(res, 500, { error: 'read failed' }); return; }
-  const type = MIME[extname(fp).toLowerCase()] || 'application/octet-stream';
-  const headers = { 'Content-Type': type, 'Cache-Control': 'no-cache', 'X-Content-Type-Options': 'nosniff' };
   const ae = String(req.headers['accept-encoding'] || '');
   if (/gzip/.test(ae) && data.length > 2048 && /^(text|application\/javascript|application\/json|image\/svg)/.test(type)) {
     data = gzipSync(data);
@@ -169,6 +197,75 @@ function refreshInodePorts() {
   inodePort = map;
 }
 
+// 端口 ↔ 进程：原来靠遍历 /proc/<pid>/fd 反查 socket inode 归属，
+// 390 个进程 × 每 10 秒 ≈ 上万个 readdir/readlink 系统调用，是第二个 CPU 大户。
+// 现在优先用一次 `ss -tunapH`（内核已经算好了），解析失败才退回旧路径。
+let portsInflight = false;
+
+async function refreshPorts() {
+  if (portsInflight) return;
+  portsInflight = true;
+  try {
+    const ok = await portsViaSs();
+    if (!ok) { refreshInodePorts(); refreshPidPorts(); }
+  } catch {
+    try { refreshInodePorts(); refreshPidPorts(); } catch { /* 忽略 */ }
+  } finally {
+    portsInflight = false;
+  }
+}
+
+async function portsViaSs() {
+  let out = '';
+  try {
+    const r = await execFileP('ss', ['-tunapH'],
+      { timeout: 5000, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
+    out = String(r.stdout || '');
+  } catch {
+    return false;                     // 没装 ss / 无权限 → 调用方回退
+  }
+  if (!out.trim()) return false;
+  const byPid = new Map();
+  let candidates = 0;               // 有多少行「看起来是端口」，用来判断 ss 是否有权限看到进程
+  for (const line of out.split('\n')) {
+    const t = line.trim();
+    if (!t) continue;
+    const f = t.split(/\s+/);
+    // 字段：Netid State Recv-Q Send-Q Local Peer [Process]
+    if (f.length < 6) continue;
+    const netid = f[0];
+    const state = f[1];
+    const local = f[4];
+    if (!netid.startsWith('tcp') && !netid.startsWith('udp')) continue;
+    if (netid.startsWith('tcp') && state !== 'LISTEN') continue;   // 与旧实现一致：TCP 只看监听
+    candidates += 1;
+    const m = t.match(/pid=(\d+)/);
+    if (!m) continue;
+    const pid = num(m[1]);
+    const idx = local.lastIndexOf(':');
+    if (idx < 0) continue;
+    const port = num(local.slice(idx + 1));
+    if (!port) continue;
+    const addr = local.slice(0, idx).replace(/^\[|\]$/g, '');
+    if (!byPid.has(pid)) byPid.set(pid, []);
+    byPid.get(pid).push({ port, proto: netid, addr, state: state === 'LISTEN' ? 'LISTEN' : state });
+  }
+  // 非 root 时 ss 只给得出自己进程的 pid（实测 admin 只有 2 条，root 有 122 条）。
+  // 拿到的比例太低就认为「看不到」，退回遍历 /proc/PID/fd（结果一样但至少不漏）。
+  if (!byPid.size || byPid.size < Math.max(3, candidates * 0.3)) return false;
+  for (const [pid, list] of byPid) {
+    const seen = new Set();
+    byPid.set(pid, list.filter((p) => {
+      const k = p.proto + p.port + p.addr;
+      if (seen.has(k)) return false;
+      seen.add(k);
+      return true;
+    }).sort((a, b) => a.port - b.port));
+  }
+  pidPorts = byPid;
+  return true;
+}
+
 function refreshPidPorts() {
   const out = new Map();
   let pids = [];
@@ -207,20 +304,26 @@ const cgroupCache = new Map();          // pid → {v, ts}
 let dockerNames = new Map();            // 短ID(12) → 容器名
 let dockerAt = 0;
 
-function refreshDocker() {
+let dockerInflight = false;
+async function refreshDocker() {
   const now = Date.now();
-  if (now - dockerAt < 15000) return;   // docker 命令有开销，15s 才跑一次
+  if (dockerInflight || now - dockerAt < 15000) return;   // docker 命令有开销，15s 才跑一次
   dockerAt = now;
+  dockerInflight = true;
   const names = new Map();
   try {
-    const out = execFileSync('docker', ['ps', '--no-trunc', '--format', '{{.ID}}\t{{.Names}}'],
-      { timeout: 4000, encoding: 'utf8' });
-    for (const line of out.split('\n')) {
+    const { stdout } = await execFileP('docker', ['ps', '--no-trunc', '--format', '{{.ID}}\t{{.Names}}'],
+      { timeout: 4000, encoding: 'utf8', maxBuffer: 4 * 1024 * 1024 });
+    for (const line of String(stdout).split('\n')) {
       const [id, name] = line.trim().split('\t');
       if (id && name) names.set(id.slice(0, 12), name);
     }
-  } catch { /* 没装 docker / 无权限：静默降级，不显示容器列即可 */ }
-  dockerNames = names;
+    dockerNames = names;
+  } catch {
+    /* 没装 docker / 无权限 / 超时：保留上一次结果，静默降级 */
+  } finally {
+    dockerInflight = false;
+  }
 }
 
 function procContainer(pid) {
@@ -250,6 +353,9 @@ function readCpuModel() {
 }
 
 let lastCpuDelta = { dt: 0, di: 0 };
+// 进程扫描的节奏可能慢于 1 秒（有人看 2 秒一次 / 没人看 10 秒一次），
+// 所以 CPU% 的分母要跨过被跳过的 tick 累加起来，否则进程 CPU% 会虚高几倍。
+let pendingCpuDelta = 0;
 function sampleCpu() {
   const lines = readOr('/proc/stat').split('\n');
   const parse = (f) => {
@@ -545,7 +651,9 @@ function sampleProcs() {
   const now = Date.now();
   // 分母必须是「两次采样之间」的总 jiffies 增量，不能用累计值：
   // 用累计值算出来的进程 CPU% 会小到四舍五入后全是 0.0。
-  const totalDelta = lastCpuDelta.dt > 0 ? lastCpuDelta.dt : 0;
+  // 分母 = 上次扫描以来累计的全机 jiffies
+  const totalDelta = pendingCpuDelta > 0 ? pendingCpuDelta : (lastCpuDelta.dt > 0 ? lastCpuDelta.dt : 0);
+  pendingCpuDelta = 0;
   const ncpu = Math.max(1, state.cpu.count || 1);
   const list = [];
   const seen = new Set();
@@ -611,6 +719,22 @@ function sampleProcs() {
 }
 
 let lastSampleAt = Date.now();
+let lastApiHit = Date.now();
+let lastProcScanAt = 0;
+
+// 「有人在看吗」：有 SSE 长连接，或最近 N 秒内有过任何一个 /api 请求。
+function activeRecently(ms = 30000) {
+  return clients.size > 0 || (Date.now() - lastApiHit < ms);
+}
+
+// 请求进来时保证进程数据是新的（空闲期只每 5 秒扫一次，别把 5 秒前的数据当实时返回）
+function ensureFreshProcs(maxAgeMs = 1200) {
+  if (Date.now() - state.ts > maxAgeMs) {
+    sampleProcs();
+    lastProcScanAt = Date.now();
+  }
+}
+
 function tick() {
   const now = Date.now();
   const dtSec = Math.max(0.2, (now - lastSampleAt) / 1000);
@@ -620,7 +744,17 @@ function tick() {
   sampleLoad();
   sampleIo(dtSec);
   sampleNet(dtSec);
-  sampleProcs();
+  // 全量扫 /proc（每个进程一个 stat 文件）是本项目最大的 CPU 开销：
+  // 390 个进程 × 每秒一次 ≈ 持续 3% CPU。没人看的时候降到 5 秒一次，
+  // 系统级指标照旧 1 秒采，所以历史曲线/告警不受影响。
+  pendingCpuDelta += Math.max(0, lastCpuDelta.dt || 0);
+  // 有人看：2 秒扫一次（表格本身 10 秒才拉一次，2 秒足够新）；
+  // 没人看：10 秒扫一次。两种情况 CPU% 都靠 pendingCpuDelta 保持正确。
+  const procInterval = activeRecently(30000) ? 2000 : 10000;
+  if (now - lastProcScanAt >= procInterval) {
+    sampleProcs();
+    lastProcScanAt = now;
+  }
   history.push({
     ts: now,
     cpu: state.cpu.totalPct,
@@ -638,9 +772,46 @@ function tick() {
 
 // ── SSE ─────────────────────────────────────────────────────────────────
 const clients = new Set();
+
+// SSE 是每秒一帧的长连接，每帧体积直接等于带宽：整包实测 16.5 KB/秒
+// （一个页面挂一天 ≈ 1.4 GB）。而前端只用到标量 KPI + 最近 60 个历史点，
+// 帧里那份 top30 进程列表从来没被读过 —— 所以 SSE 改推紧凑帧：
+// 去掉 top，历史点压成数组（60 行 × 8 个数字，约 2.7 KB）。
+const HIST_KEYS = ['ts', 'cpu', 'mem', 'swap', 'rd', 'wr', 'rx', 'tx'];
+function histCompact() {
+  const out = [];
+  for (const h of history.slice(-60)) {
+    out.push([
+      h.ts,
+      Math.round((h.cpu || 0) * 10) / 10,
+      Math.round((h.mem || 0) * 10) / 10,
+      Math.round((h.swap || 0) * 10) / 10,
+      Math.round(h.rd || 0), Math.round(h.wr || 0),
+      Math.round(h.rx || 0), Math.round(h.tx || 0),
+    ]);
+  }
+  return out;
+}
+function sseSnapshot() {
+  return {
+    ts: state.ts,
+    version: VERSION,
+    cpu: state.cpu,
+    mem: state.mem,
+    swap: state.swap,
+    load: state.load,
+    uptime: state.uptime,
+    procTotal: state.procTotal,
+    io: state.io,
+    net: state.net,
+    hk: HIST_KEYS,
+    h: histCompact(),
+  };
+}
+
 function broadcast() {
   if (!clients.size) return;
-  const payload = `data: ${JSON.stringify(snapshot(30))}\n\n`;
+  const payload = `data: ${JSON.stringify(sseSnapshot())}\n\n`;
   for (const res of clients) {
     try { res.write(payload); } catch { clients.delete(res); }
   }
@@ -798,32 +969,50 @@ const PROTECTED_UNITS = new Set([
   'networking.service', 'NetworkManager.service', 'cron.service',
 ]);
 
-function listUnits(force = false) {
-  const now = Date.now();
-  if (!force && now - unitsCache.at < 5000) return unitsCache.list;
-  let list = [];
-  try {
-    const out = execFileSync('systemctl',
-      ['list-units', '--type=service', '--all', '--no-legend', '--no-pager', '--plain'],
-      { timeout: 6000, encoding: 'utf8' });
-    for (const line of out.split('\n')) {
-      const t = line.trim();
-      if (!t) continue;
-      const f = t.split(/\s+/);
-      if (f.length < 4) continue;
-      const [name, load, active, sub] = f;
-      if (!name.endsWith('.service')) continue;
-      const desc = t.slice(t.indexOf(sub, name.length + load.length + active.length) + sub.length).trim();
-      list.push({ name, load, active, sub, desc, protected: PROTECTED_UNITS.has(name) });
+let unitsInflight = false;
+let unitsFirstLoad = null;      // 首次没有任何缓存时的等待 promise
+
+async function listUnits(force = false) {
+  if (!force && Date.now() - unitsCache.at < 5000) return unitsCache.list;
+  // 已经有一次在跑：先返回旧结果，别排队等 systemctl（它可能要几百毫秒到几秒）
+  if (unitsInflight) return unitsCache.list;
+  if (unitsFirstLoad) return unitsFirstLoad;
+
+  const run = (async () => {
+    unitsInflight = true;
+    const list = [];
+    try {
+      const { stdout } = await execFileP('systemctl',
+        ['list-units', '--type=service', '--all', '--no-legend', '--no-pager', '--plain'],
+        { timeout: 6000, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
+      for (const line of String(stdout).split('\n')) {
+        const t = line.trim();
+        if (!t) continue;
+        const f = t.split(/\s+/);
+        if (f.length < 4) continue;
+        const [name, load, active, sub] = f;
+        if (!name.endsWith('.service')) continue;
+        const desc = t.slice(t.indexOf(sub, name.length + load.length + active.length) + sub.length).trim();
+        list.push({ name, load, active, sub, desc, protected: PROTECTED_UNITS.has(name) });
+      }
+      unitsCache = { at: Date.now(), list };
+    } catch {
+      /* 非 systemd / 无权限：保留上一次的缓存（宁可显示旧数据，也不清空成「没有服务」） */
+      unitsCache = { at: Date.now(), list: unitsCache.list };
+    } finally {
+      unitsInflight = false;
+      unitsFirstLoad = null;
     }
-  } catch { /* 非 systemd 环境：返回空表，前端提示即可 */ }
-  unitsCache = { at: now, list };
-  return list;
+    return unitsCache.list;
+  })();
+
+  if (!unitsCache.list.length) unitsFirstLoad = run;   // 第一次必须等结果
+  return run;
 }
 
 const SERVICE_ACTIONS = new Set(['start', 'stop', 'restart']);
 
-function runServiceAction(name, action) {
+async function runServiceAction(name, action) {
   // kind 用来区分审计里的分类：rejected = 被规则拦住（没真的执行），error = 执行了但失败
   if (!UNIT_RE.test(name)) return { ok: false, kind: 'rejected', error: '服务名不合法' };
   if (!SERVICE_ACTIONS.has(action)) return { ok: false, kind: 'rejected', error: '不支持的操作：' + action };
@@ -831,7 +1020,7 @@ function runServiceAction(name, action) {
     return { ok: false, kind: 'rejected', error: `${name} 属于关键服务，禁止 ${action}（会导致失联或系统不可用）` };
   }
   try {
-    execFileSync('systemctl', [action, name], { timeout: 20000, encoding: 'utf8' });
+    await execFileP('systemctl', [action, name], { timeout: 20000, encoding: 'utf8' });
     unitsCache.at = 0;   // 让下一次查询重新拉取
     return { ok: true };
   } catch (e) {
@@ -853,6 +1042,9 @@ const SORTS = {
 };
 
 async function handle(req, res, pathname, query) {
+  res.__req = req;                        // sendJSON 需要看 Accept-Encoding 决定是否 gzip
+  if (pathname.startsWith('/api/')) lastApiHit = Date.now();
+
   // ── SSE：实时快照 ──
   if (pathname === '/api/stream') {
     res.writeHead(200, {
@@ -863,7 +1055,7 @@ async function handle(req, res, pathname, query) {
     });
     res.write('retry: 3000\n');
     res.write(': connected\n\n');
-    res.write(`data: ${JSON.stringify(snapshot(30))}\n\n`);
+    res.write(`data: ${JSON.stringify(sseSnapshot())}\n\n`);
     clients.add(res);
     const keep = setInterval(() => { try { res.write(': ping\n\n'); } catch { /* 忽略 */ } }, 25000);
     req.on('close', () => { clearInterval(keep); clients.delete(res); });
@@ -880,6 +1072,7 @@ async function handle(req, res, pathname, query) {
   }
 
   if (pathname === '/api/processes') {
+    ensureFreshProcs();                   // 空闲期按 5 秒扫，这里按需补一次到 1.2 秒内
     const q = String(query.get('q') || '').toLowerCase().trim();
     const sortKey = SORTS[query.get('sort')] ? query.get('sort') : 'cpu';
     const limit = Math.min(2000, Math.max(1, num(query.get('limit')) || 500));
@@ -945,6 +1138,7 @@ async function handle(req, res, pathname, query) {
 
   const detail = pathname.match(/^\/api\/process\/(\d+)$/);
   if (detail) {
+    ensureFreshProcs();
     const pid = num(detail[1]);
     const base = procs.find((p) => p.pid === pid);
     if (!base) { sendJSON(res, 404, { error: '进程不存在或已退出' }); return; }
@@ -1100,7 +1294,7 @@ async function handle(req, res, pathname, query) {
   if (pathname === '/api/services') {
     const q = String(query.get('q') || '').toLowerCase().trim();
     const state = String(query.get('state') || '').trim();
-    let list = listUnits();
+    let list = await listUnits();
     if (q) list = list.filter((u) => u.name.toLowerCase().includes(q) || u.desc.toLowerCase().includes(q));
     if (state === 'running') list = list.filter((u) => u.active === 'active');
     else if (state === 'stopped') list = list.filter((u) => u.active !== 'active');
@@ -1125,7 +1319,7 @@ async function handle(req, res, pathname, query) {
       sendJSON(res, 400, { error: '需要 confirm: true 才会执行' });
       return;
     }
-    const r = runServiceAction(name, action);
+    const r = await runServiceAction(name, action);
     if (!r.ok) {
       const id = auditRecord({ action: tag, target: name, result: r.kind || 'error', message: r.error, client });
       sendJSON(res, 400, { error: r.error, id });
@@ -1196,7 +1390,17 @@ refreshDocker();
 refreshInodePorts();
 refreshPidPorts();
 setInterval(appendHistory, 30000);   // 历史每 30 秒一行
-setInterval(() => { refreshDocker(); refreshInodePorts(); refreshPidPorts(); }, 10000);
+let portsTick = 0;
+setInterval(() => {
+  portsTick += 1;
+  const active = activeRecently(60000);
+  // 容器列表只在有人看的时候刷新（docker ps 要几十毫秒）
+  if (active) refreshDocker();
+  // 端口归属：有人看 10 秒一次；没人看 60 秒一次。
+  // 单次 `ss -tunapH` 内核要挨个进程做 socket 归属，实测约 80ms CPU，
+  // 按 10 秒跑就是常驻 0.8% —— 没人看的时候完全没必要。
+  if (active || portsTick % 6 === 0) refreshPorts();
+}, 10000);
 
 // 先跑一轮采样，避免首屏全是 0（进程 CPU% 需要两次采样才有意义）
 tick();
