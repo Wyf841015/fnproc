@@ -347,10 +347,34 @@ select {
 }
 .chips { display: flex; flex-wrap: wrap; gap: 6px; }
 .chip { font-size: 12px; padding: 3px 8px; border-radius: 999px; border: 1px solid var(--line); background: var(--bg-2); }
+.chip.dim { color: var(--text-dim); border-style: dashed; }
+.chip.chain { border-color: rgba(56, 189, 248, .35); }
+.chip.chain.near { border-color: rgba(56, 189, 248, .7); color: var(--accent); }
+.chip.path { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
 .signals { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
 .btn.sig { justify-content: center; }
 .btn.sig.warn { border-color: rgba(248, 113, 113, .45); color: var(--danger); }
 .btn.sig.warn:hover { background: rgba(248, 113, 113, .12); }
+/* 结束整棵子树：占满两列，视觉上比单进程信号更「重」 */
+.btn.sig.danger-tree {
+  grid-column: 1 / -1; border-color: rgba(248, 113, 113, .55); color: var(--danger);
+  background: rgba(248, 113, 113, .08);
+}
+.btn.sig.danger-tree:hover { background: rgba(248, 113, 113, .18); }
+/* 环境变量：等宽、限高、可滚动，避免一个巨长的环境把抽屉撑爆 */
+.dblock pre.env-pre {
+  max-height: 190px; overflow: auto; font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 11.5px; line-height: 1.55; white-space: pre; overflow-wrap: normal;
+}
+/* 确认弹窗里的「同时结束整棵子树」 */
+.modal-check {
+  display: flex; align-items: flex-start; gap: 8px; margin: 0 0 14px;
+  padding: 9px 10px; border: 1px dashed rgba(248, 113, 113, .45);
+  border-radius: var(--radius-sm); background: rgba(248, 113, 113, .07);
+  font-size: 12.5px; color: var(--text-dim); cursor: pointer; line-height: 1.45;
+}
+.modal-check input { margin-top: 2px; accent-color: var(--danger); }
+.modal-check b { color: var(--danger); }
 
 /* ── 弹窗 ─────────────────────────────────────────────── */
 .modal-mask {

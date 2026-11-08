@@ -620,10 +620,21 @@ async function loadHistoryView() {
       rd: x.rd, wr: x.wr, rx: x.rx, tx: x.tx,
     }));
     chartCpu.draw(rows); chartMem.draw(rows); chartIo.draw(rows);
-    const span = rows.length
-      ? `${new Date(rows[0].ts).toLocaleTimeString()} → ${new Date(rows[rows.length - 1].ts).toLocaleTimeString()}`
-      : '暂无历史数据';
-    $('range-hint').textContent = `${span} · ${rows.length} 个采样点（每 30 秒）`;
+    // 后端按窗口自动分桶（30s / 90s / 6min / 1h…），提示里写清楚聚合粒度，
+    // 否则 7 天曲线被压成 240 个点时会让人误以为是采样丢了。
+    const bucket = Number(d.bucket || 30);
+    // 跨度超过 6 小时就必须带日期：否则「昨天 21:06」和「今天 21:06」都显示成
+    // 9:06:00 PM，看着像起点比终点还晚（实测 24 小时视图就这样被误读）。
+    const withDate = Number(historyRange) >= 360;
+    const fmtT = (ts) => {
+      const dt = new Date(ts);
+      const hm = `${String(dt.getHours()).padStart(2, '0')}:${String(dt.getMinutes()).padStart(2, '0')}`;
+      return withDate ? `${dt.getMonth() + 1}/${dt.getDate()} ${hm}` : dt.toLocaleTimeString();
+    };
+    const span = rows.length ? `${fmtT(rows[0].ts)} → ${fmtT(rows[rows.length - 1].ts)}` : '暂无历史数据';
+    const gran = bucket >= 3600 ? `${Math.round(bucket / 3600)} 小时`
+      : (bucket >= 60 ? `${Math.round(bucket / 60)} 分钟` : `${bucket} 秒`);
+    $('range-hint').textContent = `${span} · ${rows.length} 个点 · 每 ${gran}聚合`;
   } catch (e) {
     $('range-hint').textContent = '历史数据读取失败：' + e.message;
   }
@@ -702,19 +713,27 @@ async function openDetail(pid) {
     $('d-meta').textContent = `${d.user} · ${STATE_CN[d.state] || d.state} · 启动于 ${fmtStart(d.startMs)}`;
     const grid = $('d-grid');
     grid.textContent = '';
+    const sm = d.smaps || null;
+    const cg = d.cgroup || null;
+    // 内存必须同时给 RSS 与 PSS：RSS 会把共享库/共享内存按进程重复计一遍，
+    // 只看 RSS 会误判大户（实测全机 RSS 相加比真实占用高 27%）。
     const items = [
       ['CPU', fmtPct(d.cpuPct) + ' %'],
       ['内存 RSS', fmtBytes(d.rss)],
-      ['Swap', fmtBytes(d.vmSwap)],
+      ['内存 PSS', sm ? fmtBytes(sm.pss) : '—'],
+      ['独享 USS', sm ? fmtBytes(sm.uss) : '—'],
+      ['共享内存', sm ? fmtBytes(sm.shared) : '—'],
+      ['Swap', fmtBytes(sm ? sm.swap : (d.vmSwap || 0))],
       ['虚拟峰值', fmtBytes(d.vmPeak)],
-      ['线程', d.threads],
-      ['文件描述符', d.fds],
-      ['环境变量', d.envCount + ' 个'],
-      ['OOM 分数', d.oom],
-      ['磁盘读', fmtBytes(d.io.read)],
-      ['磁盘写', fmtBytes(d.io.write)],
+      ['线程', d.threads && d.threads.count != null ? d.threads.count : d.threads],
+      ['文件描述符', d.fdLimit ? `${d.fds} / ${d.fdLimit.soft}` : d.fds],
+      ['环境变量', `${(d.env && d.env.count) || d.envCount || 0} 个`],
+      ['OOM 分数', d.oomAdj ? `${d.oom}（adj ${d.oomAdj > 0 ? '+' : ''}${d.oomAdj}）` : d.oom],
+      ['磁盘读', fmtBytes((d.io && d.io.read) || 0)],
+      ['磁盘写', fmtBytes((d.io && d.io.write) || 0)],
       ['CPU 时间', fmtCpuTime(d.cpuTime)],
       ['父进程', d.ppid],
+      ['子树进程', `${d.descendantCount || 0} 个`],
     ];
     for (const [k, v] of items) {
       const box = el('div', 'ditem');
@@ -723,11 +742,67 @@ async function openDetail(pid) {
     }
     $('d-cmd').textContent = d.cmd || '—';
     $('d-paths').textContent = `EXE: ${d.exe || '(无权限读取)'}\nCWD: ${d.cwd || '(无权限读取)'}`;
+
+    // 父进程链（由近到远）
+    const par = $('d-parents');
+    par.textContent = '';
+    if (d.parents && d.parents.length) {
+      d.parents.forEach((p, i) => par.appendChild(el('span', i === 0 ? 'chip chain near' : 'chip chain', `${p.name} (${p.pid})`)));
+    } else par.appendChild(el('span', 'hint', '无上级进程'));
+
+    // cgroup + 内存额度
+    const cgBox = $('d-cgroup');
+    cgBox.textContent = '';
+    if (cg) {
+      const lim = (v) => (v === 'max' || v == null ? '不限' : fmtBytes(v));
+      cgBox.appendChild(el('span', 'chip dim', `当前 ${fmtBytes(cg.current || 0)}`));
+      if (cg.peak != null) cgBox.appendChild(el('span', 'chip dim', `峰值 ${fmtBytes(cg.peak)}`));
+      cgBox.appendChild(el('span', 'chip dim', `软限 ${lim(cg.high)}`));
+      cgBox.appendChild(el('span', 'chip dim', `硬限 ${lim(cg.max)}`));
+      if (cg.pids != null) {
+        cgBox.appendChild(el('span', 'chip dim', `进程 ${cg.pids}${cg.pidsMax && cg.pidsMax !== 'max' ? ' / ' + cg.pidsMax : ''}`));
+      }
+      const pathChip = el('span', 'chip dim mono path', cg.path);
+      pathChip.title = cg.path;
+      cgBox.appendChild(pathChip);
+    } else cgBox.appendChild(el('span', 'hint', '该进程不在 cgroup v2 下'));
+
+    // 线程列表
+    const th = $('d-threads');
+    th.textContent = '';
+    if (d.threads && d.threads.list && d.threads.list.length) {
+      for (const t of d.threads.list) th.appendChild(el('span', 'chip dim', `${t.name} · ${t.tid}`));
+      $('d-thread-count').textContent = d.threads.truncated
+        ? `共 ${d.threads.count} 个，仅列前 ${d.threads.list.length}`
+        : `共 ${d.threads.count} 个`;
+    } else {
+      th.appendChild(el('span', 'hint', '无'));
+      $('d-thread-count').textContent = '';
+    }
+
+    // 环境变量（敏感项已由后端打码）
+    const envBox = $('d-env');
+    if (d.env && d.env.list && d.env.list.length) {
+      envBox.textContent = d.env.list.map((e) => `${e.k}=${e.v}`).join('\n');
+      $('d-env-count').textContent = d.env.masked
+        ? `共 ${d.env.count} 个，其中 ${d.env.masked} 项已打码`
+        : `共 ${d.env.count} 个`;
+    } else {
+      envBox.textContent = '(无权限读取或无环境变量)';
+      $('d-env-count').textContent = '';
+    }
+
     const ch = $('d-children');
     ch.textContent = '';
     if (d.children && d.children.length) {
       for (const c of d.children.slice(0, 20)) ch.appendChild(el('span', 'chip', `${c.name} (${c.pid})`));
     } else ch.appendChild(el('span', 'hint', '无子进程'));
+
+    // 结束整棵子树（有子孙才显示）
+    const kt = $('d-kill-tree');
+    kt.hidden = !(d.descendantCount > 0);
+    kt.textContent = `结束整棵子树（${d.descendantCount || 0} 个）`;
+
     // 更新各信号按钮的 pid
     for (const b of drawer.querySelectorAll('[data-signal]')) b.dataset.pid = pid;
   } catch (e) {
@@ -744,11 +819,22 @@ function closeDetail() {
 
 // ── 确认弹窗 ────────────────────────────────────────────────────────────
 let pendingAction = null;
-function confirmModal(title, body, okText, fn) {
+let pendingTree = 0;        // 这次操作「可选的」子树进程数，0 = 不显示勾选项
+function confirmModal(title, body, okText, fn, opts = {}) {
   $('modal-title').textContent = title;
   $('modal-body').textContent = body;
   $('modal-ok').textContent = okText || '确定';
   pendingAction = fn;
+  pendingTree = Number(opts.treeCount || 0);
+  const wrap = $('modal-tree-wrap'), cb = $('modal-tree');
+  if (pendingTree > 0) {
+    $('modal-tree-count').textContent = String(pendingTree);
+    cb.checked = opts.treeDefault === true;
+    wrap.hidden = false;
+  } else {
+    cb.checked = false;
+    wrap.hidden = true;
+  }
   $('modal-mask').hidden = false;
   requestAnimationFrame(() => $('modal-mask').classList.add('show'));
 }
@@ -756,26 +842,59 @@ function closeModal() {
   $('modal-mask').classList.remove('show');
   setTimeout(() => { $('modal-mask').hidden = true; }, 160);
   pendingAction = null;
+  pendingTree = 0;
+}
+// 勾选框是否被选中（只有存在可选子树时才为真）
+function treeChecked() {
+  return pendingTree > 0 && $('modal-tree').checked === true;
 }
 
-async function sendSignal(pid, signal) {
+// 本地缓存里的子孙 pid（只用于「先显示个大概」，真正执行时以后端为准）
+function descendantsInCache(pid) {
+  const kids = new Map();
+  for (const p of rowsCache) {
+    if (!kids.has(p.ppid)) kids.set(p.ppid, []);
+    kids.get(p.ppid).push(p.pid);
+  }
+  const out = [];
+  const stack = [...(kids.get(pid) || [])];
+  const seen = new Set(stack);
+  while (stack.length) {
+    const cur = stack.pop();
+    out.push(cur);
+    for (const c of kids.get(cur) || []) if (!seen.has(c)) { seen.add(c); stack.push(c); }
+  }
+  return out;
+}
+
+async function sendSignal(pid, signal, opts = {}) {
   const row = rowsCache.find((p) => p.pid === pid);
   const name = row ? `${row.name} (${pid})` : `PID ${pid}`;
   const danger = signal === 'SIGKILL';
+  // 问一次后端要准确的子孙数量（列表缓存可能被搜索/容器过滤裁过，不能当真）
+  let descCount = descendantsInCache(pid).length;
+  try {
+    const d = await fetch(`${API}/process/${pid}`, { cache: 'no-store' }).then((r) => r.json());
+    if (d && !d.error && Number.isFinite(d.descendantCount)) descCount = d.descendantCount;
+  } catch { /* 拿不到就用本地估算 */ }
   confirmModal(
     danger ? '强制结束进程' : '向进程发送信号',
-    `目标：${name}\n信号：${signal}${danger ? '\n\nKILL 无法被进程捕获，数据可能来不及保存。' : ''}`,
+    `目标：${name}\n信号：${signal}`
+      + (descCount > 0 ? `\n\n该进程还有 ${descCount} 个子孙进程。勾选下方选项可一并结束（先子后父，避免残留孤儿进程）。` : '')
+      + (danger ? '\n\nKILL 无法被进程捕获，数据可能来不及保存。' : ''),
     danger ? '确定结束' : '确定发送',
-    async () => {
+    async ({ tree: treeKill } = {}) => {
+      const tree = treeKill === true;
       try {
         const r = await fetch(API + '/kill', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ pid, signal, confirm: true }),
+          body: JSON.stringify({ pid, signal, confirm: true, tree }),
         });
         const d = await r.json();
         if (!r.ok || !d.success) throw new Error(d.error || ('HTTP ' + r.status));
-        toast(`已向 ${name} 发送 ${signal}`, 'ok');
+        if (d.tree) toast(`已结束子树：${d.killed + d.gone}/${d.count} 个进程`, 'ok');
+        else toast(`已向 ${name} 发送 ${signal}`, 'ok');
         loadAudit();
         refreshAll();
         if (currentDetailPid === pid && (signal === 'SIGKILL' || signal === 'SIGTERM')) closeDetail();
@@ -783,6 +902,7 @@ async function sendSignal(pid, signal) {
         toast('发送失败：' + e.message, 'error');
       }
     },
+    { treeCount: descCount, treeDefault: opts.forceTree === true },
   );
 }
 
@@ -1116,6 +1236,15 @@ function bindEvents() {
     });
   }
 
+  // 结束整棵子树：默认 TERM，弹窗里勾选状态预置为「已勾选」
+  const ktBtn = $('d-kill-tree');
+  if (ktBtn) {
+    ktBtn.addEventListener('click', () => {
+      if (!currentDetailPid) return;
+      sendSignal(currentDetailPid, 'SIGTERM', { forceTree: true });
+    });
+  }
+
   $('d-close').addEventListener('click', closeDetail);
   $('drawer-mask').addEventListener('click', closeDetail);
 
@@ -1123,8 +1252,10 @@ function bindEvents() {
   $('modal-mask').addEventListener('click', (e) => { if (e.target === $('modal-mask')) closeModal(); });
   $('modal-ok').addEventListener('click', async () => {
     const fn = pendingAction;
+    // 注意顺序：closeModal() 会重置 pendingTree，所以勾选状态必须在关闭前取走
+    const tree = treeChecked();
     closeModal();
-    if (fn) await fn();
+    if (fn) await fn({ tree });
   });
 
   document.addEventListener('keydown', (e) => {

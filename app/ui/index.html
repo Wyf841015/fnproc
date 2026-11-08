@@ -6,7 +6,7 @@
 <base href="/app/fnproc/">
 <title>进程管家 · fnproc</title>
 <link rel="icon" href="images/icon_64.png">
-<link rel="stylesheet" href="styles/app.css?v=0.1.2">
+<link rel="stylesheet" href="styles/app.css?v=0.2.0">
 </head>
 <body>
 <div class="app">
@@ -106,6 +106,7 @@
         <option value="60">最近 1 小时</option>
         <option value="360">最近 6 小时</option>
         <option value="1440">最近 24 小时</option>
+        <option value="10080">最近 7 天</option>
       </select>
     </div>
     <div class="charts">
@@ -348,12 +349,28 @@
   <div class="drawer-body">
     <div class="dgrid" id="d-grid"></div>
     <div class="dblock">
+      <label>父进程链</label>
+      <div id="d-parents" class="chips">—</div>
+    </div>
+    <div class="dblock" id="d-cgroup-block">
+      <label>控制组（cgroup）· 内存额度</label>
+      <div id="d-cgroup" class="chips">—</div>
+    </div>
+    <div class="dblock">
+      <label>线程 <span class="hint" id="d-thread-count"></span></label>
+      <div id="d-threads" class="chips">—</div>
+    </div>
+    <div class="dblock">
       <label>命令行</label>
       <pre id="d-cmd">—</pre>
     </div>
     <div class="dblock">
       <label>可执行文件 / 工作目录</label>
       <pre id="d-paths">—</pre>
+    </div>
+    <div class="dblock">
+      <label>环境变量 <span class="hint" id="d-env-count"></span></label>
+      <pre id="d-env" class="env-pre">—</pre>
     </div>
     <div class="dblock">
       <label>子进程</label>
@@ -367,8 +384,9 @@
         <button class="btn sig" data-signal="SIGSTOP" type="button">STOP 暂停</button>
         <button class="btn sig" data-signal="SIGCONT" type="button">CONT 继续</button>
         <button class="btn sig" data-signal="SIGHUP" type="button">HUP 重载</button>
+        <button class="btn sig danger-tree" id="d-kill-tree" type="button" hidden>结束整棵子树</button>
       </div>
-      <p class="hint" id="d-signal-hint">发信号会立即生效，KILL 不给进程任何收尾机会。</p>
+      <p class="hint" id="d-signal-hint">发信号会立即生效，KILL 不给进程任何收尾机会。结束子树会先结束子进程，再结束目标进程。</p>
     </div>
   </div>
 </aside>
@@ -378,6 +396,10 @@
   <div class="modal" role="dialog" aria-modal="true">
     <h3 id="modal-title">确认操作</h3>
     <p id="modal-body">—</p>
+    <label class="modal-check" id="modal-tree-wrap" hidden>
+      <input type="checkbox" id="modal-tree">
+      <span>同时结束整棵子树（共 <b id="modal-tree-count">0</b> 个子孙进程）</span>
+    </label>
     <div class="modal-actions">
       <button class="btn ghost" id="modal-cancel" type="button">取消</button>
       <button class="btn danger" id="modal-ok" type="button">确定</button>
@@ -443,6 +465,6 @@
   <img id="lightbox-img" alt="二维码放大">
 </div>
 
-<script src="main.js?v=0.1.2" type="module"></script>
+<script src="main.js?v=0.2.0" type="module"></script>
 </body>
 </html>

@@ -16,6 +16,7 @@ import { createServer } from 'node:http';
 import { execFileSync } from 'node:child_process';
 import { gzipSync } from 'node:zlib';
 import { openAuditStore } from './audit-db.js';
+import { openHistoryStore } from './history-db.js';
 
 const UI_DIR = dirname(fileURLToPath(import.meta.url));
 const TARGET_DIR = dirname(UI_DIR);
@@ -26,7 +27,7 @@ const PORT = parseInt(process.env.PORT || '47951', 10);
 const SOCK_DIR = process.env.FNPROC_SOCK_DIR || TARGET_DIR;
 const SOCK_PATH = join(SOCK_DIR, 'fnproc.sock');
 const GATEWAY_PREFIX = '/app/fnproc';
-const VERSION = '0.1.2';
+const VERSION = '0.2.0';
 const SAMPLE_MS = 1000;
 const HISTORY_MAX = 120;              // 内存里保留 120 个采样点，够前端画满图
 
@@ -400,6 +401,144 @@ function procUid(pid) {
   return uid;
 }
 
+// ── 详情页用的深度读取（只在打开详情/发信号时才跑，不进 1 秒采样热路径）──────
+// PSS/USS 必须从 smaps_rollup 取：RSS 会把共享库和共享内存重复计进每个进程，
+// 全机 RSS 相加能比真实占用高出一大截（实测 4.4GB vs PSS 3.2GB）。
+function readSmaps(pid) {
+  const raw = readOr(`/proc/${pid}/smaps_rollup`);
+  if (!raw) return null;
+  const out = { rss: 0, pss: 0, shared: 0, uss: 0, swap: 0, anonymous: 0, sharedClean: 0, sharedDirty: 0, privateClean: 0, privateDirty: 0 };
+  for (const line of raw.split('\n')) {
+    const idx = line.indexOf(':');
+    if (idx < 0) continue;
+    const key = line.slice(0, idx).trim();
+    const val = num(line.slice(idx + 1).trim().split(/\s+/)[0]) * 1024;
+    switch (key) {
+      case 'Rss': out.rss = val; break;
+      case 'Pss': out.pss = val; break;
+      case 'Anonymous': out.anonymous = val; break;
+      case 'Swap': out.swap = val; break;
+      case 'Shared_Clean': out.sharedClean = val; break;
+      case 'Shared_Dirty': out.sharedDirty = val; break;
+      case 'Private_Clean': out.privateClean = val; break;
+      case 'Private_Dirty': out.privateDirty = val; break;
+      default: break;
+    }
+  }
+  out.shared = out.sharedClean + out.sharedDirty;
+  out.uss = out.privateClean + out.privateDirty;   // USS = 独享物理内存
+  return out;
+}
+
+// cgroup v2：路径 + 内存额度。max 表示不限（返回字符串 'max'）
+function readCgroupMem(pid) {
+  const lines = readOr(`/proc/${pid}/cgroup`).trim().split('\n');
+  let path = '';
+  for (const line of lines) {
+    const parts = line.split(':');
+    if (parts.length >= 3 && parts[2]) { path = parts[2]; break; }
+  }
+  if (!path) return null;
+  const base = '/sys/fs/cgroup' + (path === '/' ? '' : path);
+  const readKey = (f) => {
+    const v = readOr(join(base, f)).trim();
+    if (!v) return null;
+    if (v === 'max') return 'max';
+    return num(v);
+  };
+  return {
+    path,
+    current: readKey('memory.current'),
+    high: readKey('memory.high'),
+    max: readKey('memory.max'),
+    peak: readKey('memory.peak'),
+    pids: readKey('pids.current'),
+    pidsMax: readKey('pids.max'),
+  };
+}
+
+function readThreads(pid, limit = 40) {
+  let tids = [];
+  try { tids = readdirSync(`/proc/${pid}/task`).map(num).filter(Boolean); } catch { return { count: 0, list: [] }; }
+  const list = [];
+  for (const tid of tids.slice(0, limit)) {
+    const name = readOr(`/proc/${pid}/task/${tid}/comm`).trim();
+    list.push({ tid, name: name || '?' });
+  }
+  return { count: tids.length, list, truncated: tids.length > limit };
+}
+
+// 沿 ppid 往上走，得到「父进程链」（限 8 层，防环形脏数据把循环卡死）
+function readParentChain(pid, depth = 8) {
+  const byPid = new Map(procs.map((p) => [p.pid, p]));
+  const chain = [];
+  let cur = byPid.get(pid)?.ppid || 0;
+  const guard = new Set();
+  while (cur > 0 && chain.length < depth && !guard.has(cur)) {
+    guard.add(cur);
+    const p = byPid.get(cur);
+    chain.push({ pid: cur, name: p?.name || readOr(`/proc/${cur}/comm`).trim() || '?' });
+    cur = p?.ppid || 0;
+  }
+  return chain;
+}
+
+// 环境变量：名字含 KEY/TOKEN/SECRET/PASS/AUTH/COOKIE 的值一律打码 ——
+// 详情页是给人看的，不该把凭据原样铺在屏幕上（也避免被截图带走）。
+const SECRET_KEY_RE = /(KEY|TOKEN|SECRET|PASS|PWD|AUTH|COOKIE|CREDENTIAL|SESSION)/i;
+function readEnvPairs(pid, limit = 40) {
+  const raw = readOr(`/proc/${pid}/environ`);
+  if (!raw) return { count: 0, list: [], masked: 0 };
+  const all = raw.split('\0').filter(Boolean);
+  let masked = 0;
+  const list = [];
+  for (const kv of all.slice(0, limit)) {
+    const eq = kv.indexOf('=');
+    const k = eq > 0 ? kv.slice(0, eq) : kv;
+    let v = eq > 0 ? kv.slice(eq + 1) : '';
+    if (SECRET_KEY_RE.test(k) && v) { v = '***'; masked += 1; }
+    else if (v.length > 140) v = v.slice(0, 140) + '…';
+    list.push({ k, v });
+  }
+  return { count: all.length, list, masked };
+}
+
+function readFdLimit(pid) {
+  for (const line of readOr(`/proc/${pid}/limits`).split('\n')) {
+    if (line.startsWith('Max open files')) {
+      const f = line.slice(14).trim().split(/\s{2,}/);
+      return { soft: num(f[0]), hard: num(f[1]) };
+    }
+  }
+  return null;
+}
+
+// 子孙进程：广度优先展开。杀整棵子树时先按深度倒序（先子后父），
+// 否则父进程先死会让子进程变孤儿（被 init 收养）而漏杀。
+function descendantsOf(pid) {
+  const kids = new Map();
+  for (const p of procs) {
+    if (!kids.has(p.ppid)) kids.set(p.ppid, []);
+    kids.get(p.ppid).push(p.pid);
+  }
+  const levels = [];
+  let frontier = [pid];
+  const seen = new Set([pid]);
+  while (frontier.length && seen.size < 5000) {
+    const next = [];
+    for (const cur of frontier) {
+      for (const c of kids.get(cur) || []) {
+        if (seen.has(c)) continue;
+        seen.add(c);
+        next.push(c);
+      }
+    }
+    if (next.length) levels.push(next);
+    frontier = next;
+  }
+  return levels;          // 第 0 层是子，最后一层是最深的孙
+}
+
 function sampleProcs() {
   let pids = [];
   try { pids = readdirSync('/proc').filter((n) => /^\d+$/.test(n)); } catch { /* 忽略 */ }
@@ -554,6 +693,27 @@ if (auditStore.enabled) {
   console.error('[audit] SQLite 打开失败，降级为内存待写队列:', auditStore.health().error);
 }
 
+// ── 采样历史库 ──────────────────────────────────────────────────────────
+// 老的 history.jsonl 只在新库不可用时继续写；能开库就只写库，避免双份落盘。
+// 首次启动会把已有 jsonl 一次性迁进来（迁完不再读它）。
+const HISTORY_DB = join(DATA_DIR, 'history.db');
+const HISTORY_RETENTION_DAYS = 7;
+const historyStore = openHistoryStore(HISTORY_DB, {
+  retentionDays: HISTORY_RETENTION_DAYS,
+  migrateFrom: HISTORY_FILE,
+});
+if (historyStore.enabled) {
+  const h = historyStore.health();
+  console.log(`[history] SQLite 已启用: ${HISTORY_DB} rows=${h.rows} 迁移=${h.migrated} 保留=${HISTORY_RETENTION_DAYS}天`);
+} else {
+  console.error('[history] SQLite 打开失败，回退到 history.jsonl:', historyStore.health().error);
+}
+// 每小时裁一次过期采样（不再有 8MB 整文件重写）
+setInterval(() => {
+  const removed = historyStore.prune(HISTORY_RETENTION_DAYS);
+  if (removed > 0) console.log(`[history] 清理过期采样 ${removed} 行`);
+}, 3600 * 1000);
+
 // 记录一条操作。在回 HTTP 响应之前调用 —— 客户端看到成功，就等于库里已有这条记录。
 function auditRecord({ action, target = '', result = 'ok', message = '', client = '', detail = {} }) {
   const id = auditStore.record({ action, target, result, message, client, detail });
@@ -582,6 +742,12 @@ function appendHistory() {
     tx: state.net.txBps,
   };
   try {
+    // 优先写 SQLite：按时间保留 + 分桶查询，不再有整文件重写。
+    // 只有库打不开时才回退老的 jsonl（含 8MB 轮转）。
+    if (historyStore.enabled) {
+      historyStore.append(row);
+      return;
+    }
     appendFileSync(HISTORY_FILE, JSON.stringify(row) + '\n');
     const size = statSync(HISTORY_FILE).size;
     if (size > HISTORY_MAX_BYTES) {
@@ -805,11 +971,40 @@ async function handle(req, res, pathname, query) {
       const f = readOr(`/proc/${pid}/statm`).split(/\s+/).map(num);
       statm = { size: f[0] * PAGE, resident: f[1] * PAGE, shared: f[2] * PAGE };
     } catch { /* 忽略 */ }
+
+    // ── 深度信息（PSS/USS、cgroup、线程、父链、环境变量、句柄上限）────────
+    // 这些读取得多花几毫秒，所以只在打开详情时算，不参与 1 秒采样。
+    const smaps = readSmaps(pid);
+    const cgroup = readCgroupMem(pid);
+    const threads = readThreads(pid);
+    const parents = readParentChain(pid);
+    const env = readEnvPairs(pid);
+    const fdLimit = readFdLimit(pid);
+    let oomAdj = 0;
+    try { oomAdj = num(readOr(`/proc/${pid}/oom_score_adj`).trim()); } catch { /* 忽略 */ }
+    const levels = descendantsOf(pid);
+    const descPids = levels.flat();
+
     sendJSON(res, 200, {
       ...base, exe, cwd, fds, envCount, oom, vmSwap, vmPeak, statm,
       cmd: procCmdline(pid, true),
       io: { read: io.read, write: io.write },
       children: procs.filter((p) => p.ppid === pid).map((p) => ({ pid: p.pid, name: p.name })),
+      // 新增：内存细分（PSS 才是「真实占用」，RSS 会把共享内存重复计）
+      smaps,
+      // 新增：cgroup 及其内存额度（current/high/max/peak），max 表示不限
+      cgroup,
+      // 新增：线程列表（限 40 条，超过用 truncated 标记）
+      threads,
+      // 新增：父进程链（由近到远）
+      parents,
+      // 新增：环境变量（敏感 key 已打码）
+      env,
+      fdLimit,
+      oomAdj,
+      // 新增：整棵子树的进程数与 pid 列表（供「结束整棵子树」用）
+      descendantCount: descPids.length,
+      descendants: descPids.slice(0, 200),
     });
     return;
   }
@@ -832,6 +1027,44 @@ async function handle(req, res, pathname, query) {
     if (pid === process.pid) return reject('拒绝：不能结束进程管家自身');
     if (!SIGNALS.has(sig)) return reject(`拒绝：不支持的信号 ${sig}`);
     if (body.confirm !== true) return reject('需要 confirm: true 才会执行');
+
+    // ── 结束整棵子树 ──────────────────────────────────────────────────────
+    // 顺序很关键：必须「先子后父」。反过来的话父进程先死，子进程被 init 收养、
+    // ppid 变成 1，这一轮就再也找不到它们了 —— 表现为「杀了个 node，还剩几个
+    // worker 在跑」。所以按层深倒序发送，最后才动目标进程本身。
+    if (body.tree === true) {
+      const levels = descendantsOf(pid);
+      const descCount = levels.reduce((s, l) => s + l.length, 0);
+      if (descCount > 500) return reject(`拒绝：子树过大（${descCount} 个进程），超过 500 上限`);
+      const targets = [];
+      for (let i = levels.length - 1; i >= 0; i -= 1) targets.push(...levels[i]);
+      targets.push(pid);
+      const killed = [];
+      const gone = [];
+      const failed = [];
+      for (const t of targets) {
+        if (t <= 1 || t === process.pid) { failed.push({ pid: t, error: '受保护，跳过' }); continue; }
+        try { process.kill(t, sig); killed.push(t); } catch (e) {
+          if (e.code === 'ESRCH') gone.push(t);
+          else failed.push({ pid: t, error: e.code || e.message });
+        }
+      }
+      const okCount = killed.length + gone.length;
+      const ok = okCount > 0 && failed.length === 0;
+      const msg = `${sig} 子树 ${okCount}/${targets.length}${failed.length ? ` 失败 ${failed.length}` : ''}`;
+      const id = auditRecord({
+        action: 'kill', target: String(pid), result: ok ? 'ok' : 'error', message: msg, client,
+        detail: { ...detail, tree: true, count: targets.length, killed, gone, failed: failed.slice(0, 20) },
+      });
+      sendJSON(res, ok ? 200 : 400, {
+        success: ok, id, at: new Date().toISOString(), pid, signal: sig,
+        name: tName, user: tUser, ok, tree: true,
+        count: targets.length, killed: killed.length, gone: gone.length, failed,
+        error: ok ? undefined : (failed[0]?.error || '子树内没有进程被结束'),
+      });
+      return;
+    }
+
     try {
       process.kill(pid, sig);
       const id = auditRecord({ action: 'kill', target: String(pid), result: 'ok', message: `${sig} ${tName}`, client, detail });
@@ -845,11 +1078,21 @@ async function handle(req, res, pathname, query) {
   }
 
   if (pathname === '/api/history') {
-    const minutes = num(query.get('minutes')) || 60;
+    // 1 小时 / 6 小时 / 24 小时 / 7 天：SQLite 分桶聚合，返回点数恒定 ≤240
+    const minutes = Math.max(1, Math.min(60 * 24 * 31, num(query.get('minutes')) || 60));
+    if (historyStore.enabled) {
+      const points = Math.min(600, Math.max(60, num(query.get('points')) || 240));
+      const q = historyStore.query(minutes, points);
+      sendJSON(res, 200, {
+        ts: Date.now(), minutes, count: q.rows.length, bucket: q.bucket,
+        source: q.source, file: HISTORY_DB, rows: q.rows, health: historyStore.health(),
+      });
+      return;
+    }
     const rows = readHistory(minutes);
     sendJSON(res, 200, {
-      ts: Date.now(), minutes, count: rows.length,
-      file: HISTORY_FILE, rows,
+      ts: Date.now(), minutes, count: rows.length, bucket: 30,
+      source: 'jsonl', file: HISTORY_FILE, rows,
     });
     return;
   }
