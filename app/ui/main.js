@@ -162,6 +162,19 @@ let currentTab = 'overview';     // overview | process | ports | containers | se
 let processView = 'list';        // list | tree（仅「进程」tab 内的子视图）
 let historyRange = '60s';        // 60s = 实时内存数据；其它 = 从 /api/history 读落盘数据
 let containerFilter = '';        // 容器名或短 ID，非空时列表只显示该容器进程
+// ── 全局 fetch 超时 ────────────────────────────────────────────────────
+// 后端卡住时（systemctl/docker 变慢、socket 半死），没有超时的 fetch 会永远挂着：
+// 界面停在「加载中…」、模块级 flag 永久占用、后续点击被静默吞掉。
+// 这里统一包一层，20 秒必断，不必在 38 个调用点各写一遍。
+const __rawFetch = window.fetch.bind(window);
+window.fetch = (input, init = {}) => {
+  if (init && init.signal) return __rawFetch(input, init);       // 调用方自带取消信号就不重复包
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), 20000);
+  return __rawFetch(input, { ...init, signal: ac.signal })
+    .finally(() => clearTimeout(timer));
+};
+
 const collapsed = new Set();     // 树视图里被折叠的 pid
 let currentDetailPid = null;
 let es = null;
@@ -412,7 +425,13 @@ function treeRow(node, depth, hasKids, isCollapsed, aggVal) {
   const cName = node.container ? node.container.name : '';
   if (cName !== r.container) {
     r.cTd.textContent = '';
-    if (node.container) r.cTd.appendChild(el('span', 'chip cont', node.container.name));
+    if (node.container) {
+      const chip = el('span', 'chip cont', node.container.name);
+      chip.dataset.action = 'filter-container';
+      chip.dataset.container = node.container.name;
+      chip.title = '只看该容器的进程';
+      r.cTd.appendChild(chip);
+    }
     else r.cTd.appendChild(el('span', 'hint', '—'));
     r.container = cName;
   }
@@ -462,6 +481,8 @@ function renderTree(rows) {
   tb.textContent = '';
   tb.appendChild(frag);
   for (const pid of [...treeRefs.keys()]) if (!seen.has(pid)) treeRefs.delete(pid);
+  // 折叠状态也按存活进程清理，否则长期开着页面会单调增长
+  for (const pid of [...collapsed]) if (!seen.has(pid)) collapsed.delete(pid);
   $('table-info').textContent = `${rows.length} 个进程 · ${roots.length} 个根节点${collapsed.size ? ` · 已折叠 ${collapsed.size}` : ''}`;
 }
 
@@ -550,7 +571,9 @@ async function renderContainers() {
 // ── 视图：systemd 服务 ──────────────────────────────────────────────────
 async function renderServices() {
   const q = new URL(API + '/services', location.origin);
-  if (query) q.searchParams.set('q', query);
+  // 用服务页自己的筛选词：早期复用进程页的 query，
+  // 在进程页搜过 "nginx" 再切过来，服务列表会被无声过滤
+  if (svcQuery) q.searchParams.set('q', svcQuery);
   const st = $('svc-state').value;
   if (st) q.searchParams.set('state', st);
   const r = await fetch(q.toString(), { cache: 'no-store' });
@@ -798,7 +821,7 @@ async function loadAlertEvents() {
     }
     tb.appendChild(frag);
     $('alert-events-empty').hidden = (d.rows || []).length > 0;
-  } catch { /* 忽略 */ }
+  } catch (e) { console.warn('[alerts/events] 读取失败:', e.message); }
 }
 
 // 规则编辑弹窗
@@ -825,13 +848,11 @@ function openAlertModal(rule) {
   $('af-webhook').value = r.webhook || '';
   $('af-target').value = r.target || '';
   syncAlertForm();
-  $('alert-mask').hidden = false;
-  requestAnimationFrame(() => $('alert-mask').classList.add('show'));
+  showMask($('alert-mask'));
 }
 
 function closeAlertModal() {
-  $('alert-mask').classList.remove('show');
-  setTimeout(() => { $('alert-mask').hidden = true; }, 160);
+  closeMask($('alert-mask'));
 }
 
 function syncAlertForm() {
@@ -857,6 +878,9 @@ function alertFormBody() {
     notifyFn: $('af-notify-fn').checked,
     webhook: $('af-webhook').value.trim(),
     target: $('af-target').value.trim(),
+    // op 必须在提交里带上：后端缺省会退回 '>'，
+    // 于是一条「磁盘可用 < 10%」的规则被编辑保存后会反转成「> 10%」（从该报变成不报）
+    op: (alertRules.find((x) => x.id === editingAlertId) || {}).op || '>',
   };
 }
 
@@ -922,8 +946,7 @@ async function openLog(unit) {
   logUnit = unit || '';
   $('log-title').textContent = unit ? `日志 · ${unit}` : '系统日志';
   $('log-pre').textContent = '加载中…';
-  $('log-mask').hidden = false;
-  requestAnimationFrame(() => $('log-mask').classList.add('show'));
+  showMask($('log-mask'));
   await loadLog();
 }
 
@@ -932,18 +955,45 @@ async function openContainerLog(name) {
   logUnit = name || '';
   $('log-title').textContent = `容器日志 · ${name}`;
   $('log-pre').textContent = '加载中…';
-  $('log-mask').hidden = false;
-  requestAnimationFrame(() => $('log-mask').classList.add('show'));
+  showMask($('log-mask'));
   await loadLog();
 }
 
+// 延迟隐藏必须可取消：关闭后立刻重开时，旧定时器会把刚打开的层再藏起来
+// （表现为 class="show" 与 hidden 同时存在，面板直接消失）
+function hideLater(el, ms = 160) {
+  if (!el) return;
+  if (el.__hideTimer) clearTimeout(el.__hideTimer);
+  el.__hideTimer = setTimeout(() => { el.hidden = true; el.__hideTimer = null; }, ms);
+}
+function showMask(el) {
+  if (!el) return;
+  if (el.__hideTimer) { clearTimeout(el.__hideTimer); el.__hideTimer = null; }
+  el.hidden = false;
+  requestAnimationFrame(() => el.classList.add('show'));
+}
+function closeMask(el, ms = 160) {
+  if (!el) return;
+  el.classList.remove('show');
+  hideLater(el, ms);
+}
+
 function closeLog() {
-  $('log-mask').classList.remove('show');
-  setTimeout(() => { $('log-mask').hidden = true; }, 160);
+  closeMask($('log-mask'));
+}
+
+function closeSnapModal() {
+  closeMask($('snap-mask'));
 }
 
 async function loadLog() {
   const isDocker = logKind === 'docker';
+  // 级别/关键字筛选只有 journalctl 支持，docker logs 用不上 —— 显式禁用并给出说明
+  if ($('log-priority')) $('log-priority').disabled = isDocker;
+  if ($('log-grep')) {
+    $('log-grep').disabled = isDocker;
+    $('log-grep').placeholder = isDocker ? '容器日志不支持关键字过滤' : '关键字过滤（回车生效）';
+  }
   const q = new URL(API + (isDocker ? '/container/logs' : '/journal'), location.origin);
   if (isDocker) {
     if (logUnit) q.searchParams.set('name', logUnit);
@@ -1040,6 +1090,7 @@ function renderVolumes(list) {
 
 // ── 连接视图（监听 / 全部）────────────────────────────────────────────────
 let portMode = 'listen';
+let svcQuery = '';               // 服务页独立筛选词（不共用进程页搜索框）
 
 async function renderConnections() {
   const r = await fetch(API + '/connections', { cache: 'no-store' });
@@ -1100,8 +1151,7 @@ async function saveSnapshot() {
 }
 
 async function openSnapshotDiff() {
-  $('snap-mask').hidden = false;
-  requestAnimationFrame(() => $('snap-mask').classList.add('show'));
+  showMask($('snap-mask'));
   $('snap-result').innerHTML = '<p class="hint">加载中…</p>';
   try {
     const d = await (await fetch(API + '/snapshots', { cache: 'no-store' })).json();
@@ -1149,7 +1199,9 @@ async function runSnapshotDiff() {
       if (!rows.length) { wrap.appendChild(el('p', 'hint', '—')); box.appendChild(wrap); return; }
       const tb = el('div', 'chips');
       for (const x of rows.slice(0, 60)) {
-        const txt = muter ? `${x.name}(${x.pid}) ${x.delta > 0 ? '+' : ''}${fmtBytes(Math.abs(x.delta))}` : `${x.name}(${x.pid}) ${fmtBytes(x.rss)}`;
+        const txt = muter
+          ? `${x.name}(${x.pid}) ${x.delta > 0 ? '+' : '-'}${fmtBytes(Math.abs(x.delta))}`
+          : `${x.name}(${x.pid}) ${fmtBytes(x.rss)}`;
         tb.appendChild(el('span', 'chip dim', txt));
       }
       wrap.appendChild(tb);
@@ -1172,7 +1224,7 @@ async function loadWatchdogs() {
     const d = await (await fetch(API + '/watchdogs', { cache: 'no-store' })).json();
     watchdogs = d.watchdogs || [];
     renderWatchdogs();
-  } catch { /* 忽略 */ }
+  } catch (e) { console.warn('[watchdogs] 读取失败:', e.message); }
 }
 
 function renderWatchdogs() {
@@ -1214,13 +1266,11 @@ function openWatchdogModal(w) {
   $('wd-command').value = w ? w.command : '';
   $('wd-cooldown').value = w ? w.cooldownSec : 300;
   $('wd-enabled').checked = w ? w.enabled : false;
-  $('wd-mask').hidden = false;
-  requestAnimationFrame(() => $('wd-mask').classList.add('show'));
+  showMask($('wd-mask'));
 }
 
 function closeWatchdogModal() {
-  $('wd-mask').classList.remove('show');
-  setTimeout(() => { $('wd-mask').hidden = true; }, 160);
+  closeMask($('wd-mask'));
 }
 
 async function saveWatchdog() {
@@ -1282,7 +1332,10 @@ async function loadCron() {
     tb.appendChild(frag);
     if ($('cron-hint')) $('cron-hint').textContent = `${d.count || 0} 条`;
     if ($('cron-empty')) $('cron-empty').hidden = (d.jobs || []).length > 0;
-  } catch { /* 忽略 */ }
+  } catch (e) {
+    console.warn('[cron] 读取失败:', e.message);
+    if ($('cron-hint')) $('cron-hint').textContent = '读取失败';
+  }
 }
 
 async function loadBoot() {
@@ -1297,7 +1350,10 @@ async function loadBoot() {
       $('boot-pre').textContent = [d.raw || '', '', '耗时最长的服务（systemd-analyze blame）：']
         .concat(d.blame || []).join('\n').trim();
     }
-  } catch { /* 忽略 */ }
+  } catch (e) {
+    console.warn('[boot] 读取失败:', e.message);
+    if ($('boot-hint')) $('boot-hint').textContent = '读取失败';
+  }
 }
 
 // ── 一级 tab（功能分类）──────────────────────────────────────────────────
@@ -1310,8 +1366,8 @@ function setTab(name) {
   for (const t of TAB_NAMES) $('panel-' + t).hidden = (t !== name);
   // 切到概览要立刻画一次图，否则 canvas 尺寸为 0 时画出来是空的
   if (name === 'overview') requestAnimationFrame(() => loadHistoryView());
-  if (name === 'audit') loadAudit();
-  if (name === 'alerts') loadAlerts();
+  // 注意：audit / alerts 的加载由 refreshView() 统一分发，
+  // 这里再调一次会让「告警」页一次点击发 6 个请求、整表重建两遍
   if (name === 'services') { loadTimers(); loadCron(); loadBoot(); }
   if (name === 'ports') {
     // 端口/连接数据是后台定时刷新的，切过来时可能已经陈旧，强制补一次
@@ -1332,7 +1388,9 @@ function setView(v) {
   return refreshView();
 }
 
+let refreshSeq = 0;
 async function refreshView() {
+  const seq = ++refreshSeq;
   try {
     if (currentTab === 'ports') {
       if (portMode === 'all') { await renderConnections(); return; }
@@ -1415,6 +1473,9 @@ async function loadHistoryView() {
   }
   try {
     const r = await fetch(`${API}/history?minutes=${historyRange}`, { cache: 'no-store' });
+    // 不判 r.ok 时，5xx 会让 rows 为空 —— 图表画空、提示变「暂无历史数据」，
+    // 把「后端挂了」伪装成「没有数据」
+    if (!r.ok) throw new Error('历史数据请求失败: HTTP ' + r.status);
     const d = await r.json();
     const rows = (d.rows || []).map((x) => ({
       ts: x.ts, cpu: x.cpu, mem: x.mem, swap: x.swap,
@@ -1521,6 +1582,7 @@ async function openDetail(pid) {
   try {
     const r = await fetch(`${API}/process/${pid}`, { cache: 'no-store' });
     const d = await r.json();
+    if (currentDetailPid !== pid) return;      // 期间用户点了别的行：丢弃这份过期响应
     if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
     $('d-name').textContent = `${d.name} (${d.pid})`;
     $('d-meta').textContent = `${d.user} · ${STATE_CN[d.state] || d.state} · 启动于 ${fmtStart(d.startMs)}`;
@@ -1630,7 +1692,7 @@ async function openDetail(pid) {
 function closeDetail() {
   const mask = $('drawer-mask'), drawer = $('drawer');
   mask.classList.remove('show'); drawer.classList.remove('show');
-  setTimeout(() => { mask.hidden = true; drawer.hidden = true; }, 200);
+  hideLater(drawer, 200);
   currentDetailPid = null;
 }
 
@@ -1657,7 +1719,7 @@ function confirmModal(title, body, okText, fn, opts = {}) {
 }
 function closeModal() {
   $('modal-mask').classList.remove('show');
-  setTimeout(() => { $('modal-mask').hidden = true; }, 160);
+  hideLater($('modal-mask'));
   pendingAction = null;
   pendingTree = 0;
 }
@@ -2006,25 +2068,35 @@ function bindEvents() {
   $('btn-snap-diff').addEventListener('click', openSnapshotDiff);
   $('snap-close').addEventListener('click', () => {
     $('snap-mask').classList.remove('show');
-    setTimeout(() => { $('snap-mask').hidden = true; }, 160);
+    hideLater($('snap-mask'));
   });
   $('snap-mask').addEventListener('click', (e) => {
     if (e.target === $('snap-mask')) {
       $('snap-mask').classList.remove('show');
-      setTimeout(() => { $('snap-mask').hidden = true; }, 160);
+      hideLater($('snap-mask'));
     }
   });
   $('snap-run').addEventListener('click', runSnapshotDiff);
   $('snap-del').addEventListener('click', () => {
-    const id = $('snap-b').value || $('snap-a').value;
-    if (!id) { toast('先选一个快照', 'error'); return; }
-    confirmModal('删除快照', `确定删除快照 #${id}？`, '确定删除', async () => {
-      await fetch(API + '/snapshot/delete', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ id: Number(id), confirm: true }),
-      });
-      toast('已删除', 'ok');
-      openSnapshotDiff();
+    // 早期实现静默优先删「对比（较晚）」那个，且不看响应就报成功。
+    // 现在：两个下拉各自有明确的删除按钮语义 —— 删「对比快照」，并要求两个下拉都选好。
+    const id = $('snap-b').value;
+    if (!id) { toast('请先在右侧选择要删除的快照', 'error'); return; }
+    const label = $('snap-b').selectedOptions && $('snap-b').selectedOptions[0]
+      ? $('snap-b').selectedOptions[0].textContent : `#${id}`;
+    confirmModal('删除快照', `确定删除「${label}」？\n删除后无法恢复。`, '确定删除', async () => {
+      try {
+        const r = await fetch(API + '/snapshot/delete', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: Number(id), confirm: true }),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+        toast('快照已删除', 'ok');
+        await openSnapshotDiff();
+      } catch (err) {
+        toast('删除失败：' + err.message, 'error');
+      }
     });
   });
 
@@ -2044,7 +2116,14 @@ function bindEvents() {
   // ── 记录：时间范围 + 导出 ──
   if ($('audit-range')) $('audit-range').addEventListener('change', () => { auditState.page = 0; loadAudit(); });
   if ($('audit-export')) $('audit-export').addEventListener('click', () => {
-    location.href = `${API}/export?what=audit`;
+    // 导出必须与页面上的筛选一致，否则用户拿到的是全库数据却以为是筛选结果
+    const p = new URLSearchParams({ what: 'audit' });
+    if (auditState.action) p.set('action', auditState.action);
+    if (auditState.result) p.set('result', auditState.result);
+    if (auditState.q) p.set('q', auditState.q);
+    const rangeH = Number($('audit-range') ? $('audit-range').value : 0) || 0;
+    if (rangeH) p.set('since', String(Date.now() - rangeH * 3600 * 1000));
+    location.href = `${API}/export?${p.toString()}`;
   });
 
   // 一级 tab 切换
@@ -2132,11 +2211,6 @@ function bindEvents() {
     const b = e.target.closest('button[data-action="filter-container"]');
     if (b) applyContainerFilter(b.dataset.container);
   });
-  $('ptbody').addEventListener('click', (e) => {
-    const chip = e.target.closest('[data-action="filter-container"]');
-    if (chip) { e.stopPropagation(); applyContainerFilter(chip.dataset.container); }
-  });
-
   // 表头点击排序
   for (const th of document.querySelectorAll('th[data-sort]')) {
     th.addEventListener('click', () => {
@@ -2148,13 +2222,15 @@ function bindEvents() {
   }
 
   // 表格行点击：详情 / 信号按钮
+  // 一个委托监听处理三种点击，按优先级 return：
+  // 早期这件事被写成两个 addEventListener 挂在同一个 tbody 上，
+  // 而 stopPropagation 只阻止向祖先传播、拦不住同节点上的第二个监听器 ——
+  // 点容器 chip 会「先过滤整张表、又弹出详情抽屉」
   $('ptbody').addEventListener('click', (e) => {
+    const chip = e.target.closest('[data-action="filter-container"]');
+    if (chip) { applyContainerFilter(chip.dataset.container); return; }
     const btn = e.target.closest('button[data-action="signal"]');
-    if (btn) {
-      e.stopPropagation();
-      sendSignal(Number(btn.dataset.pid), 'SIGTERM');
-      return;
-    }
+    if (btn) { sendSignal(Number(btn.dataset.pid), 'SIGTERM'); return; }
     const tr = e.target.closest('tr[data-pid]');
     if (tr) openDetail(Number(tr.dataset.pid));
   });
@@ -2162,7 +2238,14 @@ function bindEvents() {
   // 详情抽屉里的信号按钮
   for (const b of $('drawer').querySelectorAll('[data-signal]')) {
     b.addEventListener('click', () => {
-      if (!currentDetailPid) return;
+      // 用按钮自带的 pid：连续点两行时 currentDetailPid 可能已经变成另一个进程，
+      // 而界面上显示的还是前一个 —— 会出现「看着 A、杀的是 B」
+      const pid = Number(b.dataset.pid) || currentDetailPid;
+      if (!pid) return;
+      if (Number(b.dataset.pid) && Number(b.dataset.pid) !== currentDetailPid) {
+        toast('该行已被切换，请重新打开要操作的进程', 'error');
+        return;
+      }
       sendSignal(currentDetailPid, b.dataset.signal);
     });
   }
@@ -2236,8 +2319,17 @@ function bindEvents() {
   });
 
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') { closeModal(); closeDetail(); closeSheets(); }
-    if (e.key === '/' && document.activeElement !== $('q')) { e.preventDefault(); $('q').focus(); }
+    if (e.key === 'Escape') {
+      // 新增的四个弹层也要能被 ESC 关掉（之前只绑了"点遮罩"）
+      closeModal(); closeDetail(); closeSheets();
+      closeAlertModal(); closeLog(); closeWatchdogModal(); closeSnapModal();
+    }
+    // 只在「没在输入」时接管 `/`：早期只排除了搜索框自身，
+    // 于是 webhook 地址、看门狗命令、记录搜索里打斜杠会被吞掉并把焦点抢走
+    const ae = document.activeElement;
+    const typing = !!ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA'
+      || ae.tagName === 'SELECT' || ae.isContentEditable);
+    if (e.key === '/' && !typing && currentTab === 'process') { e.preventDefault(); $('q').focus(); }
   });
 
   window.addEventListener('beforeunload', () => { if (es) es.close(); });

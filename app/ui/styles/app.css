@@ -6,6 +6,7 @@
 [hidden] { display: none !important; }
 
 :root {
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, "DejaVu Sans Mono", monospace;
   --radius: 14px;
   --radius-sm: 9px;
   --bg: #0b1120;
@@ -363,7 +364,7 @@ select {
 .btn.sig.danger-tree:hover { background: rgba(248, 113, 113, .18); }
 /* 环境变量：等宽、限高、可滚动，避免一个巨长的环境把抽屉撑爆 */
 .dblock pre.env-pre {
-  max-height: 190px; overflow: auto; font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  max-height: 190px; overflow: auto; font-family: var(--font-mono);
   font-size: 11.5px; line-height: 1.55; white-space: pre; overflow-wrap: normal;
 }
 /* 确认弹窗里的「同时结束整棵子树」 */
@@ -548,7 +549,7 @@ select {
 /* ── 告警页 ─────────────────────────────────────────────── */
 .row-dim { opacity: .55; }
 .chip.alarm { border-color: rgba(248, 113, 113, .55); color: var(--danger); background: rgba(248, 113, 113, .12); }
-.chip.warn { border-color: rgba(251, 191, 36, .5); color: var(--warning, #fbbf24); background: rgba(251, 191, 36, .1); }
+.chip.warn { border-color: rgba(251, 191, 36, .5); color: var(--warn, #fbbf24); background: rgba(251, 191, 36, .1); }
 .chip.dim { color: var(--text-dim); border-style: dashed; }
 .tab-badge[data-hot="1"] { background: rgba(248, 113, 113, .18); color: var(--danger); border-color: rgba(248, 113, 113, .5); }
 .modal.wide { width: min(620px, 100%); }
@@ -571,7 +572,7 @@ select {
 .log-pre {
   margin: 0; padding: 10px; max-height: min(58vh, 460px); overflow: auto;
   background: #05080f; color: #cbd5e1; border: 1px solid var(--line); border-radius: var(--radius-sm);
-  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-family: var(--font-mono);
   font-size: 11.5px; line-height: 1.55; white-space: pre;
 }
 /* ── 定时器折叠块 ───────────────────────────────────────── */
@@ -592,7 +593,7 @@ select {
 .psi-val { font-size: 13px; text-align: right; font-variant-numeric: tabular-nums; }
 .psi-bar { grid-column: 1 / -1; height: 6px; border-radius: 999px; background: var(--bg-2); overflow: hidden; }
 .psi-bar > i { display: block; height: 100%; border-radius: 999px; background: var(--accent); transition: width .4s; }
-.psi-item[data-level="warm"] .psi-bar > i { background: var(--warning, #fbbf24); }
+.psi-item[data-level="warm"] .psi-bar > i { background: var(--warn, #fbbf24); }
 .psi-item[data-level="hot"] .psi-bar > i { background: var(--danger); }
 .vol-list { display: grid; gap: 10px; }
 .vol-row { display: grid; gap: 4px; }
@@ -600,7 +601,7 @@ select {
 .vol-name { font-size: 12.5px; }
 .vol-bar { height: 6px; border-radius: 999px; background: var(--bg-2); overflow: hidden; }
 .vol-bar > i { display: block; height: 100%; border-radius: 999px; background: var(--accent); }
-.vol-row[data-level="warm"] .vol-bar > i { background: var(--warning, #fbbf24); }
+.vol-row[data-level="warm"] .vol-bar > i { background: var(--warn, #fbbf24); }
 .vol-row[data-level="hot"] .vol-bar > i { background: var(--danger); }
 .vol-sub { font-size: 11px; }
 /* ── 快照对比 ───────────────────────────────────────────── */
@@ -633,3 +634,5 @@ select {
   padding: 4px 7px; border: 1px solid var(--line); border-radius: var(--radius-sm);
   background: var(--bg-2); color: var(--text); font-size: 12px; width: 92px;
 }
+/* 卷百分比：与其它数字统一等宽右对齐 */
+.vol-pct { font-size: 12.5px; font-variant-numeric: tabular-nums; color: var(--text-dim); }

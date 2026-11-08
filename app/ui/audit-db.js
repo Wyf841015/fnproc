@@ -107,7 +107,7 @@ export function openAuditStore(dbPath, { version = '' } = {}) {
       result: String(input.result || 'ok').slice(0, 16),
       message: String(input.message ?? '').slice(0, 512),
       client: String(input.client ?? '').slice(0, 128),
-      detail: JSON.stringify(detail).slice(0, 4096),
+      detail: safeDetail(detail),
       version: String(input.version ?? version).slice(0, 32),
     };
   }
@@ -142,6 +142,16 @@ export function openAuditStore(dbPath, { version = '' } = {}) {
     }
   }
 
+  // detail 截断必须保证仍是合法 JSON：直接 slice 字符串会切在 token 中间，
+  // 读侧 JSON.parse 失败后静默变 {}，管理员看到空白 detail 却不知道被截断过
+  function safeDetail(detail) {
+    if (detail == null) return null;
+    let s;
+    try { s = JSON.stringify(detail); } catch { return JSON.stringify({ _error: '无法序列化' }); }
+    if (s.length <= 4096) return s;
+    return JSON.stringify({ _truncated: true, preview: s.slice(0, 3800) });
+  }
+
   function list({ limit = 50, offset = 0, q = '', action = '', result = '', since = 0 } = {}) {
     if (!db) {
       const rows = pending.slice().reverse().map((r, i) => toLegacy({ ...r, id: pending.length - i }));
@@ -158,7 +168,7 @@ export function openAuditStore(dbPath, { version = '' } = {}) {
       args.push(like, like, like, like);
     }
     const clause = where.length ? 'WHERE ' + where.join(' AND ') : '';
-    const lim = Math.min(500, Math.max(1, Number(limit) || 50));
+    const lim = Math.min(5000, Math.max(1, Number(limit) || 50));
     const off = Math.max(0, Number(offset) || 0);
     try {
       const total = db.prepare(`SELECT COUNT(*) AS c FROM audit ${clause}`).get(...args).c;

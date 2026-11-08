@@ -105,8 +105,11 @@ export function openSnapshotStore(dbPath, { retentionDays = 30, version = '' } =
 
     // 两个快照对比：新增 / 消失 / 内存变化最大的
     diff(idA, idB) {
-      const a = new Map(this.items(idA).map((x) => [x.pid, x]));
-      const b = new Map(this.items(idB).map((x) => [x.pid, x]));
+      // 键用 pid+name：只按 pid 比对时，跨天复用同一个 pid 的两个不同进程
+      // 会被算成「同一进程内存涨了 X GB」
+      const key = (x) => `${x.pid}|${String(x.name || '').slice(0, 60)}`;
+      const a = new Map(this.items(idA).map((x) => [key(x), x]));
+      const b = new Map(this.items(idB).map((x) => [key(x), x]));
       const added = [];
       const removed = [];
       const changed = [];

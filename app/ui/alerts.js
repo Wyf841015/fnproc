@@ -14,6 +14,7 @@
 import { readFileSync, statfsSync } from 'node:fs';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { lookup } from 'node:dns/promises';
 
 const execFileP = promisify(execFile);
 
@@ -23,6 +24,56 @@ function sqlLit(s) {
     .replace(/\0/g, '')
     .replace(/[\u0001-\u0008\u000b\u000c\u000e-\u001f]/g, '')
     .replace(/'/g, "''") + "'";
+}
+
+// ── Webhook 地址校验（SSRF 防护）────────────────────────────────────────
+// 告警 webhook 是本进程（root）主动发起的 POST，如果不校验目标，
+// 它就是一台可打内网/回环/云元数据的内网 HTTP 客户端。
+// 判据：解析出真实 IP 后逐个判断，字面 IP 与域名一视同仁。
+export function isPrivateAddress(ip) {
+  const a = String(ip || '').trim().toLowerCase().replace(/^\[|\]$/g, '');
+  if (!a) return true;
+  const v4 = a.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
+  if (v4) {
+    const [o1, o2] = [Number(v4[1]), Number(v4[2])];
+    if (o1 === 10) return true;
+    if (o1 === 127) return true;
+    if (o1 === 0) return true;
+    if (o1 === 169 && o2 === 254) return true;              // 链路本地 / 云元数据
+    if (o1 === 172 && o2 >= 16 && o2 <= 31) return true;
+    if (o1 === 192 && o2 === 168) return true;
+    if (o1 === 100 && o2 >= 64 && o2 <= 127) return true;    // CGNAT
+    if (o1 >= 224) return true;                              // 组播/保留
+    return false;
+  }
+  if (a === '::1' || a === '::') return true;
+  if (a.startsWith('fe80')) return true;                     // IPv6 链路本地
+  if (/^f[cd][0-9a-f]{2}/.test(a)) return true;              // IPv6 ULA fc00::/7
+  const mapped = a.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+  if (mapped) return isPrivateAddress(mapped[1]);
+  return false;
+}
+
+export async function webhookBlockReason(rawUrl) {
+  let u;
+  try { u = new URL(String(rawUrl || '').trim()); } catch { return 'Webhook 地址不合法'; }
+  if (!/^https?:$/.test(u.protocol)) return 'Webhook 必须是 http(s) 地址';
+  const host = u.hostname.replace(/^\[|\]$/g, '');
+  if (!host) return 'Webhook 缺少主机名';
+  if (/^(localhost|.*\.local|.*\.internal|.*\.lan)$/i.test(host)) return 'Webhook 不允许指向本机或内网域名';
+  const addrs = [];
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(host) || host.includes(':')) addrs.push(host);
+  else {
+    try {
+      const list = await lookup(host, { all: true });
+      for (const x of list) addrs.push(x.address);
+    } catch { return 'Webhook 域名解析失败'; }
+  }
+  if (!addrs.length) return 'Webhook 域名未解析到地址';
+  for (const a of addrs) {
+    if (isPrivateAddress(a)) return `Webhook 指向内网地址 ${a}，已拒绝`;
+  }
+  return '';
 }
 
 export function readPsiMem() {
@@ -61,6 +112,7 @@ export function createAlertEngine({ store, version = '', log = console.log, getU
   let lastEvalAt = 0;
   let ctx = { cpu: 0, mem: 0, swap: 0, procs: [], procTotal: 0 };
   let delivering = false;
+  let lastRuleSig = '';            // 规则判据签名：变化时重置计时状态
 
   // 供 /api/overview 等地方取「当前有没有告警在持续」
   function snapshot() {
@@ -85,12 +137,7 @@ export function createAlertEngine({ store, version = '', log = console.log, getU
       case 'swap': return ctx.swap;
       case 'disk': return diskUsedPct(rule.target);
       case 'psi_mem': return readPsiMem();
-      case 'oom': {
-        const now = readOomKillCount();
-        const delta = Math.max(0, now - prevOom);
-        prevOom = now;
-        return delta;
-      }
+      case 'oom': return roundOomDelta;      // 每轮判定只采样一次（见 beginRound）
       case 'proc_missing': {
         const t = String(rule.target || '').trim();
         if (!t) return null;
@@ -112,6 +159,15 @@ export function createAlertEngine({ store, version = '', log = console.log, getU
       }
       default: return null;
     }
+  }
+
+  // 每轮判定开始时采一次 OOM 计数，否则同时启用两条 OOM 规则时，
+  // 第一条把 prevOom 推进了，第二条永远读到 delta=0、永不触发
+  let roundOomDelta = 0;
+  function beginRound() {
+    const now = readOomKillCount();
+    roundOomDelta = Math.max(0, now - prevOom);
+    prevOom = now;
   }
 
   function breached(rule, v) {
@@ -156,7 +212,7 @@ WITH n AS (
 INSERT INTO notify_user (uid, notify_id, read)
 SELECT uid, id, 0 FROM users, n;`.trim();
     try {
-      await execFileP('psql', ['-U', 'postgres', '-d', 'trim', '-v', 'ON_ERROR_STOP=1', '-c', sql],
+      await execFileP('psql', ['-X', '-q', '-U', 'postgres', '-d', 'trim', '-v', 'ON_ERROR_STOP=1', '-c', sql],
         { timeout: 8000, encoding: 'utf8', maxBuffer: 1024 * 1024 });
       return { ok: true };
     } catch (e) {
@@ -167,7 +223,8 @@ SELECT uid, id, 0 FROM users, n;`.trim();
 
   async function deliverWebhook(rule, message) {
     const url = String(rule.webhook || '').trim();
-    if (!/^https?:\/\//i.test(url)) return { ok: false, error: 'Webhook 必须是 http(s) 地址' };
+    const blocked = await webhookBlockReason(url);
+    if (blocked) return { ok: false, error: blocked };
     const ac = new AbortController();
     const to = setTimeout(() => ac.abort(), 6000);
     try {
@@ -182,6 +239,7 @@ SELECT uid, id, 0 FROM users, n;`.trim();
           ts: Date.now(),
           version,
         }),
+        redirect: 'manual',          // 不跟随重定向，避免 302 绕过 SSRF 校验
         signal: ac.signal,
       });
       return res.ok ? { ok: true, status: res.status } : { ok: false, error: `HTTP ${res.status}` };
@@ -250,6 +308,7 @@ SELECT uid, id, 0 FROM users, n;`.trim();
     if (!store.enabled || delivering) return;
     delivering = true;
     lastEvalAt = Date.now();
+    beginRound();
     try {
       // 看门狗先跑（它只看进程在不在，很便宜；有命令才会真的执行）
       try { await runWatchdogs(); } catch (e) { log('[watchdog] 异常: ' + (e.message || e)); }
@@ -259,6 +318,16 @@ SELECT uid, id, 0 FROM users, n;`.trim();
       const needUnits = rules.some((r) => r.metric === 'unit_failed');
       if (needUnits && typeof getUnits === 'function') {
         try { ctx.units = await getUnits(); } catch { /* 用上次的 */ }
+      }
+
+      // 规则被删掉后清理它的计时状态，避免 Map 只增不减
+      const aliveIds = new Set(rules.map((r) => r.id));
+      for (const id of [...breachSince.keys()]) if (!aliveIds.has(id)) breachSince.delete(id);
+      const liveSig = rules.map((r) => `${r.id}:${r.metric}:${r.op}:${r.threshold}:${r.durationSec}`).join('|');
+      if (liveSig !== lastRuleSig) {
+        // 阈值/判据改了就重置计时：否则沿用旧起点会在下一次判定立刻触发
+        lastRuleSig = liveSig;
+        breachSince.clear();
       }
 
       for (const rule of rules) {

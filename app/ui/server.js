@@ -20,7 +20,7 @@ import { gzipSync } from 'node:zlib';
 import { openAuditStore } from './audit-db.js';
 import { openHistoryStore } from './history-db.js';
 import { openAlertStore, METRICS, LEVEL_LABEL } from './alert-db.js';
-import { createAlertEngine, readPsiMem, diskUsedPct } from './alerts.js';
+import { createAlertEngine, readPsiMem, diskUsedPct, webhookBlockReason } from './alerts.js';
 import { openSnapshotStore } from './snapshot-db.js';
 
 const UI_DIR = dirname(fileURLToPath(import.meta.url));
@@ -32,7 +32,7 @@ const PORT = parseInt(process.env.PORT || '47951', 10);
 const SOCK_DIR = process.env.FNPROC_SOCK_DIR || TARGET_DIR;
 const SOCK_PATH = join(SOCK_DIR, 'fnproc.sock');
 const GATEWAY_PREFIX = '/app/fnproc';
-const VERSION = '0.3.0';
+const VERSION = '0.3.1';
 const SAMPLE_MS = 1000;
 const HISTORY_MAX = 120;              // 内存里保留 120 个采样点，够前端画满图
 
@@ -66,21 +66,33 @@ function sendJSON(res, code, obj) {
   res.end(out);
 }
 
+// 请求体解析。约定：解析失败不抛异常，而是返回 { __error } 让调用方回 400，
+// 这样「JSON 写错」和「字段缺失」不会混在一起，排查时能看出区别。
 function parseBody(req, limit = 64 * 1024) {
   return new Promise((resolve) => {
     let size = 0;
+    let tooBig = false;
     const chunks = [];
     req.on('data', (c) => {
+      if (tooBig) return;                 // 超限后继续丢弃，但不再累积
       size += c.length;
-      if (size > limit) { req.destroy(); resolve({}); return; }
+      if (size > limit) {
+        tooBig = true;
+        chunks.length = 0;
+        resolve({ __error: '请求体过大', __status: 413 });
+        return;
+      }
       chunks.push(c);
     });
     req.on('end', () => {
+      if (tooBig) return;
       const raw = Buffer.concat(chunks).toString('utf8').trim();
       if (!raw) return resolve({});
-      try { resolve(JSON.parse(raw)); } catch { resolve({}); }
+      try { resolve(JSON.parse(raw)); } catch (e) {
+        resolve({ __error: '请求体不是合法 JSON: ' + String(e.message || e).slice(0, 80), __status: 400 });
+      }
     });
-    req.on('error', () => resolve({}));
+    req.on('error', () => resolve({ __error: '读取请求体失败', __status: 400 }));
   });
 }
 
@@ -106,21 +118,55 @@ const MIME = {
   '.ico': 'image/x-icon',
 };
 
+// 只有前端资源对外提供。UI_DIR 里同时放着 server.js / alert-db.js / config 等后端文件，
+// 早期版本按「路径不越界」直接整目录放行，等于把整套后端源码和网关配置挂到公网可下载。
+const STATIC_ALLOW = [
+  /^index\.html$/,
+  /^main\.js$/,
+  /^styles\/[A-Za-z0-9._-]+\.css$/,
+  /^images\/[A-Za-z0-9._-]+\.(png|jpe?g|svg|webp|gif|ico)$/,
+  /^favicon\.ico$/,
+];
+
+// Accept-Encoding 里 gzip;q=0 表示「明确不要 gzip」，不能只看是否出现 gzip 字样
+function wantsGzip(ae) {
+  const m = String(ae || '').match(/(?:^|,)\s*gzip\s*(?:;\s*q=([0-9.]+))?/i);
+  if (!m) return false;
+  if (m[1] != null && Number(m[1]) <= 0) return false;
+  return true;
+}
+
 function serveStatic(req, res, pathname) {
   const rel = pathname === '/' || pathname === '' ? 'index.html' : pathname.replace(/^\/+/, '');
-  if (rel.includes('..')) { sendJSON(res, 403, { error: '路径越界' }); return; }
+  if (rel.includes('..') || rel.startsWith('.') || rel.includes('\\')) {
+    sendJSON(res, 403, { error: '路径越界' });
+    return;
+  }
+  if (!STATIC_ALLOW.some((re) => re.test(rel))) {
+    // 白名单外：存在的文件回 403（不提供下载），不存在的回 404
+    if (existsSync(join(UI_DIR, rel))) { sendJSON(res, 403, { error: '该资源不对外提供' }); return; }
+    sendJSON(res, 404, { error: 'not found' });
+    return;
+  }
   const fp = join(UI_DIR, rel);
   let st;
-  try { st = statSync(fp); } catch { sendJSON(res, 404, { error: 'not found: ' + rel }); return; }
-  if (!st.isFile()) { sendJSON(res, 404, { error: 'not found: ' + rel }); return; }
+  try { st = statSync(fp); } catch { sendJSON(res, 404, { error: 'not found' }); return; }
+  if (!st.isFile()) { sendJSON(res, 404, { error: 'not found' }); return; }
   const type = MIME[extname(fp).toLowerCase()] || 'application/octet-stream';
   // ETag 用 size+mtime：部署新版本必然变，文件没变则命中 304 不用重下。
   // 保留 no-cache（每次都回源校验）—— fnOS WebView 缓存旧 main.js 的坑还在，
   // 不能用强缓存；304 只是把「未改动的整包传输」省掉。
-  const etag = '"' + st.size.toString(16) + '-' + Math.floor(st.mtimeMs).toString(16) + '"';
+  const compressible = st.size > 2048 && /^(text|application\/javascript|application\/json|image\/svg)/.test(type);
+  const useGzip = compressible && wantsGzip(req.headers['accept-encoding']);
+  // ETag 必须区分编码：同一 ETag 对应两种字节流时，中间的缓存可能把 gzip 内容喂给不支持的客户端
+  const etag = '"' + st.size.toString(16) + '-' + Math.floor(st.mtimeMs).toString(16) + (useGzip ? '-gz' : '') + '"';
   const headers = {
     'Content-Type': type, 'Cache-Control': 'no-cache',
     ETag: etag, 'X-Content-Type-Options': 'nosniff',
+    Vary: 'Accept-Encoding',
+    'Referrer-Policy': 'no-referrer',
+    // 允许 fnOS 自己的外壳 iframe 与 fnOS 云域名，其它站点不允许嵌入（防点击劫持）
+    "Content-Security-Policy": "frame-ancestors 'self' https://*.fnos.net;",
   };
   if (String(req.headers['if-none-match'] || '') === etag) {
     res.writeHead(304, headers);
@@ -129,8 +175,7 @@ function serveStatic(req, res, pathname) {
   }
   let data;
   try { data = readFileSync(fp); } catch { sendJSON(res, 500, { error: 'read failed' }); return; }
-  const ae = String(req.headers['accept-encoding'] || '');
-  if (/gzip/.test(ae) && data.length > 2048 && /^(text|application\/javascript|application\/json|image\/svg)/.test(type)) {
+  if (useGzip) {
     data = gzipSync(data);
     headers['Content-Encoding'] = 'gzip';
   }
@@ -209,16 +254,23 @@ function refreshInodePorts() {
 // 现在优先用一次 `ss -tunapH`（内核已经算好了），解析失败才退回旧路径。
 let portsInflight = false;
 let lastPortsAt = 0;
+let portsSsOk = false;            // 本轮是否用 ss 采集成功（失败时连接视图为空，前端要能区分）
+let allConnsDegraded = false;
 
 async function refreshPorts() {
   if (portsInflight) return;
   portsInflight = true;
   try {
     const ok = await portsViaSs();
+    portsSsOk = ok;
     if (!ok) { refreshInodePorts(); refreshPidPorts(); }
   } catch {
     try { refreshInodePorts(); refreshPidPorts(); } catch { /* 忽略 */ }
   } finally {
+    // 走回退路径（没装 ss / 无权限）时也要记时间戳，
+    // 否则每个 /api/ports 请求都会触发一次全量 fd 扫描（数百进程同步 readdir/readlink）
+    lastPortsAt = Date.now();
+    allConnsDegraded = !portsSsOk;
     portsInflight = false;
   }
 }
@@ -329,6 +381,7 @@ function refreshPidPorts() {
 const cgroupCache = new Map();          // pid → {v, ts}
 let dockerNames = new Map();            // 短ID(12) → 容器名
 let containerStats = { at: 0, map: new Map(), error: '' };   // docker stats 缓存
+let statsWait = null;                    // docker stats 在途 promise（并发请求共用，避免扇出多个子进程）
 let dockerAt = 0;
 
 let dockerInflight = false;
@@ -623,22 +676,30 @@ function readParentChain(pid, depth = 8) {
 
 // 环境变量：名字含 KEY/TOKEN/SECRET/PASS/AUTH/COOKIE 的值一律打码 ——
 // 详情页是给人看的，不该把凭据原样铺在屏幕上（也避免被截图带走）。
-const SECRET_KEY_RE = /(KEY|TOKEN|SECRET|PASS|PWD|AUTH|COOKIE|CREDENTIAL|SESSION)/i;
-function readEnvPairs(pid, limit = 40) {
+// 密钥识别：键名关键词 + 值形状双判据。
+// 只靠关键词会漏 DATABASE_URL / *_DSN / *_URI / BEARER / LICENSE 这类，
+// 而这些恰恰是最常放连接串与授权码的地方。
+const SECRET_KEY_RE = /(KEY|TOKEN|SECRET|PASS|PWD|AUTH|COOKIE|CREDENTIAL|SESSION|LICENSE|SIGN|SALT|DSN|DATABASE|REDIS|MONGO|MYSQL|PGHOST|PGUSER|API|BEARER|PRIVATE|CERT)/i;
+// 值形状：xx://user:pass@host 或 query 里带 token/password
+const SECRET_VALUE_RE = /\/\/[^/\s:@]+:[^/\s@]+@|(?:^|[?&])(?:token|password|passwd|secret|api_?key|access_?key|sig)=/i;
+
+function readEnvPairs(pid, limit = 0) {
   const raw = readOr(`/proc/${pid}/environ`);
   if (!raw) return { count: 0, list: [], masked: 0 };
   const all = raw.split('\0').filter(Boolean);
   let masked = 0;
   const list = [];
-  for (const kv of all.slice(0, limit)) {
+  // limit<=0 表示不截断：早期只处理前 40 条，排在后面的敏感项既不显示也不计数
+  const slice = limit > 0 ? all.slice(0, limit) : all;
+  for (const kv of slice) {
     const eq = kv.indexOf('=');
     const k = eq > 0 ? kv.slice(0, eq) : kv;
     let v = eq > 0 ? kv.slice(eq + 1) : '';
-    if (SECRET_KEY_RE.test(k) && v) { v = '***'; masked += 1; }
+    if (v && (SECRET_KEY_RE.test(k) || SECRET_VALUE_RE.test(v))) { v = '***'; masked += 1; }
     else if (v.length > 140) v = v.slice(0, 140) + '…';
     list.push({ k, v });
   }
-  return { count: all.length, list, masked };
+  return { count: all.length, list, masked, truncated: limit > 0 && all.length > limit };
 }
 
 function readFdLimit(pid) {
@@ -916,7 +977,12 @@ function broadcast() {
   if (!clients.size) return;
   const payload = `data: ${JSON.stringify(sseSnapshot())}\n\n`;
   for (const res of clients) {
-    try { res.write(payload); } catch { clients.delete(res); }
+    // 对已断开的 ServerResponse 调 write() 不会抛异常（实测 Node 24），
+    // 所以只能主动查状态，否则死连接会一直留在集合里被反复写入
+    if (res.writableEnded || res.destroyed) { clients.delete(res); continue; }
+    try {
+      if (!res.write(payload)) { /* 背压：本帧写满缓冲，丢弃后续由下次推送补上 */ }
+    } catch { clients.delete(res); }
   }
 }
 
@@ -972,6 +1038,7 @@ if (auditStore.enabled) {
 // 首次启动会把已有 jsonl 一次性迁进来（迁完不再读它）。
 const HISTORY_DB = join(DATA_DIR, 'history.db');
 const HISTORY_RETENTION_DAYS = 7;
+const ALERT_EVENT_RETENTION_DAYS = 180;      // 告警事件保留半年，避免无限增长
 const historyStore = openHistoryStore(HISTORY_DB, {
   retentionDays: HISTORY_RETENTION_DAYS,
   migrateFrom: HISTORY_FILE,
@@ -986,10 +1053,14 @@ if (historyStore.enabled) {
 setInterval(() => {
   const removed = historyStore.prune(HISTORY_RETENTION_DAYS);
   if (removed > 0) console.log(`[history] 清理过期采样 ${removed} 行`);
+  const evRemoved = alertStore.pruneEvents(ALERT_EVENT_RETENTION_DAYS);
+  if (evRemoved > 0) console.log(`[alert] 清理过期告警事件 ${evRemoved} 行`);
 }, 3600 * 1000);
 
 // ── 进程快照 ────────────────────────────────────────────────────────────
 // 存的是「某一刻的进程清单」，用来跨天对比：谁新起了、谁没了、谁内存涨了。
+let lastSnapshotAt = 0;            // 快照写入节流
+let lastAlertTestAt = 0;           // 测试通知节流
 const snapshotStore = openSnapshotStore(join(DATA_DIR, 'snapshots.db'), { version: VERSION });
 if (snapshotStore.enabled) {
   console.log(`[snapshot] 快照库已启用: ${snapshotStore.path} 现有 ${snapshotStore.health().snapshots} 个快照`);
@@ -1010,6 +1081,8 @@ const alertEngine = createAlertEngine({
 if (alertStore.enabled) {
   const st = alertStore.stats();
   console.log(`[alert] 告警库已启用: ${ALERT_DB} 规则=${st.rules}（启用 ${st.enabled}）事件=${st.events}`);
+  const prunedEvents = alertStore.pruneEvents(ALERT_EVENT_RETENTION_DAYS);
+  if (prunedEvents > 0) console.log(`[alert] 启动清理过期事件 ${prunedEvents} 行`);
   // 首次运行给几条有意义的默认规则（阈值偏保守、持续时间长，避免抖动误报）。
   // 不想要可以在「告警」页删掉或关掉。
   if (st.rules === 0) {
@@ -1119,14 +1192,36 @@ const SIGNALS = new Set(['SIGTERM', 'SIGKILL', 'SIGSTOP', 'SIGCONT', 'SIGHUP', '
 // systemctl 调用有开销（几十到几百毫秒），所以结果缓存 5 秒；名字进 URL/JSON
 // 都要先过白名单，防止把 "ssh.service; rm -rf /" 这种塞进 execFile 的参数。
 let unitsCache = { at: 0, list: [] };
-const UNIT_RE = /^[A-Za-z0-9@._:\\-]+\.service$/;
+// 首字符不允许 - ：否则 "-x.service" 会被 systemctl 当成命令行选项解析
+const UNIT_RE = /^[A-Za-z0-9@._:][A-Za-z0-9@._:\\-]*\.service$/;
 
 // 停掉这些会让机器失联或直接瘫痪，禁止 stop/restart（start 允许，用于救回来）
+// 关键服务：禁止 stop / restart / 禁用自启。
+// 早期只有 10 条通用黑名单，fnOS 自己的登录、存储、docker、备份等服务全不在里面 ——
+// 一次误操作就能让整台 NAS 停服，而 disable 之后重启也不会恢复。
 const PROTECTED_UNITS = new Set([
+  // 通用
   'ssh.service', 'sshd.service', 'dbus.service', 'systemd-logind.service',
   'systemd-journald.service', 'systemd-udevd.service', 'systemd-networkd.service',
   'networking.service', 'NetworkManager.service', 'cron.service',
+  'systemd-resolved.service', 'systemd-timesyncd.service', 'polkit.service',
+  // fnOS 平台（登录 / 存储 / 应用管理 / docker / 备份）
+  'accountsrv.service', 'dockermgr.service', 'docker.service', 'containerd.service',
+  'filestor_service.service', 'backup_service.service', 'trim_nginx.service',
+  'trim_update.service', 'trim_ws.service', 'trim_connect.service',
+  'eventlogger.service', 'downloader.service', 'postgresql.service',
+  // 显示相关（NAS 面板依赖）
+  'trim_display.service', 'power_manager.service',
 ]);
+
+// 前缀规则：命中即视为关键服务（覆盖各版本命名差异，避免每加一个服务就要改名单）
+const PROTECTED_PREFIXES = ['trim_', 'trim-', 'account', 'dockermgr', 'docker', 'containerd',
+  'filestor', 'backup_', 'eventlog', 'systemd-', 'ssh', 'dbus'];
+
+function isProtectedUnit(name) {
+  if (PROTECTED_UNITS.has(name)) return true;
+  return PROTECTED_PREFIXES.some((p) => name.startsWith(p));
+}
 
 // 并发调用共享同一个在途 promise。
 // 早期写法是「在途时直接返回缓存」，但首次加载时缓存还是空的 ——
@@ -1152,7 +1247,7 @@ async function listUnits(force = false) {
         const [name, load, active, sub] = f;
         if (!name.endsWith('.service')) continue;
         const desc = t.slice(t.indexOf(sub, name.length + load.length + active.length) + sub.length).trim();
-        list.push({ name, load, active, sub, desc, protected: PROTECTED_UNITS.has(name), enabledState: '' });
+        list.push({ name, load, active, sub, desc, protected: isProtectedUnit(name), enabledState: '' });
       }
       // 开机自启状态（enabled / disabled / static …）：列表里没有，得单独问一次
       try {
@@ -1183,11 +1278,11 @@ async function runServiceAction(name, action) {
   // kind 用来区分审计里的分类：rejected = 被规则拦住（没真的执行），error = 执行了但失败
   if (!UNIT_RE.test(name)) return { ok: false, kind: 'rejected', error: '服务名不合法' };
   if (!SERVICE_ACTIONS.has(action)) return { ok: false, kind: 'rejected', error: '不支持的操作：' + action };
-  if (PROTECTED_UNITS.has(name) && action !== 'start') {
+  if (isProtectedUnit(name) && action !== 'start') {
     return { ok: false, kind: 'rejected', error: `${name} 属于关键服务，禁止 ${action}（会导致失联或系统不可用）` };
   }
   try {
-    await execFileP('systemctl', [action, name], { timeout: 20000, encoding: 'utf8' });
+    await execFileP('systemctl', ['--', action, name], { timeout: 20000, encoding: 'utf8', maxBuffer: 2 * 1024 * 1024 });
     unitsCache.at = 0;   // 让下一次查询重新拉取
     return { ok: true };
   } catch (e) {
@@ -1198,7 +1293,7 @@ async function runServiceAction(name, action) {
 
 
 // ── 路由 ────────────────────────────────────────────────────────────────
-const SORTS = {
+const SORTS = Object.assign(Object.create(null), {
   cpu: (a, b) => b.cpuPct - a.cpuPct,
   mem: (a, b) => b.rss - a.rss,
   pid: (a, b) => a.pid - b.pid,
@@ -1206,7 +1301,10 @@ const SORTS = {
   time: (a, b) => b.cpuTime - a.cpuTime,
   threads: (a, b) => b.threads - a.threads,
   start: (a, b) => b.startMs - a.startMs,
-};
+});
+
+// 用 hasOwn 判存在：直接 SORTS[k] 会命中原型链（?sort=__proto__ 把 Object.prototype 当比较器 → 500）
+const SORT_KEYS = new Set(['cpu', 'mem', 'pid', 'name', 'time', 'threads', 'start']);
 
 async function handle(req, res, pathname, query) {
   res.__req = req;                        // sendJSON 需要看 Accept-Encoding 决定是否 gzip
@@ -1223,6 +1321,10 @@ async function handle(req, res, pathname, query) {
     res.write('retry: 3000\n');
     res.write(': connected\n\n');
     res.write(`data: ${JSON.stringify(sseSnapshot())}\n\n`);
+    if (clients.size >= 64) {            // 单机管理界面，64 个并发流已经远超正常用量
+      sendJSON(res, 429, { error: '实时连接过多，请稍后再试' });
+      return;
+    }
     clients.add(res);
     const keep = setInterval(() => { try { res.write(': ping\n\n'); } catch { /* 忽略 */ } }, 25000);
     req.on('close', () => { clearInterval(keep); clients.delete(res); });
@@ -1230,6 +1332,7 @@ async function handle(req, res, pathname, query) {
   }
 
   if (pathname === '/api/overview') {
+    ensureFreshProcs();                   // 与 /api/processes 一致：最多陈旧 1.2 秒
     sendJSON(res, 200, {
       ...snapshot(10),
         core: state.cpu.cores,
@@ -1244,7 +1347,7 @@ async function handle(req, res, pathname, query) {
   if (pathname === '/api/processes') {
     ensureFreshProcs();                   // 空闲期按 5 秒扫，这里按需补一次到 1.2 秒内
     const q = String(query.get('q') || '').toLowerCase().trim();
-    const sortKey = SORTS[query.get('sort')] ? query.get('sort') : 'cpu';
+    const sortKey = SORT_KEYS.has(String(query.get('sort') || '')) ? String(query.get('sort')) : 'cpu';
     const limit = Math.min(2000, Math.max(1, num(query.get('limit')) || 500));
     const cFilter = String(query.get('container') || '').trim();
     let rows = procs;
@@ -1379,7 +1482,8 @@ async function handle(req, res, pathname, query) {
   }
 
   if (pathname === '/api/kill' && req.method === 'POST') {
-    const body = await parseBody(req);
+    const body = await readBody(req, res);
+    if (!body) return;
     const pid = num(body.pid);
     const sig = String(body.signal || 'SIGTERM').toUpperCase();
     const client = clientOf(req);
@@ -1484,7 +1588,8 @@ async function handle(req, res, pathname, query) {
   }
 
   if (pathname === '/api/service' && req.method === 'POST') {
-    const body = await parseBody(req);
+    const body = await readBody(req, res);
+    if (!body) return;
     const name = String(body.name || '').trim();
     const action = String(body.action || '').trim();
     const client = clientOf(req);
@@ -1520,7 +1625,16 @@ async function handle(req, res, pathname, query) {
   }
 
   if (pathname === '/api/alerts' && req.method === 'POST') {
-    const body = await parseBody(req);
+    const body = await readBody(req, res);
+    if (!body) return;
+    if (body.webhook) {
+      const blocked = await webhookBlockReason(body.webhook);
+      if (blocked) {
+        auditRecord({ action: 'alert.save', target: String(body.id || 0), result: 'rejected', message: blocked, client: clientOf(req) });
+        sendJSON(res, 400, { error: blocked });
+        return;
+      }
+    }
     const r = alertStore.saveRule(body);
     if (!r.ok) { sendJSON(res, 400, { error: r.error }); return; }
     auditRecord({ action: 'alert.save', target: String(r.id), result: 'ok', message: `${body.id ? '更新' : '新建'}规则 ${body.name || ''}`, client: clientOf(req) });
@@ -1529,7 +1643,8 @@ async function handle(req, res, pathname, query) {
   }
 
   if (pathname === '/api/alerts/delete' && req.method === 'POST') {
-    const body = await parseBody(req);
+    const body = await readBody(req, res);
+    if (!body) return;
     if (body.confirm !== true) { sendJSON(res, 400, { error: '需要 confirm: true' }); return; }
     const id = num(body.id);
     const r = alertStore.deleteRule(id);
@@ -1550,7 +1665,13 @@ async function handle(req, res, pathname, query) {
 
   // 发一条测试通知（不写 last_fired、不影响冷却）
   if (pathname === '/api/alerts/test' && req.method === 'POST') {
-    const body = await parseBody(req);
+    const body = await readBody(req, res);
+    if (!body) return;
+    if (Date.now() - lastAlertTestAt < 3000) {
+      sendJSON(res, 429, { error: '测试通知过于频繁，请 3 秒后再试' });
+      return;
+    }
+    lastAlertTestAt = Date.now();
     const id = num(body.id);
     let rule = alertStore.listRules().find((x) => x.id === id);
     if (!rule && body.rule) rule = { ...body.rule, id: 0, lastFired: 0 };
@@ -1576,7 +1697,9 @@ async function handle(req, res, pathname, query) {
     const args = ['--no-pager', '--utc', '-o', 'short-iso'];
     if (unit) args.push('-u', unit);
     if (/^[0-7]$/.test(prio)) args.push('-p', prio);
-    if (grep) args.push('--grep', grep);
+    // journalctl --grep 走 PCRE2：用户输入 (a+)+$ 这类模式能让它烧满 CPU 到超时。
+    // 把元字符转义成字面量，功能上「搜关键字」仍然满足，风险归零。
+    if (grep) args.push('--grep', grep.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
     args.push('-n', String(lines));
     try {
       const { stdout } = await execFileP('journalctl', args, { timeout: 8000, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
@@ -1613,7 +1736,8 @@ async function handle(req, res, pathname, query) {
 
   // 启用 / 禁用开机自启（与 start/stop 分开：这是改配置，不是改运行状态）
   if (pathname === '/api/service/enable' && req.method === 'POST') {
-    const body = await parseBody(req);
+    const body = await readBody(req, res);
+    if (!body) return;
     const name = String(body.name || '').trim();
     const enable = body.enable !== false;
     const client = clientOf(req);
@@ -1623,10 +1747,10 @@ async function handle(req, res, pathname, query) {
       sendJSON(res, 400, { error: msg });
     };
     if (!UNIT_RE.test(name)) return reject('服务名不合法');
-    if (!enable && PROTECTED_UNITS.has(name)) return reject(`${name} 属于关键服务，禁止禁用（会导致失联或系统不可用）`);
+    if (!enable && isProtectedUnit(name)) return reject(`${name} 属于关键服务，禁止禁用（会导致失联或系统不可用）`);
     if (body.confirm !== true) return reject('需要 confirm: true 才会执行');
     try {
-      await execFileP('systemctl', [enable ? 'enable' : 'disable', name],
+      await execFileP('systemctl', ['--', enable ? 'enable' : 'disable', name],
         { timeout: 20000, encoding: 'utf8', maxBuffer: 2 * 1024 * 1024 });
       unitsCache.at = 0;
       auditRecord({ action: tag, target: name, result: 'ok', message: `${enable ? '启用' : '禁用'} ${name}`, client });
@@ -1663,7 +1787,7 @@ async function handle(req, res, pathname, query) {
     out.sort((a, b) => (a.state === 'LISTEN' ? 0 : 1) - (b.state === 'LISTEN' ? 0 : 1) || a.port - b.port);
     const counts = {};
     for (const c of out) counts[c.state] = (counts[c.state] || 0) + 1;
-    sendJSON(res, 200, { ts: state.ts, total: out.length, counts, conns: out.slice(0, 2000) });
+    sendJSON(res, 200, { ts: state.ts, total: out.length, counts, degraded: allConnsDegraded, conns: out.slice(0, 2000) });
     return;
   }
 
@@ -1671,31 +1795,40 @@ async function handle(req, res, pathname, query) {
   if (pathname === '/api/container/stats') {
     const now = Date.now();
     if (now - containerStats.at > 10000) {
-      try {
-        const { stdout } = await execFileP('docker',
-          ['stats', '--no-stream', '--format', '{{json .}}'],
-          { timeout: 8000, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
-        const map = new Map();
-        for (const line of String(stdout || '').split('\n')) {
-          const t = line.trim();
-          if (!t) continue;
+      // 并发请求共用同一次 docker stats：之前没有在途保护，N 个请求会拉起 N 个子进程
+      if (!statsWait) {
+        statsWait = (async () => {
           try {
-            const o = JSON.parse(t);
-            map.set(o.Name, {
-              name: o.Name,
-              cpuPct: o.CPUPerc || '',
-              memUsage: o.MemUsage || '',
-              memPct: o.MemPerc || '',
-              netIO: o.NetIO || '',
-              blockIO: o.BlockIO || '',
-              pids: o.PIDs || '',
-            });
-          } catch { /* 跳过坏行 */ }
-        }
-        containerStats = { at: now, map, error: '' };
-      } catch (e) {
-        containerStats = { at: now, map: containerStats.map, error: String(e.stderr || e.message || e).split('\n')[0].slice(0, 160) };
+            const { stdout } = await execFileP('docker',
+              ['stats', '--no-stream', '--format', '{{json .}}'],
+              { timeout: 8000, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
+            const map = new Map();
+            for (const line of String(stdout || '').split('\n')) {
+              const t = line.trim();
+              if (!t) continue;
+              try {
+                const o = JSON.parse(t);
+                map.set(o.Name, {
+                  name: o.Name,
+                  cpuPct: o.CPUPerc || '',
+                  memUsage: o.MemUsage || '',
+                  memPct: o.MemPerc || '',
+                  netIO: o.NetIO || '',
+                  blockIO: o.BlockIO || '',
+                  pids: o.PIDs || '',
+                });
+              } catch { /* 跳过坏行 */ }
+            }
+            containerStats = { at: Date.now(), map, error: '' };
+          } catch (e) {
+            containerStats = {
+              at: Date.now(), map: containerStats.map,
+              error: String(e.stderr || e.message || e).split('\n')[0].slice(0, 160),
+            };
+          }
+        })().finally(() => { statsWait = null; });
       }
+      await statsWait;
     }
     sendJSON(res, 200, {
       ts: containerStats.at, error: containerStats.error,
@@ -1721,7 +1854,8 @@ async function handle(req, res, pathname, query) {
 
   // ── 容器启停 ────────────────────────────────────────────────────────────
   if (pathname === '/api/container/action' && req.method === 'POST') {
-    const body = await parseBody(req);
+    const body = await readBody(req, res);
+    if (!body) return;
     const name = String(body.name || '').trim();
     const action = String(body.action || '').trim();
     const client = clientOf(req);
@@ -1753,7 +1887,15 @@ async function handle(req, res, pathname, query) {
   }
 
   if (pathname === '/api/snapshot' && req.method === 'POST') {
-    const body = await parseBody(req);
+    const body = await readBody(req, res);
+    if (!body) return;
+    // 每个快照写全量进程清单，循环调用会把磁盘打满（磁盘满了审计库会降级成内存队列，
+    // 超出 5000 条就丢 —— 等于审计被冲掉）。10 秒内只允许存一个。
+    if (Date.now() - lastSnapshotAt < 10000) {
+      sendJSON(res, 429, { error: '存快照太频繁，请 10 秒后再试' });
+      return;
+    }
+    lastSnapshotAt = Date.now();
     ensureFreshProcs();
     const r = snapshotStore.save(procs, String(body.label || '').trim());
     if (!r.ok) { sendJSON(res, 400, { error: r.error }); return; }
@@ -1763,7 +1905,8 @@ async function handle(req, res, pathname, query) {
   }
 
   if (pathname === '/api/snapshot/delete' && req.method === 'POST') {
-    const body = await parseBody(req);
+    const body = await readBody(req, res);
+    if (!body) return;
     if (body.confirm !== true) { sendJSON(res, 400, { error: '需要 confirm: true' }); return; }
     const r = snapshotStore.remove(num(body.id));
     sendJSON(res, r.ok ? 200 : 400, r);
@@ -1785,13 +1928,26 @@ async function handle(req, res, pathname, query) {
   }
 
   if (pathname === '/api/watchdogs' && req.method === 'POST') {
-    const body = await parseBody(req);
-    // 执行命令是高风险动作：必须显式确认，且默认不启用
-    if (!body.id && body.acknowledge !== true) {
-      sendJSON(res, 400, { error: '看门狗会以 root 身份执行命令，需要 acknowledge: true 确认已知悉风险' });
+    const body = await readBody(req, res);
+    if (!body) return;
+    // 执行命令是高风险动作，判据必须用「结果状态」而不是「请求里有没有 id」：
+    //   · 新建时为 false（哪怕请求里写了 true）
+    //   · 更新时保持原有开关状态，除非显式要求改
+    //   · 以下任一条成立就必须带 acknowledge：true
+    //       ① 目标状态是「启用」 ② 改动了一条已启用看门狗的命令
+    const existing = body.id ? alertStore.listWatchdogs().find((w) => w.id === Number(body.id)) : null;
+    const wantsEnable = typeof body.enabled === 'boolean' ? body.enabled : (existing ? existing.enabled : false);
+    const commandChanged = existing ? String(body.command || '').trim() !== existing.command : true;
+    const needAck = wantsEnable || (existing && existing.enabled && commandChanged);
+    if (needAck && body.acknowledge !== true) {
+      auditRecord({
+        action: 'watchdog.save', target: String(body.id || 0), result: 'rejected',
+        message: '缺少 acknowledge: true（看门狗以 root 执行命令）', client: clientOf(req),
+      });
+      sendJSON(res, 400, { error: '看门狗会以 root 身份执行命令，保存启用状态需要 acknowledge: true' });
       return;
     }
-    const r = alertStore.saveWatchdog({ enabled: false, ...body });
+    const r = alertStore.saveWatchdog({ ...body, enabled: wantsEnable });
     if (!r.ok) { sendJSON(res, 400, { error: r.error }); return; }
     auditRecord({
       action: 'watchdog.save', target: String(r.id), result: 'ok',
@@ -1803,7 +1959,8 @@ async function handle(req, res, pathname, query) {
   }
 
   if (pathname === '/api/watchdogs/delete' && req.method === 'POST') {
-    const body = await parseBody(req);
+    const body = await readBody(req, res);
+    if (!body) return;
     if (body.confirm !== true) { sendJSON(res, 400, { error: '需要 confirm: true' }); return; }
     const r = alertStore.deleteWatchdog(num(body.id));
     if (!r.ok) { sendJSON(res, 400, { error: r.error }); return; }
@@ -1814,7 +1971,8 @@ async function handle(req, res, pathname, query) {
 
   // ── 进程调优（renice / OOM 保护 / cgroup 内存上限）──────────────────────
   if (pathname === '/api/tune' && req.method === 'POST') {
-    const body = await parseBody(req);
+    const body = await readBody(req, res);
+    if (!body) return;
     const pid = num(body.pid);
     const action = String(body.action || '').trim();
     const client = clientOf(req);
@@ -1862,6 +2020,9 @@ async function handle(req, res, pathname, query) {
   // ── Prometheus 指标 ─────────────────────────────────────────────────────
   if (pathname === '/metrics') {
     const L = [];
+    // label 值必须转义：进程 comm 可以用 prctl 设成含换行的任意字节，
+    // 不处理就能在指标输出里伪造整行（指标注入）
+    const lbl = (s) => String(s == null ? '' : s).replace(/[\\"\n\r\t]/g, '_').slice(0, 80);
     const add = (name, help, val, labels = '') => {
       L.push(`# HELP ${name} ${help}`, `# TYPE ${name} gauge`, `${name}${labels} ${val}`);
     };
@@ -1878,15 +2039,15 @@ async function handle(req, res, pathname, query) {
     add('fnproc_net_tx_bps', '网络发速率', state.net.txBps);
     add('fnproc_psi_mem_some_avg60', '内存压力 PSI', psi.mem);
     for (const v of volumes.list) {
-      add('fnproc_volume_used_percent', '卷使用率', v.usedPct, `{mount="${v.mount}"}`);
+      add('fnproc_volume_used_percent', '卷使用率', v.usedPct, `{mount="${lbl(v.mount)}"}`);
     }
     for (const a of alertEngine.snapshot()) {
-      add('fnproc_alert_breaching', '规则是否正在违规', a.breaching ? 1 : 0, `{rule="${String(a.name).replace(/["\\]/g, '')}"}`);
+      add('fnproc_alert_breaching', '规则是否正在违规', a.breaching ? 1 : 0, `{rule="${lbl(a.name)}"}`);
     }
     add('fnproc_alert_events_total', '历史告警事件数', alertStore.stats().events);
     // 每个进程只导出内存前 50，避免指标爆炸
     for (const p of [...procs].sort((a, b) => b.rss - a.rss).slice(0, 50)) {
-      const nm = String(p.name || '').replace(/["\\]/g, '');
+      const nm = lbl(p.name);
       add('fnproc_process_rss_bytes', '进程常驻内存', p.rss, `{pid="${p.pid}",name="${nm}"}`);
       add('fnproc_process_cpu_percent', '进程 CPU 使用率', p.cpuPct, `{pid="${p.pid}",name="${nm}"}`);
     }
@@ -1900,8 +2061,10 @@ async function handle(req, res, pathname, query) {
   if (pathname === '/api/export') {
     const what = String(query.get('what') || 'processes').trim();
     const csvCell = (v) => {
-      const s = String(v == null ? '' : v);
-      return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+      let s = String(v == null ? '' : v);
+      // Excel 公式注入：以 = + - @ 制表符 开头的单元格会被当公式执行，前置单引号中和
+      if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;
+      return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
     };
     let header = [];
     let rows = [];
@@ -1915,11 +2078,18 @@ async function handle(req, res, pathname, query) {
       header = ['ts', 'isoTime', 'cpu', 'mem', 'swap', 'load1', 'readBps', 'writeBps', 'rxBps', 'txBps'];
       rows = (q.rows || []).map((r) => [r.ts, new Date(r.ts).toISOString(), r.cpu, r.mem, r.swap, r.load1, r.rd, r.wr, r.rx, r.tx]);
     } else if (what === 'audit') {
-      const q = auditStore.list({ limit: 5000, offset: 0, q: '', action: '', result: '' });
+      // 与记录页保持同一套筛选条件（action / result / q / since 全部透传）
+      const q = auditStore.list({
+        limit: 500, offset: 0,
+        q: String(query.get('q') || ''),
+        action: String(query.get('action') || ''),
+        result: String(query.get('result') || ''),
+        since: num(query.get('since')) || 0,
+      });
       header = ['id', 'isoTime', 'action', 'target', 'result', 'message', 'client', 'detail'];
       rows = (q.rows || []).map((r) => [r.id, new Date(r.ts).toISOString(), r.action, r.target, r.result, r.message, r.client, r.detail]);
     } else if (what === 'alerts') {
-      const q = alertStore.listEvents({ limit: 5000, offset: 0 });
+      const q = alertStore.listEvents({ limit: 1000, offset: 0, level: query.get('level') == null ? '' : String(query.get('level')) });
       header = ['id', 'isoTime', 'level', 'rule', 'metric', 'value', 'message', 'delivered'];
       rows = (q.rows || []).map((r) => [r.id, new Date(r.ts).toISOString(), r.level, r.ruleName, r.metric, r.value, r.message, JSON.stringify(r.delivered)]);
     } else {
@@ -1927,12 +2097,17 @@ async function handle(req, res, pathname, query) {
       return;
     }
     const body = [header.join(','), ...rows.map((r) => r.map(csvCell).join(','))].join('\n') + '\n';
+    // BOM 必须算进 Content-Length：早期版本按不含 BOM 的长度声明，
+    // 客户端会按声明截断，导出的最后一行末尾 3 字节被吃掉
+    const out = '\ufeff' + body;
+    const len = Buffer.byteLength(out);
     res.writeHead(200, {
       'Content-Type': 'text/csv; charset=utf-8',
       'Content-Disposition': `attachment; filename="fnproc-${what}-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '')}.csv"`,
-      'Content-Length': Buffer.byteLength(body),
+      'Content-Length': len,
+      'X-Row-Count': String(rows.length),
     });
-    res.end('\ufeff' + body);           // BOM：Excel 打开中文不乱码
+    res.end(out);
     return;
   }
 
@@ -1974,7 +2149,7 @@ async function handle(req, res, pathname, query) {
   if (pathname === '/api/boot') {
     const out = { kernelSec: null, userspaceSec: null, blame: [], error: '' };
     try {
-      const t = await execFileP('systemd-analyze', [], { timeout: 6000, encoding: 'utf8' });
+      const t = await execFileP('systemd-analyze', [], { timeout: 6000, encoding: 'utf8', maxBuffer: 1024 * 1024 });
       const txt = String(t.stdout || '');
       const k = txt.match(/([\d.]+)s \(kernel\)/);
       const u = txt.match(/([\d.]+)s \(userspace\)/);
@@ -2021,11 +2196,68 @@ async function handle(req, res, pathname, query) {
     return;
   }
 
+  // 写端点被 GET 访问时回 405，比 404 更能说明问题（避免把「方法不对」当成「接口不存在」）
+  const POST_ONLY = new Set(['/api/kill', '/api/service', '/api/service/enable', '/api/alerts',
+    '/api/alerts/delete', '/api/alerts/test', '/api/watchdogs', '/api/watchdogs/delete',
+    '/api/snapshot', '/api/snapshot/delete', '/api/container/action', '/api/tune']);
+  if (POST_ONLY.has(pathname)) {
+    sendJSON(res, 405, { error: '该接口只接受 POST' });
+    return;
+  }
   sendJSON(res, 404, { error: 'unknown api: ' + pathname });
 }
 
 // ── HTTP 入口（网关会带 /app/fnproc 前缀，必须自己剥掉）──────────────────
+// ── 请求来源守卫 ────────────────────────────────────────────────────────
+// 为什么需要：服务同时监听 127.0.0.1:PORT，浏览器里的任意网页都能跨域打到它。
+// 跨域的「简单请求」（text/plain / form-urlencoded）不会触发预检，浏览器直接发出，
+// 服务端不判 Content-Type 就等于开了后门 —— 本项目以 root 运行，
+// 一个 text/plain POST 就能落地 root 命令（实测过）。
+//
+// 分层判据（按强度从高到低）：
+//   ① 带 X-Trim-Userid = 请求确实从 fnOS 网关过来（恶意网页无法伪造该头）→ 放行
+//   ② 没有该头时，拒绝 Sec-Fetch-Site: cross-site（浏览器必带）
+//   ③ 任何写请求必须是 application/json —— 这会让浏览器强制发预检，
+//      而预检一律 403 直接掐掉（见 OPTIONS 处理）
+const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+
+function guardRequest(req, res) {
+  const method = String(req.method || 'GET').toUpperCase();
+  if (method === 'OPTIONS') {
+    res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('forbidden');
+    return true;
+  }
+  const gwUid = req.headers['x-trim-userid'] || req.headers['x-trim-uid'];
+  if (!gwUid) {
+    const sfs = String(req.headers['sec-fetch-site'] || '').toLowerCase();
+    if (sfs === 'cross-site') {
+      sendJSON(res, 403, { error: '拒绝跨站请求' });
+      return true;
+    }
+  }
+  if (MUTATING_METHODS.has(method)) {
+    const ct = String(req.headers['content-type'] || '');
+    if (!/^application\/json\b/i.test(ct)) {
+      sendJSON(res, 415, { error: '写请求必须使用 Content-Type: application/json' });
+      return true;
+    }
+  }
+  return false;
+}
+
+// 统一读取请求体：解析失败/超限时直接回 400/413，调用方拿到 null 就 return
+async function readBody(req, res) {
+  const b = await parseBody(req);
+  if (b && b.__error) {
+    sendJSON(res, b.__status || 400, { error: b.__error });
+    return null;
+  }
+  return b;
+}
+
 const httpServer = createServer(async (req, res) => {
+  if (guardRequest(req, res)) return;
   let pathname = '/';
   let query = new URLSearchParams();
   try {
@@ -2043,6 +2275,10 @@ const httpServer = createServer(async (req, res) => {
   serveStatic(req, res, pathname);
 });
 
+httpServer.on('error', (e) => {
+  console.error(`[fatal] HTTP 监听失败 ${PORT}: ${e.code || ''} ${e.message || e}`);
+  process.exit(1);
+});
 httpServer.listen(PORT, '127.0.0.1', () => console.log(`fnproc HTTP on 127.0.0.1:${PORT}`));
 
 const sockServer = createServer((req, res) => httpServer.emit('request', req, res));
@@ -2087,13 +2323,22 @@ for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP']) {
         detail: { signal: sig, uptimeSec: Math.round(process.uptime()) },
       });
     } catch { /* 退出路径不抛错 */ }
-    try { auditStore.close(); } catch { /* 忽略 */ }   // 关闭时会把 WAL checkpoint 进主库
+    // 四个 SQLite 库都要关：只关审计库会让 history/snapshot/alert 的 WAL 不 checkpoint，
+  // 最后一段采样与事件丢失（historyStore 还有内存 pending 队列要落盘）
+  for (const [name, store] of [['audit', auditStore], ['history', historyStore],
+    ['alert', alertStore], ['snapshot', snapshotStore]]) {
+    try { store.close(); } catch (e) { console.error(`[shutdown] 关闭 ${name} 库失败:`, e.message); }
+  }   // 关闭时会把 WAL checkpoint 进主库
     try { unlinkSync(SOCK_PATH); } catch { /* 忽略 */ }
     process.exit(0);
   });
 }
 
 // 未捕获异常也要留痕：先落一条记录再退出，避免「莫名其妙重启但查不到原因」
+process.on('unhandledRejection', (e) => {
+  console.error('[unhandledRejection]', e && e.stack ? e.stack : e);
+});
+
 process.on('uncaughtException', (e) => {
   try {
     auditRecord({

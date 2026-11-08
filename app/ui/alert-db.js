@@ -126,7 +126,14 @@ export function openAlertStore(dbPath, { version = '' } = {}) {
       const metric = String(input.metric || '').trim();
       if (!name) return { ok: false, error: '规则名不能为空' };
       if (!METRICS[metric]) return { ok: false, error: '不支持的判据：' + metric };
-      const op = ['>', '<', '==', 'missing', 'failed'].includes(input.op) ? input.op : '>';
+      // op 缺省时：更新保留原值，新建才用 '>'
+      // （早期无论新建更新都退回 '>'，导致前端不带 op 时把「磁盘可用 < 10%」改成「> 10%」）
+      const prev = Number(input.id)
+        ? (db ? (db.prepare('SELECT op FROM alert_rules WHERE id = ?').get(Number(input.id)) || {}).op : null)
+        : null;
+      const op = ['>', '<', '==', 'missing', 'failed'].includes(input.op)
+        ? input.op
+        : (prev || '>');
       const values = {
         name,
         enabled: input.enabled === false ? 0 : 1,
@@ -276,6 +283,16 @@ export function openAlertStore(dbPath, { version = '' } = {}) {
         error = e.message;
         return { rows: [], total: 0 };
       }
+    },
+
+    // 告警事件保留期裁剪：这个表只增不删，长期跑必须定期裁，否则磁盘被慢慢吃满
+    pruneEvents(days = 180) {
+      if (!db) return 0;
+      try {
+        const cutoff = Date.now() - Math.max(1, days) * 86400000;
+        const info = db.prepare('DELETE FROM alert_events WHERE ts < ?').run(cutoff);
+        return Number(info.changes) || 0;
+      } catch { return 0; }
     },
 
     stats() {
