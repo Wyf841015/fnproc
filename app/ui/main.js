@@ -162,6 +162,21 @@ let currentTab = 'overview';     // overview | process | ports | containers | se
 let processView = 'list';        // list | tree（仅「进程」tab 内的子视图）
 let historyRange = '60s';        // 60s = 实时内存数据；其它 = 从 /api/history 读落盘数据
 let containerFilter = '';        // 容器名或短 ID，非空时列表只显示该容器进程
+// ── 全屏遮罩自愈 ─────────────────────────────────────────────────────
+// 遮罩都是 position:fixed;inset:0（opacity:0 时肉眼不可见但仍拦截点击）。
+// 任何一个关闭路径漏掉 hidden = true，整页按钮就全哑掉，而且完全没有报错线索。
+// 这里做一次廉价巡检：没有 .show、又没有待执行的隐藏定时器，就补上 hidden。
+// 有过一次「点过一次弹窗后按钮全点不动」的教训，留这个兜底。
+setInterval(() => {
+  for (const id of ['drawer-mask', 'modal-mask', 'alert-mask', 'log-mask',
+    'snap-mask', 'wd-mask', 'sponsor-mask', 'feedback-mask', 'lightbox']) {
+    const el = document.getElementById(id);
+    if (!el || el.hidden || el.__hideTimer) continue;
+    if (!el.classList.contains('show')) el.hidden = true;
+    else if (el.id === 'drawer-mask' && document.getElementById('drawer')?.hidden) el.hidden = true;
+  }
+}, 1500);
+
 // ── 全局 fetch 超时 ────────────────────────────────────────────────────
 // 后端卡住时（systemctl/docker 变慢、socket 半死），没有超时的 fetch 会永远挂着：
 // 界面停在「加载中…」、模块级 flag 永久占用、后续点击被静默吞掉。
@@ -970,7 +985,12 @@ function showMask(el) {
   if (!el) return;
   if (el.__hideTimer) { clearTimeout(el.__hideTimer); el.__hideTimer = null; }
   el.hidden = false;
-  requestAnimationFrame(() => el.classList.add('show'));
+  const token = (el.__showToken = (el.__showToken || 0) + 1);
+  requestAnimationFrame(() => {
+    // 期间被关闭了（hidden 或又被关了一次）就不要再把 show 加回去
+    if (el.__showToken !== token || el.hidden) return;
+    el.classList.add('show');
+  });
 }
 function closeMask(el, ms = 160) {
   if (!el) return;
@@ -1693,9 +1713,11 @@ async function openDetail(pid) {
   }
 }
 function closeDetail() {
-  const mask = $('drawer-mask'), drawer = $('drawer');
-  mask.classList.remove('show'); drawer.classList.remove('show');
-  hideLater(drawer, 200);
+  // 遮罩必须一起隐藏：它是 position:fixed;inset:0 的全屏层，
+  // 只做 opacity:0（移除 .show）时肉眼看不见但仍在最上层吃掉所有点击 ——
+  // 「点过一次弹窗后整页按钮都点不动」就是这里漏了 mask.hidden
+  closeMask($('drawer-mask'), 200);
+  closeMask($('drawer'), 200);
   currentDetailPid = null;
 }
 
@@ -1897,18 +1919,8 @@ function renderAudit(d) {
 }
 
 // ── 赞助 / 反馈弹层 ─────────────────────────────────────────────────────
-function openSheet(id) {
-  const m = $(id);
-  if (!m) return;
-  m.hidden = false;
-  requestAnimationFrame(() => m.classList.add('show'));
-}
-function closeSheet(id) {
-  const m = $(id);
-  if (!m) return;
-  m.classList.remove('show');
-  setTimeout(() => { m.hidden = true; }, 180);
-}
+function openSheet(id) { showMask($(id)); }
+function closeSheet(id) { closeMask($(id), 180); }
 function openLightbox(src) {
   const lb = $('lightbox');
   if (!lb || !src) return;
@@ -2069,15 +2081,9 @@ function bindEvents() {
   // ── 快照 ──
   $('btn-snapshot').addEventListener('click', saveSnapshot);
   $('btn-snap-diff').addEventListener('click', openSnapshotDiff);
-  $('snap-close').addEventListener('click', () => {
-    $('snap-mask').classList.remove('show');
-    hideLater($('snap-mask'));
-  });
+  $('snap-close').addEventListener('click', () => closeSnapModal());
   $('snap-mask').addEventListener('click', (e) => {
-    if (e.target === $('snap-mask')) {
-      $('snap-mask').classList.remove('show');
-      hideLater($('snap-mask'));
-    }
+    if (e.target === $('snap-mask')) closeSnapModal();
   });
   $('snap-run').addEventListener('click', runSnapshotDiff);
   $('snap-del').addEventListener('click', () => {

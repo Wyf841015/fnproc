@@ -213,6 +213,32 @@ test('setTab 不再重复调用 loadAudit / loadAlerts（refreshView 已覆盖�
   assert.doesNotMatch(body, /loadAlerts\(\)/);
 });
 
+// ── ⑩b 全屏遮罩必须真的隐藏（否则整页点不动）─────────────────────────
+test('closeDetail 同时隐藏遮罩与抽屉', () => {
+  const main = readFileSync(join(here, '..', 'app', 'ui', 'main.js'), 'utf8');
+  const i = main.indexOf('function closeDetail()');
+  const body = main.slice(i, i + 600);
+  assert.match(body, /closeMask\(\$\('drawer-mask'\)/, 'drawer-mask 必须被关闭');
+  assert.match(body, /closeMask\(\$\('drawer'\)/, 'drawer 必须被关闭');
+});
+
+test('所有全屏遮罩的关闭路径都走 closeMask/showMask（可取消的隐藏定时器）', () => {
+  const main = readFileSync(join(here, '..', 'app', 'ui', 'main.js'), 'utf8');
+  // 不允许再出现「只移除 show、不管 hidden」的手写关闭
+  assert.doesNotMatch(main, /classList\.remove\('show'\);\s*\n\s*setTimeout\(\(\) => \{ m\.hidden = true; \}/);
+  // 兜底巡检必须存在（防止将来新增弹层忘了隐藏）
+  assert.match(main, /全屏遮罩自愈/);
+  assert.match(main, /'drawer-mask', 'modal-mask', 'alert-mask', 'log-mask'/);
+});
+
+test('showMask 的 rAF 带 token 保护（关闭后晚到的回调不会把 show 加回去）', () => {
+  const main = readFileSync(join(here, '..', 'app', 'ui', 'main.js'), 'utf8');
+  const i = main.indexOf('function showMask(el)');
+  const body = main.slice(i, i + 500);
+  assert.match(body, /__showToken/);
+  assert.match(body, /if \(el\.__showToken !== token \|\| el\.hidden\) return;/);
+});
+
 // ── ⑪ psql 不读用户 rc 文件 ─────────────────────────────────────────
 test('psql 调用带 -X（不加载 ~/.psqlrc）', () => {
   const alertsSrc = readFileSync(join(here, '..', 'app', 'ui', 'alerts.js'), 'utf8');
