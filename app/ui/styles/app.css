@@ -544,3 +544,42 @@ select {
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; animation: none !important; }
 }
+
+/* ── 告警页 ─────────────────────────────────────────────── */
+.row-dim { opacity: .55; }
+.chip.alarm { border-color: rgba(248, 113, 113, .55); color: var(--danger); background: rgba(248, 113, 113, .12); }
+.chip.warn { border-color: rgba(251, 191, 36, .5); color: var(--warning, #fbbf24); background: rgba(251, 191, 36, .1); }
+.chip.dim { color: var(--text-dim); border-style: dashed; }
+.tab-badge[data-hot="1"] { background: rgba(248, 113, 113, .18); color: var(--danger); border-color: rgba(248, 113, 113, .5); }
+.modal.wide { width: min(620px, 100%); }
+.alert-form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 14px; margin-bottom: 10px; }
+.alert-form .fld { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--text-mute); }
+.alert-form .fld.full { grid-column: 1 / -1; }
+.alert-form .fld.chk { flex-direction: row; align-items: center; gap: 8px; color: var(--text-dim); }
+.alert-form input[type="text"], .alert-form input[type="number"], .alert-form select {
+  padding: 7px 9px; border: 1px solid var(--line); border-radius: var(--radius-sm);
+  background: var(--bg-2); color: var(--text); font-size: 13px; width: 100%;
+}
+.alert-form input[type="checkbox"] { width: auto; accent-color: var(--accent); }
+/* ── 日志弹窗 ───────────────────────────────────────────── */
+.log-tools { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; }
+.log-tools select, .log-tools input {
+  padding: 6px 9px; border: 1px solid var(--line); border-radius: var(--radius-sm);
+  background: var(--bg-2); color: var(--text); font-size: 12px;
+}
+.log-tools input { flex: 1 1 160px; min-width: 0; }
+.log-pre {
+  margin: 0; padding: 10px; max-height: min(58vh, 460px); overflow: auto;
+  background: #05080f; color: #cbd5e1; border: 1px solid var(--line); border-radius: var(--radius-sm);
+  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 11.5px; line-height: 1.55; white-space: pre;
+}
+/* ── 定时器折叠块 ───────────────────────────────────────── */
+.timers-block > summary {
+  display: flex; align-items: center; gap: 10px; cursor: pointer;
+  padding: 2px 0 8px; list-style: none;
+}
+.timers-block > summary::-webkit-details-marker { display: none; }
+.timers-block > summary::before { content: '▸'; color: var(--text-mute); font-size: 12px; }
+.timers-block[open] > summary::before { content: '▾'; }
+.timers-block > summary h2 { margin: 0; font-size: 14px; }

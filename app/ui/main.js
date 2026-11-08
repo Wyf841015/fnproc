@@ -536,6 +536,23 @@ async function renderServices() {
     } else {
       act.append(mk('启动', 'start'));
     }
+    // 日志：为什么 failed 得能看到它自己的日志，不能逼用户去 SSH
+    const logBtn = el('button', 'btn tiny ghost', '日志');
+    logBtn.type = 'button';
+    logBtn.dataset.action = 'svc-log';
+    logBtn.dataset.unit = u.name;
+    act.appendChild(logBtn);
+    // 开机自启（与启停是两件事：这个是改配置）
+    if (u.enabledState === 'enabled' || u.enabledState === 'disabled') {
+      const on = u.enabledState === 'enabled';
+      const eb = el('button', 'btn tiny ghost', on ? '取消自启' : '开机自启');
+      eb.type = 'button';
+      eb.dataset.action = 'svc-enable';
+      eb.dataset.unit = u.name;
+      eb.dataset.enable = on ? '0' : '1';
+      if (u.protected && on) { eb.disabled = true; eb.title = '关键服务，禁止取消开机自启'; }
+      act.appendChild(eb);
+    }
     tr.appendChild(act);
     frag.appendChild(tr);
   }
@@ -574,8 +591,338 @@ async function doServiceAction(name, action) {
   );
 }
 
+function doServiceEnable(name, enable) {
+  const label = enable ? '开机自启' : '取消开机自启';
+  confirmModal(
+    enable ? '设置开机自启' : '取消开机自启',
+    `目标：${name}\n操作：${label}${enable ? '' : '\n\n取消后系统重启时它不会自动运行。'}`,
+    '确定',
+    async () => {
+      try {
+        const r = await fetch(API + '/service/enable', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name, enable, confirm: true }),
+        });
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+        toast(`${name} ${label}成功`, 'ok');
+        renderServices();
+      } catch (e) {
+        toast(`${label}失败：` + e.message, 'error');
+      }
+    },
+  );
+}
+
+// ── 告警 ────────────────────────────────────────────────────────────────
+let alertMeta = {};                 // metric → { label, unit, needTarget, targetHint }
+let alertLevels = { 0: '普通', 1: '警告', 2: '严重' };
+let alertRules = [];                // 最近一次规则列表
+let alertLive = [];                 // 每条规则当前的实测值 / 是否违规中
+let editingAlertId = 0;
+
+function fmtAgo(ts) {
+  if (!ts) return '—';
+  const s = Math.max(0, Math.round((Date.now() - ts) / 1000));
+  if (s < 60) return `${s} 秒前`;
+  if (s < 3600) return `${Math.round(s / 60)} 分钟前`;
+  if (s < 86400) return `${Math.round(s / 3600)} 小时前`;
+  return `${Math.round(s / 86400)} 天前`;
+}
+
+function fmtDur(sec) {
+  const s = Number(sec) || 0;
+  if (!s) return '立即';
+  if (s < 60) return `${s} 秒`;
+  if (s < 3600) return `${Math.round(s / 60)} 分钟`;
+  return `${(s / 3600).toFixed(s % 3600 ? 1 : 0)} 小时`;
+}
+
+function metricText(rule) {
+  const m = alertMeta[rule.metric] || {};
+  const unit = m.unit || '';
+  if (rule.metric === 'proc_missing') return `进程不存在：${rule.target}`;
+  if (rule.metric === 'unit_failed') return `单元 failed：${rule.target}`;
+  const tgt = rule.target ? ` ${rule.target}` : '';
+  return `${m.label || rule.metric}${tgt} ${rule.op} ${rule.threshold}${unit}`;
+}
+
+async function loadAlerts() {
+  try {
+    const r = await fetch(API + '/alerts', { cache: 'no-store' });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+    alertMeta = d.metrics || {};
+    alertLevels = d.levels || alertLevels;
+    alertRules = d.rules || [];
+    alertLive = d.live || [];
+    renderAlertRules();
+    await loadAlertEvents();
+    const st = d.stats || {};
+    $('alerts-hint').textContent = `${st.rules || 0} 条规则（启用 ${st.enabled || 0}）· 累计 ${st.events || 0} 次事件`;
+    const firing = alertLive.filter((x) => x.breaching).length;
+    $('badge-alerts').textContent = firing ? String(firing) : '—';
+    $('badge-alerts').dataset.hot = firing ? '1' : '';
+  } catch (e) {
+    toast('告警数据读取失败：' + e.message, 'error');
+  }
+}
+
+function renderAlertRules() {
+  const tb = $('alert-body');
+  tb.textContent = '';
+  const liveOf = new Map(alertLive.map((x) => [x.id, x]));
+  const frag = document.createDocumentFragment();
+  for (const rule of alertRules) {
+    const live = liveOf.get(rule.id) || {};
+    const tr = el('tr');
+    if (!rule.enabled) tr.classList.add('row-dim');
+    tr.appendChild(el('td', 'num mono', rule.id));
+    tr.appendChild(el('td', 'pname', rule.name));
+    tr.appendChild(el('td', 'hint', metricText(rule)));
+    tr.appendChild(el('td', 'num mono', rule.metric === 'proc_missing' || rule.metric === 'unit_failed' ? '—' : `${rule.threshold}`));
+    tr.appendChild(el('td', 'num mono hide-sm', fmtDur(rule.durationSec)));
+    tr.appendChild(el('td', 'num mono hide-sm', fmtDur(rule.cooldownSec)));
+    const nt = el('td', 'hide-md');
+    if (rule.notifyFn) nt.appendChild(el('span', 'chip', '系统通知'));
+    if (rule.webhook) nt.appendChild(el('span', 'chip cont', 'Webhook'));
+    if (!rule.notifyFn && !rule.webhook) nt.appendChild(el('span', 'hint', '未配置'));
+    tr.appendChild(nt);
+    const stTd = el('td');
+    if (live.breaching) {
+      const chip = el('span', 'chip alarm', `违规中 ${live.value != null ? (Math.round(live.value * 10) / 10) : ''}`);
+      chip.title = `自 ${new Date(live.sinceMs || Date.now()).toLocaleTimeString()} 起持续超标`;
+      stTd.appendChild(chip);
+    } else if (live.value != null) {
+      stTd.appendChild(el('span', 'chip dim', `正常 ${Math.round(live.value * 10) / 10}`));
+    } else {
+      stTd.appendChild(el('span', 'hint', rule.enabled ? '—' : '已停用'));
+    }
+    tr.appendChild(stTd);
+    tr.appendChild(el('td', 'num hide-sm hint', fmtAgo(rule.lastFired)));
+    const act = el('td', 'act');
+    const mk = (label, action, cls) => {
+      const b = el('button', 'btn tiny' + (cls ? ' ' + cls : ''), label);
+      b.type = 'button';
+      b.dataset.action = action;
+      b.dataset.id = rule.id;
+      return b;
+    };
+    act.append(mk('编辑', 'alert-edit'), mk('测试', 'alert-test'), mk('删除', 'alert-del', 'warn'));
+    tr.appendChild(act);
+    frag.appendChild(tr);
+  }
+  tb.appendChild(frag);
+  $('alerts-empty').hidden = alertRules.length > 0;
+}
+
+async function loadAlertEvents() {
+  try {
+    const lv = $('alert-level-filter') ? $('alert-level-filter').value : '';
+    const q = new URL(API + '/alerts/events', location.origin);
+    q.searchParams.set('limit', '50');
+    if (lv !== '') q.searchParams.set('level', lv);
+    const d = await (await fetch(q.toString(), { cache: 'no-store' })).json();
+    const tb = $('alert-events');
+    tb.textContent = '';
+    const frag = document.createDocumentFragment();
+    for (const ev of d.rows || []) {
+      const tr = el('tr');
+      tr.appendChild(el('td', 'num mono hint', new Date(ev.ts).toLocaleString()));
+      const lvTd = el('td');
+      const cls = ev.level === 2 ? 'chip alarm' : (ev.level === 1 ? 'chip warn' : 'chip dim');
+      lvTd.appendChild(el('span', cls, alertLevels[ev.level] || ev.level));
+      tr.appendChild(lvTd);
+      tr.appendChild(el('td', 'pname', ev.ruleName || '—'));
+      tr.appendChild(el('td', '', ev.message || ''));
+      const dl = el('td', 'hide-sm hint');
+      const parts = [];
+      for (const [ch, res] of Object.entries(ev.delivered || {})) {
+        const name = ch === 'fnos' ? '系统通知' : (ch === 'webhook' ? 'Webhook' : ch);
+        parts.push(`${name} ${res && res.ok ? '✓' : '✗' + (res && res.error ? ' ' + res.error : '')}`);
+      }
+      dl.textContent = parts.join(' · ') || '—';
+      tr.appendChild(dl);
+      frag.appendChild(tr);
+    }
+    tb.appendChild(frag);
+    $('alert-events-empty').hidden = (d.rows || []).length > 0;
+  } catch { /* 忽略 */ }
+}
+
+// 规则编辑弹窗
+function openAlertModal(rule) {
+  editingAlertId = rule ? rule.id : 0;
+  $('alert-modal-title').textContent = rule ? `编辑规则 #${rule.id}` : '新建告警规则';
+  const sel = $('af-metric');
+  sel.textContent = '';
+  for (const [key, m] of Object.entries(alertMeta)) {
+    const o = document.createElement('option');
+    o.value = key;
+    o.textContent = m.label;
+    sel.appendChild(o);
+  }
+  const r = rule || { name: '', metric: 'cpu', op: '>', threshold: 90, durationSec: 180, cooldownSec: 900, level: 1, enabled: true, notifyFn: true, webhook: '', target: '' };
+  sel.value = r.metric;
+  $('af-name').value = r.name || '';
+  $('af-threshold').value = r.threshold;
+  $('af-duration').value = r.durationSec;
+  $('af-cooldown').value = r.cooldownSec;
+  $('af-level').value = String(r.level);
+  $('af-enabled').checked = r.enabled !== false;
+  $('af-notify-fn').checked = r.notifyFn !== false;
+  $('af-webhook').value = r.webhook || '';
+  $('af-target').value = r.target || '';
+  syncAlertForm();
+  $('alert-mask').hidden = false;
+  requestAnimationFrame(() => $('alert-mask').classList.add('show'));
+}
+
+function closeAlertModal() {
+  $('alert-mask').classList.remove('show');
+  setTimeout(() => { $('alert-mask').hidden = true; }, 160);
+}
+
+function syncAlertForm() {
+  const m = alertMeta[$('af-metric').value] || {};
+  $('af-target-wrap').hidden = !m.needTarget;
+  $('af-target-label').textContent = m.targetHint || '目标';
+  $('af-target').placeholder = m.targetHint || '';
+  // 进程缺失 / 单元异常 是布尔判定，没有阈值
+  const noThreshold = $('af-metric').value === 'proc_missing' || $('af-metric').value === 'unit_failed';
+  $('af-threshold-wrap').hidden = noThreshold;
+}
+
+function alertFormBody() {
+  return {
+    id: editingAlertId || undefined,
+    name: $('af-name').value.trim(),
+    metric: $('af-metric').value,
+    threshold: Number($('af-threshold').value) || 0,
+    durationSec: Number($('af-duration').value) || 0,
+    cooldownSec: Number($('af-cooldown').value) || 600,
+    level: Number($('af-level').value) || 0,
+    enabled: $('af-enabled').checked,
+    notifyFn: $('af-notify-fn').checked,
+    webhook: $('af-webhook').value.trim(),
+    target: $('af-target').value.trim(),
+  };
+}
+
+async function saveAlert() {
+  const body = alertFormBody();
+  try {
+    const r = await fetch(API + '/alerts', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+    toast(editingAlertId ? '规则已更新' : '规则已创建', 'ok');
+    closeAlertModal();
+    await loadAlerts();
+  } catch (e) {
+    toast('保存失败：' + e.message, 'error');
+  }
+}
+
+async function testAlert() {
+  const body = alertFormBody();
+  try {
+    const r = await fetch(API + '/alerts/test', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(editingAlertId ? { id: editingAlertId } : { rule: body }),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+    const dl = d.delivered || {};
+    const ok = Object.values(dl).some((x) => x && x.ok);
+    const detail = Object.entries(dl).map(([k, v]) => `${k === 'fnos' ? '系统通知' : k} ${v.ok ? '成功' : '失败（' + (v.error || '') + '）'}`).join('，');
+    toast((ok ? '测试通知已发出：' : '测试通知发送失败：') + detail, ok ? 'ok' : 'error');
+    await loadAlertEvents();
+  } catch (e) {
+    toast('测试失败：' + e.message, 'error');
+  }
+}
+
+function deleteAlert(id) {
+  const rule = alertRules.find((x) => x.id === id);
+  confirmModal('删除告警规则', `确定删除「${rule ? rule.name : '#' + id}」？\n删除后不再产生该告警，历史事件保留。`, '确定删除', async () => {
+    try {
+      const r = await fetch(API + '/alerts/delete', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id, confirm: true }),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+      toast('规则已删除', 'ok');
+      await loadAlerts();
+    } catch (e) {
+      toast('删除失败：' + e.message, 'error');
+    }
+  });
+}
+
+// ── 日志查看（journalctl）─────────────────────────────────────────────────
+let logUnit = '';
+
+async function openLog(unit) {
+  logUnit = unit || '';
+  $('log-title').textContent = unit ? `日志 · ${unit}` : '系统日志';
+  $('log-pre').textContent = '加载中…';
+  $('log-mask').hidden = false;
+  requestAnimationFrame(() => $('log-mask').classList.add('show'));
+  await loadLog();
+}
+
+function closeLog() {
+  $('log-mask').classList.remove('show');
+  setTimeout(() => { $('log-mask').hidden = true; }, 160);
+}
+
+async function loadLog() {
+  const q = new URL(API + '/journal', location.origin);
+  if (logUnit) q.searchParams.set('unit', logUnit);
+  q.searchParams.set('lines', $('log-lines').value);
+  const prio = $('log-priority').value;
+  if (prio) q.searchParams.set('priority', prio);
+  const grep = $('log-grep').value.trim();
+  if (grep) q.searchParams.set('q', grep);
+  try {
+    const r = await fetch(q.toString(), { cache: 'no-store' });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+    const lines = d.lines || [];
+    $('log-pre').textContent = lines.length ? lines.join('\n') : '（没有匹配的日志）';
+    $('log-pre').scrollTop = $('log-pre').scrollHeight;
+  } catch (e) {
+    $('log-pre').textContent = '读取失败：' + e.message;
+  }
+}
+
+// ── systemd 定时器 ──────────────────────────────────────────────────────
+async function loadTimers() {
+  try {
+    const d = await (await fetch(API + '/timers', { cache: 'no-store' })).json();
+    const tb = $('timers-body');
+    if (!tb) return;
+    tb.textContent = '';
+    const frag = document.createDocumentFragment();
+    for (const t of d.timers || []) {
+      const tr = el('tr');
+      tr.appendChild(el('td', 'svc-name mono', t.name.replace(/\.timer$/, '')));
+      tr.appendChild(el('td', 'mono hint', t.activates || '—'));
+      tr.appendChild(el('td', 'hide-sm hint', t.raw.replace(/\s+/g, ' ').slice(0, 90)));
+      frag.appendChild(tr);
+    }
+    tb.appendChild(frag);
+    $('timers-hint').textContent = `${(d.timers || []).length} 个`;
+    $('timers-empty').hidden = (d.timers || []).length > 0;
+  } catch { /* 忽略 */ }
+}
+
 // ── 一级 tab（功能分类）──────────────────────────────────────────────────
-const TAB_NAMES = ['overview', 'process', 'ports', 'containers', 'services', 'audit'];
+const TAB_NAMES = ['overview', 'process', 'ports', 'containers', 'services', 'alerts', 'audit'];
 
 function setTab(name) {
   if (!TAB_NAMES.includes(name)) name = 'overview';
@@ -585,6 +932,8 @@ function setTab(name) {
   // 切到概览要立刻画一次图，否则 canvas 尺寸为 0 时画出来是空的
   if (name === 'overview') requestAnimationFrame(() => loadHistoryView());
   if (name === 'audit') loadAudit();
+  if (name === 'alerts') loadAlerts();
+  if (name === 'services') loadTimers();
   return refreshView();
 }
 
@@ -606,6 +955,7 @@ async function refreshView() {
     if (currentTab === 'containers') { await renderContainers(); return; }
     if (currentTab === 'services') { await renderServices(); return; }
     if (currentTab === 'audit') { await loadAudit(); return; }
+    if (currentTab === 'alerts') { await loadAlerts(); return; }
     if (currentTab === 'overview') { updateBadges(); return; }
     const u = new URL(API + '/processes', location.origin);
     u.searchParams.set('sort', sortKey);
@@ -1218,6 +1568,41 @@ function bindEvents() {
     refreshView();
   });
 
+  // ── 告警页 ──
+  $('alert-add').addEventListener('click', () => openAlertModal(null));
+  $('alert-cancel').addEventListener('click', closeAlertModal);
+  $('alert-save').addEventListener('click', saveAlert);
+  $('alert-test').addEventListener('click', testAlert);
+  $('af-metric').addEventListener('change', syncAlertForm);
+  $('alert-mask').addEventListener('click', (e) => { if (e.target === $('alert-mask')) closeAlertModal(); });
+  $('alert-level-filter').addEventListener('change', () => loadAlertEvents());
+  $('alert-events-refresh').addEventListener('click', () => loadAlertEvents());
+  $('alert-body').addEventListener('click', (e) => {
+    const b = e.target.closest('button[data-action]');
+    if (!b) return;
+    const id = Number(b.dataset.id);
+    if (b.dataset.action === 'alert-edit') openAlertModal(alertRules.find((x) => x.id === id));
+    else if (b.dataset.action === 'alert-test') {
+      fetch(API + '/alerts/test', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id }),
+      }).then((r) => r.json()).then((d) => {
+        const dl = d.delivered || {};
+        const ok = Object.values(dl).some((x) => x && x.ok);
+        const detail = Object.entries(dl).map(([k, v]) => `${k === 'fnos' ? '系统通知' : k} ${v.ok ? '成功' : '失败（' + (v.error || '') + '）'}`).join('，');
+        toast((ok ? '测试通知已发出：' : '发送失败：') + detail, ok ? 'ok' : 'error');
+        loadAlertEvents();
+      }).catch((err) => toast('测试失败：' + err.message, 'error'));
+    } else if (b.dataset.action === 'alert-del') deleteAlert(id);
+  });
+
+  // ── 日志弹窗 ──
+  $('log-close').addEventListener('click', closeLog);
+  $('log-refresh').addEventListener('click', loadLog);
+  $('log-lines').addEventListener('change', loadLog);
+  $('log-priority').addEventListener('change', loadLog);
+  $('log-grep').addEventListener('keydown', (e) => { if (e.key === 'Enter') loadLog(); });
+  $('log-mask').addEventListener('click', (e) => { if (e.target === $('log-mask')) closeLog(); });
+
   // 一级 tab 切换
   $('tabs').addEventListener('click', (e) => {
     const b = e.target.closest('.tab');
@@ -1253,8 +1638,12 @@ function bindEvents() {
     if (tr) openDetail(Number(tr.dataset.pid));
   });
 
-  // 服务视图：启动 / 停止 / 重启
+  // 服务视图：启动 / 停止 / 重启 / 看日志 / 改开机自启
   $('svcbody').addEventListener('click', (e) => {
+    const logB = e.target.closest('button[data-action="svc-log"]');
+    if (logB) { e.stopPropagation(); openLog(logB.dataset.unit); return; }
+    const enB = e.target.closest('button[data-action="svc-enable"]');
+    if (enB) { e.stopPropagation(); if (!enB.disabled) doServiceEnable(enB.dataset.unit, enB.dataset.enable === '1'); return; }
     const b = e.target.closest('button[data-action="service"]');
     if (!b || b.disabled) return;
     e.stopPropagation();

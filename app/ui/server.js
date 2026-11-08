@@ -9,7 +9,7 @@
 //   · cmdline / io 是较贵的读（每进程一个文件），用 TTL 缓存：
 //     cmdline 10s、io 5s，详情页则强制刷新。
 //   · 所有 /proc 读取都 try/catch：进程在扫描过程中消失是常态，不能因此 500。
-import { readFileSync, readdirSync, existsSync, unlinkSync, statSync, readlinkSync, mkdirSync, appendFileSync, writeFileSync } from 'node:fs';
+import { readFileSync, readdirSync, existsSync, unlinkSync, statSync, statfsSync, readlinkSync, mkdirSync, appendFileSync, writeFileSync } from 'node:fs';
 import { join, dirname, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createServer } from 'node:http';
@@ -18,6 +18,8 @@ import { promisify } from 'node:util';
 import { gzipSync } from 'node:zlib';
 import { openAuditStore } from './audit-db.js';
 import { openHistoryStore } from './history-db.js';
+import { openAlertStore, METRICS, LEVEL_LABEL } from './alert-db.js';
+import { createAlertEngine, readPsiMem, diskUsedPct } from './alerts.js';
 
 const UI_DIR = dirname(fileURLToPath(import.meta.url));
 const TARGET_DIR = dirname(UI_DIR);
@@ -28,7 +30,7 @@ const PORT = parseInt(process.env.PORT || '47951', 10);
 const SOCK_DIR = process.env.FNPROC_SOCK_DIR || TARGET_DIR;
 const SOCK_PATH = join(SOCK_DIR, 'fnproc.sock');
 const GATEWAY_PREFIX = '/app/fnproc';
-const VERSION = '0.2.1';
+const VERSION = '0.3.0';
 const SAMPLE_MS = 1000;
 const HISTORY_MAX = 120;              // 内存里保留 120 个采样点，够前端画满图
 
@@ -39,6 +41,8 @@ const execFileP = promisify(execFile);
 const readOr = (p, dflt = '') => { try { return readFileSync(p, 'utf8'); } catch { return dflt; } };
 const num = (v) => { const n = Number(v); return Number.isFinite(n) ? n : 0; };
 const r1 = (v) => Math.round(v * 10) / 10;
+// 注意：必须放在 readOr 之后 —— 放前面会踩 TDZ（Cannot access 'readOr' before initialization）
+const HOST_NAME = readOr('/proc/sys/kernel/hostname').trim();
 
 function sendJSON(res, code, obj) {
   const buf = Buffer.from(JSON.stringify(obj));
@@ -735,6 +739,66 @@ function ensureFreshProcs(maxAgeMs = 1200) {
   }
 }
 
+// 只认 /proc/mounts 里真实挂载的卷根（/vol1、/vol2…）。
+// 直接用 readdir('/') 会把 /vol00 这种「外接存储空壳目录」也算进来 ——
+// 它没挂设备时 statfs 报的是根分区，会让「磁盘占用」告警盯错对象。
+function volumeMounts() {
+  const out = [];
+  const seen = new Set();
+  for (const line of readOr('/proc/mounts').split('\n')) {
+    const f = line.split(/\s+/);
+    if (f.length < 4) continue;
+    const mount = f[1];
+    if (!/^\/vol\d+$/.test(mount) || seen.has(mount)) continue;
+    seen.add(mount);
+    out.push(mount);
+  }
+  return out;
+}
+
+// PSI（进程压力）与各卷用量：几秒才变一次，5 秒采一次就够，不必挤进 1 秒主循环。
+// PSI 比 CPU% 更能回答「机器为什么卡」——它统计的是进程真正在等资源的时间。
+const volumes = { at: 0, list: [] };
+const psi = { at: 0, cpu: 0, mem: 0, io: 0 };
+
+function readPsi(file) {
+  const raw = readOr(`/proc/pressure/${file}`);
+  const line = raw.split('\n').find((l) => l.startsWith('some')) || '';
+  const m = line.match(/avg60=([\d.]+)/) || line.match(/avg10=([\d.]+)/);
+  return m ? Number(m[1]) : 0;
+}
+
+function refreshVolumes() {
+  const now = Date.now();
+  if (now - volumes.at < 5000) return;
+  volumes.at = now;
+  psi.cpu = readPsi('cpu');
+  psi.mem = readPsi('memory');
+  psi.io = readPsi('io');
+  psi.at = now;
+  const list = [];
+  for (const mount of volumeMounts()) {
+    try {
+      const st = statfsSync(mount);
+      const total = st.blocks * st.bsize;
+      if (!total) continue;
+      const free = st.bfree * st.bsize;
+      const avail = st.bavail * st.bsize;
+      list.push({
+        mount,
+        total,
+        used: total - free,
+        avail,
+        usedPct: Math.round(((total - free) / total) * 1000) / 10,
+        inodesTotal: st.files,
+        inodesFree: st.ffree,
+        inodesUsedPct: st.files ? Math.round(((st.files - st.ffree) / st.files) * 1000) / 10 : 0,
+      });
+    } catch { /* 未挂载 / 无权限 */ }
+  }
+  volumes.list = list;
+}
+
 function tick() {
   const now = Date.now();
   const dtSec = Math.max(0.2, (now - lastSampleAt) / 1000);
@@ -742,6 +806,7 @@ function tick() {
   sampleCpu();
   sampleMem();
   sampleLoad();
+  refreshVolumes();                    // 内部 5 秒自节流
   sampleIo(dtSec);
   sampleNet(dtSec);
   // 全量扫 /proc（每个进程一个 stat 文件）是本项目最大的 CPU 开销：
@@ -767,6 +832,16 @@ function tick() {
     tx: state.net.txBps,
   });
   if (history.length > HISTORY_MAX) history.shift();
+  // 告警判定用的就是这份已采好的数据，不再额外扫 /proc
+  alertEngine.setContext({
+    cpu: state.cpu.totalPct,
+    mem: state.mem.usedPct,
+    swap: state.swap.usedPct,
+    procs,
+    procTotal: state.procTotal,
+    units: unitsCache.list,
+    host: HOST_NAME,
+  });
   broadcast();
 }
 
@@ -885,6 +960,53 @@ setInterval(() => {
   if (removed > 0) console.log(`[history] 清理过期采样 ${removed} 行`);
 }, 3600 * 1000);
 
+// ── 告警 ────────────────────────────────────────────────────────────────
+// 规则与事件都落 SQLite（alerts.db）；判定每 5 秒一轮，只用已采好的数据。
+const ALERT_DB = join(DATA_DIR, 'alerts.db');
+const alertStore = openAlertStore(ALERT_DB, { version: VERSION });
+const alertEngine = createAlertEngine({
+  store: alertStore,
+  version: VERSION,
+  log: console.log,
+  getUnits: async () => listUnits(),
+});
+if (alertStore.enabled) {
+  const st = alertStore.stats();
+  console.log(`[alert] 告警库已启用: ${ALERT_DB} 规则=${st.rules}（启用 ${st.enabled}）事件=${st.events}`);
+  // 首次运行给几条有意义的默认规则（阈值偏保守、持续时间长，避免抖动误报）。
+  // 不想要可以在「告警」页删掉或关掉。
+  if (st.rules === 0) {
+    const seeds = [
+      { name: 'CPU 持续过高', metric: 'cpu', op: '>', threshold: 90, durationSec: 180, cooldownSec: 900, level: 1 },
+      { name: '内存持续过高', metric: 'mem', op: '>', threshold: 85, durationSec: 300, cooldownSec: 900, level: 1 },
+      { name: 'Swap 使用过高', metric: 'swap', op: '>', threshold: 60, durationSec: 600, cooldownSec: 1800, level: 1 },
+      { name: '发生 OOM', metric: 'oom', op: '>', threshold: 0, durationSec: 0, cooldownSec: 3600, level: 2 },
+    ];
+    // 磁盘：挑当前占用最高的卷，超过 90% 才报
+    let worst = null;
+    try {
+      for (const mount of volumeMounts()) {
+        const pct = diskUsedPct(mount);
+        if (pct != null && (!worst || pct > worst.pct)) worst = { mount, pct };
+      }
+    } catch { /* 忽略 */ }
+    if (worst) {
+      seeds.push({
+        name: `磁盘占用过高（${worst.mount}）`, metric: 'disk', op: '>', threshold: 90,
+        durationSec: 600, cooldownSec: 3600, level: 1, target: worst.mount,
+      });
+    }
+    let n = 0;
+    for (const s of seeds) {
+      const r = alertStore.saveRule({ enabled: true, notifyFn: true, webhook: '', target: '', ...s });
+      if (r.ok) n += 1;
+    }
+    console.log(`[alert] 已播种 ${n} 条默认规则（阈值可在界面上改）`);
+  }
+} else {
+  console.error('[alert] 告警库打开失败:', alertStore.health().error);
+}
+
 // 记录一条操作。在回 HTTP 响应之前调用 —— 客户端看到成功，就等于库里已有这条记录。
 function auditRecord({ action, target = '', result = 'ok', message = '', client = '', detail = {} }) {
   const id = auditStore.record({ action, target, result, message, client, detail });
@@ -969,17 +1091,17 @@ const PROTECTED_UNITS = new Set([
   'networking.service', 'NetworkManager.service', 'cron.service',
 ]);
 
-let unitsInflight = false;
-let unitsFirstLoad = null;      // 首次没有任何缓存时的等待 promise
+// 并发调用共享同一个在途 promise。
+// 早期写法是「在途时直接返回缓存」，但首次加载时缓存还是空的 ——
+// 页面切到服务页会同时触发两次请求，第二次拿到空数组，表格就一片空白。
+let unitsWait = null;
 
 async function listUnits(force = false) {
-  if (!force && Date.now() - unitsCache.at < 5000) return unitsCache.list;
-  // 已经有一次在跑：先返回旧结果，别排队等 systemctl（它可能要几百毫秒到几秒）
-  if (unitsInflight) return unitsCache.list;
-  if (unitsFirstLoad) return unitsFirstLoad;
+  // 缓存有效且非空才直接返回：空结果不当作有效缓存
+  if (!force && unitsCache.list.length && Date.now() - unitsCache.at < 5000) return unitsCache.list;
+  if (unitsWait) return unitsWait;                 // 有人正在拉：一起等同一个结果
 
-  const run = (async () => {
-    unitsInflight = true;
+  unitsWait = (async () => {
     const list = [];
     try {
       const { stdout } = await execFileP('systemctl',
@@ -993,21 +1115,29 @@ async function listUnits(force = false) {
         const [name, load, active, sub] = f;
         if (!name.endsWith('.service')) continue;
         const desc = t.slice(t.indexOf(sub, name.length + load.length + active.length) + sub.length).trim();
-        list.push({ name, load, active, sub, desc, protected: PROTECTED_UNITS.has(name) });
+        list.push({ name, load, active, sub, desc, protected: PROTECTED_UNITS.has(name), enabledState: '' });
       }
+      // 开机自启状态（enabled / disabled / static …）：列表里没有，得单独问一次
+      try {
+        const uf = await execFileP('systemctl',
+          ['list-unit-files', '--type=service', '--no-legend', '--no-pager', '--plain'],
+          { timeout: 6000, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
+        const map = new Map();
+        for (const line of String(uf.stdout || '').split('\n')) {
+          const f = line.trim().split(/\s+/);
+          if (f.length >= 2 && f[0].endsWith('.service')) map.set(f[0], f[1]);
+        }
+        for (const u of list) u.enabledState = map.get(u.name) || '';
+      } catch { /* 拿不到就留空，不影响列表 */ }
       unitsCache = { at: Date.now(), list };
     } catch {
       /* 非 systemd / 无权限：保留上一次的缓存（宁可显示旧数据，也不清空成「没有服务」） */
       unitsCache = { at: Date.now(), list: unitsCache.list };
-    } finally {
-      unitsInflight = false;
-      unitsFirstLoad = null;
     }
     return unitsCache.list;
-  })();
+  })().finally(() => { unitsWait = null; });
 
-  if (!unitsCache.list.length) unitsFirstLoad = run;   // 第一次必须等结果
-  return run;
+  return unitsWait;
 }
 
 const SERVICE_ACTIONS = new Set(['start', 'stop', 'restart']);
@@ -1065,8 +1195,11 @@ async function handle(req, res, pathname, query) {
   if (pathname === '/api/overview') {
     sendJSON(res, 200, {
       ...snapshot(10),
-      core: state.cpu.cores,
-      host: { name: readOr('/proc/sys/kernel/hostname').trim(), kernel: readOr('/proc/sys/kernel/osrelease').trim() },
+        core: state.cpu.cores,
+        host: { name: HOST_NAME, kernel: readOr('/proc/sys/kernel/osrelease').trim() },
+        psi: { cpu: psi.cpu, mem: psi.mem, io: psi.io, at: psi.at },
+        volumes: volumes.list,
+        alerts: alertEngine.snapshot(),
     });
     return;
   }
@@ -1330,6 +1463,140 @@ async function handle(req, res, pathname, query) {
     return;
   }
 
+  // ── 告警：规则与事件 ────────────────────────────────────────────────────
+  if (pathname === '/api/alerts' && req.method === 'GET') {
+    sendJSON(res, 200, {
+      rules: alertStore.listRules(),
+      stats: alertStore.stats(),
+      health: alertStore.health(),
+      metrics: METRICS,
+      levels: LEVEL_LABEL,
+      live: alertEngine.snapshot(),          // 当前各规则的实测值与是否正在违规
+      lastEvalAt: alertEngine.lastEvalAt(),
+    });
+    return;
+  }
+
+  if (pathname === '/api/alerts' && req.method === 'POST') {
+    const body = await parseBody(req);
+    const r = alertStore.saveRule(body);
+    if (!r.ok) { sendJSON(res, 400, { error: r.error }); return; }
+    auditRecord({ action: 'alert.save', target: String(r.id), result: 'ok', message: `${body.id ? '更新' : '新建'}规则 ${body.name || ''}`, client: clientOf(req) });
+    sendJSON(res, 200, { success: true, id: r.id });
+    return;
+  }
+
+  if (pathname === '/api/alerts/delete' && req.method === 'POST') {
+    const body = await parseBody(req);
+    if (body.confirm !== true) { sendJSON(res, 400, { error: '需要 confirm: true' }); return; }
+    const id = num(body.id);
+    const r = alertStore.deleteRule(id);
+    if (!r.ok) { sendJSON(res, 400, { error: r.error }); return; }
+    auditRecord({ action: 'alert.delete', target: String(id), result: 'ok', message: `删除规则 #${id}`, client: clientOf(req) });
+    sendJSON(res, 200, { success: true, removed: r.removed });
+    return;
+  }
+
+  if (pathname === '/api/alerts/events') {
+    const limit = Math.min(1000, Math.max(1, num(query.get('limit')) || 100));
+    const offset = Math.max(0, num(query.get('offset')) || 0);
+    const level = query.get('level') == null ? '' : String(query.get('level'));
+    const ruleId = num(query.get('ruleId')) || 0;
+    sendJSON(res, 200, { ...alertStore.listEvents({ limit, offset, level, ruleId }), limit, offset });
+    return;
+  }
+
+  // 发一条测试通知（不写 last_fired、不影响冷却）
+  if (pathname === '/api/alerts/test' && req.method === 'POST') {
+    const body = await parseBody(req);
+    const id = num(body.id);
+    let rule = alertStore.listRules().find((x) => x.id === id);
+    if (!rule && body.rule) rule = { ...body.rule, id: 0, lastFired: 0 };
+    if (!rule) { sendJSON(res, 404, { error: '规则不存在' }); return; }
+    const out = await alertEngine.test(rule, Number(body.value) || 0);
+    auditRecord({
+      action: 'alert.test', target: String(rule.id || 0), result: 'ok',
+      message: `测试告警 ${rule.name}`, client: clientOf(req),
+      detail: { delivered: out.delivered },
+    });
+    sendJSON(res, 200, { success: true, ...out });
+    return;
+  }
+
+  // ── journal 日志 ────────────────────────────────────────────────────────
+  // 看服务为什么 failed 必须能看到它的日志，不能逼用户去 SSH 敲 journalctl。
+  if (pathname === '/api/journal') {
+    const unit = String(query.get('unit') || '').trim();
+    const lines = Math.min(1000, Math.max(10, num(query.get('lines')) || 200));
+    const prio = String(query.get('priority') || '').trim();
+    const grep = String(query.get('q') || '').trim().slice(0, 80);
+    if (unit && !UNIT_RE.test(unit)) { sendJSON(res, 400, { error: '单元名不合法' }); return; }
+    const args = ['--no-pager', '--utc', '-o', 'short-iso'];
+    if (unit) args.push('-u', unit);
+    if (/^[0-7]$/.test(prio)) args.push('-p', prio);
+    if (grep) args.push('--grep', grep);
+    args.push('-n', String(lines));
+    try {
+      const { stdout } = await execFileP('journalctl', args, { timeout: 8000, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
+      const text = String(stdout || '');
+      const rows = text.split('\n').filter(Boolean).slice(-lines);
+      sendJSON(res, 200, { unit: unit || null, count: rows.length, lines: rows });
+    } catch (e) {
+      sendJSON(res, 500, { error: String(e.stderr || e.message || e).trim().split('\n')[0].slice(0, 200) });
+    }
+    return;
+  }
+
+  // ── systemd 定时器 ──────────────────────────────────────────────────────
+  if (pathname === '/api/timers') {
+    try {
+      const { stdout } = await execFileP('systemctl',
+        ['list-timers', '--all', '--no-pager', '--plain', '--no-legend'],
+        { timeout: 6000, encoding: 'utf8', maxBuffer: 4 * 1024 * 1024 });
+      const timers = [];
+      for (const line of String(stdout || '').split('\n')) {
+        const t = line.trim();
+        if (!t) continue;
+        // 形如：Mon 2026-11-10 04:00:00 CST  11h left  Sun ...  hermes.timer  hermes.service
+        const m = t.match(/([A-Za-z0-9@._:\\-]+\.timer)\s+([A-Za-z0-9@._:\\-]+\.(?:service|target))?\s*$/);
+        if (!m) continue;
+        timers.push({ raw: t, name: m[1], activates: m[2] || '' });
+      }
+      sendJSON(res, 200, { count: timers.length, timers });
+    } catch (e) {
+      sendJSON(res, 500, { error: String(e.stderr || e.message || e).trim().split('\n')[0].slice(0, 200) });
+    }
+    return;
+  }
+
+  // 启用 / 禁用开机自启（与 start/stop 分开：这是改配置，不是改运行状态）
+  if (pathname === '/api/service/enable' && req.method === 'POST') {
+    const body = await parseBody(req);
+    const name = String(body.name || '').trim();
+    const enable = body.enable !== false;
+    const client = clientOf(req);
+    const tag = enable ? 'service.enable' : 'service.disable';
+    const reject = (msg) => {
+      auditRecord({ action: tag, target: name, result: 'rejected', message: msg, client });
+      sendJSON(res, 400, { error: msg });
+    };
+    if (!UNIT_RE.test(name)) return reject('服务名不合法');
+    if (!enable && PROTECTED_UNITS.has(name)) return reject(`${name} 属于关键服务，禁止禁用（会导致失联或系统不可用）`);
+    if (body.confirm !== true) return reject('需要 confirm: true 才会执行');
+    try {
+      await execFileP('systemctl', [enable ? 'enable' : 'disable', name],
+        { timeout: 20000, encoding: 'utf8', maxBuffer: 2 * 1024 * 1024 });
+      unitsCache.at = 0;
+      auditRecord({ action: tag, target: name, result: 'ok', message: `${enable ? '启用' : '禁用'} ${name}`, client });
+      sendJSON(res, 200, { success: true, name, enable });
+    } catch (e) {
+      const msg = String(e.stderr || e.message || e).trim().split('\n').slice(0, 2).join(' ').slice(0, 200);
+      auditRecord({ action: tag, target: name, result: 'error', message: msg || 'systemctl 执行失败', client });
+      sendJSON(res, 400, { error: msg || 'systemctl 执行失败' });
+    }
+    return;
+  }
+
   // 操作审计：从 SQLite 分页查，支持按动作 / 结果 / 关键字过滤
   if (pathname === '/api/audit') {
     const limit = num(query.get('limit')) || 50;
@@ -1405,6 +1672,7 @@ setInterval(() => {
 // 先跑一轮采样，避免首屏全是 0（进程 CPU% 需要两次采样才有意义）
 tick();
 setInterval(tick, SAMPLE_MS);
+alertEngine.start(5000);        // 告警判定每 5 秒一轮，只用已采好的数据
 
 // 应用自身的启停也进审计 —— 这样「谁在什么时候重启过这个应用」也查得到
 auditRecord({

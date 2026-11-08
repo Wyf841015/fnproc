@@ -1,0 +1,272 @@
+// app/ui/alerts.js — 告警判定与通知投递
+//
+// 设计要点：
+//   · 判定每 5 秒跑一轮，全部基于「已经采好的」数据（CPU/内存/Swap/进程列表），
+//     不再额外扫 /proc —— 告警不应该成为新的性能负担
+//   · 每条规则维护自己的「持续违规起点」：只有连续违规超过 durationSec 才触发，
+//     避免一次瞬时抖动就打一条通知
+//   · 触发后进入冷却（cooldownSec），不会每 5 秒刷屏
+//   · 通知投递结果逐通道记录（成功 / 失败原因），写进事件表；「为什么没收到」
+//     必须能查，不能只留一句「已触发」
+//   · 所有对外动作（psql、webhook）都带超时，失败只记录不抛出，
+//     告警子系统绝不能把监控主功能拖下水
+
+import { readFileSync, statfsSync } from 'node:fs';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+
+const execFileP = promisify(execFile);
+
+// psql 里拼字面量：单引号翻倍是唯一需要的转义，同时去掉 \0 与控制字符
+function sqlLit(s) {
+  return "'" + String(s == null ? '' : s)
+    .replace(/\0/g, '')
+    .replace(/[\u0001-\u0008\u000b\u000c\u000e-\u001f]/g, '')
+    .replace(/'/g, "''") + "'";
+}
+
+export function readPsiMem() {
+  try {
+    const raw = readFileSync('/proc/pressure/memory', 'utf8');
+    const line = raw.split('\n').find((l) => l.startsWith('some')) || '';
+    const m = line.match(/avg10=([\d.]+)/);
+    return m ? Number(m[1]) : 0;
+  } catch { return 0; }
+}
+
+export function diskUsedPct(mount) {
+  try {
+    const st = statfsSync(mount);
+    const total = st.blocks * st.bsize;
+    if (!total) return null;
+    const avail = (st.bfree || 0) * st.bsize;
+    return ((total - avail) / total) * 100;
+  } catch { return null; }
+}
+
+function readOomKillCount() {
+  try {
+    for (const line of readFileSync('/proc/vmstat', 'utf8').split('\n')) {
+      if (line.startsWith('oom_kill ')) return Number(line.split(/\s+/)[1]) || 0;
+    }
+  } catch { /* 忽略 */ }
+  return 0;
+}
+
+export function createAlertEngine({ store, version = '', log = console.log, getUnits = null }) {
+  const breachSince = new Map();      // ruleId → 首次违规时间
+  const state = new Map();            // ruleId → 当前值（给前端展示）
+  let prevOom = readOomKillCount();
+  let timer = null;
+  let lastEvalAt = 0;
+  let ctx = { cpu: 0, mem: 0, swap: 0, procs: [], procTotal: 0 };
+  let delivering = false;
+
+  // 供 /api/overview 等地方取「当前有没有告警在持续」
+  function snapshot() {
+    const out = [];
+    for (const rule of store.listRules()) {
+      if (!rule.enabled) continue;
+      const s = state.get(rule.id);
+      if (!s) continue;
+      out.push({
+        id: rule.id, name: rule.name, metric: rule.metric,
+        value: s.value, breaching: s.breaching,
+        sinceMs: s.sinceMs || 0, firedAt: rule.lastFired || 0,
+      });
+    }
+    return out;
+  }
+
+  function valueOf(rule) {
+    switch (rule.metric) {
+      case 'cpu': return ctx.cpu;
+      case 'mem': return ctx.mem;
+      case 'swap': return ctx.swap;
+      case 'disk': return diskUsedPct(rule.target);
+      case 'psi_mem': return readPsiMem();
+      case 'oom': {
+        const now = readOomKillCount();
+        const delta = Math.max(0, now - prevOom);
+        prevOom = now;
+        return delta;
+      }
+      case 'proc_missing': {
+        const t = String(rule.target || '').trim();
+        if (!t) return null;
+        if (/^\d+$/.test(t)) {
+          const pid = Number(t);
+          const hit = ctx.procs.some((p) => p.pid === pid);
+          return hit ? 0 : 1;               // 1 = 缺失
+        }
+        const key = t.toLowerCase();
+        const hit = ctx.procs.some((p) => (p.name || '').toLowerCase() === key
+          || (p.cmd || '').toLowerCase().includes(key));
+        return hit ? 0 : 1;
+      }
+      case 'unit_failed': {
+        if (!Array.isArray(ctx.units)) return null;
+        const u = ctx.units.find((x) => x.name === rule.target);
+        if (!u) return null;
+        return (u.active === 'failed' || u.sub === 'failed') ? 1 : 0;
+      }
+      default: return null;
+    }
+  }
+
+  function breached(rule, v) {
+    switch (rule.metric) {
+      case 'proc_missing': return v === 1;
+      case 'unit_failed': return v === 1;
+      case 'oom': return v > 0;
+      default:
+        if (rule.op === '<') return v < rule.threshold;
+        if (rule.op === '==') return Math.abs(v - rule.threshold) < 0.01;
+        return v > rule.threshold;
+    }
+  }
+
+  function messageFor(rule, v) {
+    const who = rule.target ? `（${rule.target}）` : '';
+    switch (rule.metric) {
+      case 'proc_missing': return `进程缺失：找不到 ${rule.target}${who}`;
+      case 'unit_failed': return `服务异常：${rule.target} 处于 failed 状态`;
+      case 'oom': return `发生了 ${v} 次 OOM 杀进程（内存不足）`;
+      case 'disk': return `磁盘 ${rule.target} 使用率 ${v.toFixed(1)}%`;
+      case 'psi_mem': return `内存压力 PSI ${v.toFixed(1)}%（进程在等内存回收）`;
+      case 'swap': return `Swap 使用率 ${v.toFixed(1)}%`;
+      case 'mem': return `内存使用率 ${v.toFixed(1)}%`;
+      case 'cpu': return `CPU 使用率 ${v.toFixed(1)}%`;
+      default: return `${rule.metric} = ${v}`;
+    }
+  }
+
+  // ── 通知投递 ────────────────────────────────────────────────────────────
+  // fnOS 桌面通知：直接写 trim.notify + trim.notify_user（官方通知表）
+  async function deliverFnos(rule, message) {
+    const title = `进程管家：${rule.name}`;
+    const content = message.slice(0, 2000);
+    const sql = `
+WITH n AS (
+  INSERT INTO notify (cat, level, title, source, content, dateandtime)
+  VALUES (0, ${Number(rule.level) || 0}, ${sqlLit(title.slice(0, 250))}, 'fnproc',
+          ${sqlLit(content)}, extract(epoch from now())::bigint)
+  RETURNING id
+)
+INSERT INTO notify_user (uid, notify_id, read)
+SELECT uid, id, 0 FROM users, n;`.trim();
+    try {
+      await execFileP('psql', ['-U', 'postgres', '-d', 'trim', '-v', 'ON_ERROR_STOP=1', '-c', sql],
+        { timeout: 8000, encoding: 'utf8', maxBuffer: 1024 * 1024 });
+      return { ok: true };
+    } catch (e) {
+      const msg = String(e.stderr || e.message || e).trim().split('\n')[0].slice(0, 200);
+      return { ok: false, error: msg || 'psql 执行失败' };
+    }
+  }
+
+  async function deliverWebhook(rule, message) {
+    const url = String(rule.webhook || '').trim();
+    if (!/^https?:\/\//i.test(url)) return { ok: false, error: 'Webhook 必须是 http(s) 地址' };
+    const ac = new AbortController();
+    const to = setTimeout(() => ac.abort(), 6000);
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          source: 'fnproc',
+          rule: { id: rule.id, name: rule.name, metric: rule.metric, level: rule.level },
+          message,
+          host: ctx.host || '',
+          ts: Date.now(),
+          version,
+        }),
+        signal: ac.signal,
+      });
+      return res.ok ? { ok: true, status: res.status } : { ok: false, error: `HTTP ${res.status}` };
+    } catch (e) {
+      return { ok: false, error: e.name === 'AbortError' ? '超时（6 秒）' : String(e.message || e).slice(0, 160) };
+    } finally {
+      clearTimeout(to);
+    }
+  }
+
+  async function fire(rule, value, { test = false } = {}) {
+    const message = test ? `［测试］${messageFor(rule, value)}` : messageFor(rule, value);
+    const delivered = {};
+    if (rule.notifyFn) delivered.fnos = await deliverFnos(rule, message);
+    if (rule.webhook) delivered.webhook = await deliverWebhook(rule, message);
+    if (!rule.notifyFn && !rule.webhook) delivered.none = { ok: false, error: '未启用任何通知通道' };
+
+    const ts = Date.now();
+    const id = store.addEvent({
+      ts, ruleId: rule.id, ruleName: rule.name, metric: rule.metric,
+      value: Number(value) || 0, level: rule.level, message, delivered,
+    });
+    if (!test) store.touchFired(rule.id, ts);
+    const allFailed = Object.values(delivered).every((d) => !d.ok);
+    log(`[alert] ${test ? 'TEST ' : ''}${rule.name} → ${message} | 投递 ${allFailed ? '失败' : '成功'} ${JSON.stringify(delivered)}`);
+    return { id, ts, message, delivered };
+  }
+
+  // ── 判定主循环 ──────────────────────────────────────────────────────────
+  async function evaluate() {
+    if (!store.enabled || delivering) return;
+    delivering = true;
+    lastEvalAt = Date.now();
+    try {
+      // systemd 单元状态按需补一次（有 unit_failed 规则时）
+      const rules = store.listRules().filter((r) => r.enabled);
+      const needUnits = rules.some((r) => r.metric === 'unit_failed');
+      if (needUnits && typeof getUnits === 'function') {
+        try { ctx.units = await getUnits(); } catch { /* 用上次的 */ }
+      }
+
+      for (const rule of rules) {
+        const v = valueOf(rule);
+        if (v == null || !Number.isFinite(v)) { continue; }
+        const hit = breached(rule, v);
+        const since = breachSince.get(rule.id);
+        if (!hit) {
+          breachSince.delete(rule.id);
+          state.set(rule.id, { value: v, breaching: false, sinceMs: 0 });
+          continue;
+        }
+        if (!since) breachSince.set(rule.id, Date.now());
+        const startMs = breachSince.get(rule.id) || Date.now();
+        const heldMs = Date.now() - startMs;
+        state.set(rule.id, { value: v, breaching: true, sinceMs: startMs });
+        const needMs = Math.max(0, rule.durationSec) * 1000;
+        const cooled = Date.now() - (rule.lastFired || 0) >= Math.max(30, rule.cooldownSec) * 1000;
+        if (heldMs >= needMs && cooled) {
+          await fire(rule, v);
+          state.set(rule.id, { value: v, breaching: true, sinceMs: startMs });
+        }
+      }
+    } catch (e) {
+      log('[alert] 判定异常: ' + (e.message || e));
+    } finally {
+      delivering = false;
+    }
+  }
+
+  return {
+    start(intervalMs = 5000) {
+      if (timer) return;
+      timer = setInterval(() => { evaluate().catch(() => {}); }, intervalMs);
+      if (timer.unref) timer.unref();
+      log(`[alert] 告警引擎已启动（每 ${intervalMs / 1000} 秒判定一次，规则 ${store.listRules().filter((r) => r.enabled).length} 条）`);
+    },
+    stop() { if (timer) { clearInterval(timer); timer = null; } },
+    setContext(next) { ctx = next; },
+    evaluate,
+    snapshot,
+    lastEvalAt: () => lastEvalAt,
+    // 测试投递：不写 last_fired，不影响冷却
+    async test(rule, value = 0) {
+      return fire(rule, value, { test: true });
+    },
+    fire,
+  };
+}

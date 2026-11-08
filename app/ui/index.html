@@ -6,7 +6,7 @@
 <base href="/app/fnproc/">
 <title>进程管家 · fnproc</title>
 <link rel="icon" href="images/icon_64.png">
-<link rel="stylesheet" href="styles/app.css?v=0.2.1">
+<link rel="stylesheet" href="styles/app.css?v=0.3.0">
 </head>
 <body>
 <div class="app">
@@ -90,6 +90,9 @@
     </button>
     <button class="tab" data-tab="services" type="button" role="tab">
       <span class="tab-icon">🛠</span><span class="tab-text">服务</span><span class="tab-badge" id="badge-services">—</span>
+    </button>
+    <button class="tab" data-tab="alerts" type="button" role="tab">
+      <span class="tab-icon">🔔</span><span class="tab-text">告警</span><span class="tab-badge" id="badge-alerts">—</span>
     </button>
     <button class="tab" data-tab="audit" type="button" role="tab">
       <span class="tab-icon">📝</span><span class="tab-text">记录</span>
@@ -290,6 +293,81 @@
           <tbody id="svcbody"></tbody>
         </table>
         <div class="empty" id="services-empty" hidden>没有匹配的服务</div>
+        </div>
+        </article>
+        <article class="card">
+        <details class="timers-block">
+        <summary><h2>定时器（systemd timer）</h2><span class="hint" id="timers-hint">—</span></summary>
+        <div class="table-wrap">
+          <table class="ptable">
+            <thead><tr><th>定时器</th><th>触发的服务</th><th class="hide-sm">下次 / 上次</th></tr></thead>
+            <tbody id="timers-body"></tbody>
+          </table>
+          <div class="empty" id="timers-empty" hidden>没有定时器</div>
+        </div>
+        </details>
+        </article>
+        </section>
+
+  <!-- ── 告警 ── -->
+  <section class="tab-panel" id="panel-alerts" role="tabpanel" hidden>
+    <article class="card">
+      <div class="card-head panel-head">
+        <h2>告警规则</h2>
+        <div class="procs-tools">
+          <span class="hint" id="alerts-hint">—</span>
+          <button class="btn" id="alert-add" type="button">＋ 新建规则</button>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table class="ptable">
+          <thead>
+            <tr>
+              <th class="num">#</th>
+              <th>名称</th>
+              <th>判据</th>
+              <th class="num">阈值</th>
+              <th class="num hide-sm">持续</th>
+              <th class="num hide-sm">冷却</th>
+              <th class="hide-md">通知</th>
+              <th>状态</th>
+              <th class="num hide-sm">上次触发</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="alert-body"></tbody>
+        </table>
+        <div class="empty" id="alerts-empty" hidden>还没有告警规则，点右上角「新建规则」加一条</div>
+      </div>
+    </article>
+
+    <article class="card">
+      <div class="card-head panel-head">
+        <h2>告警事件</h2>
+        <div class="procs-tools">
+          <select id="alert-level-filter" title="按级别筛选">
+            <option value="">全部级别</option>
+            <option value="0">普通</option>
+            <option value="1">警告</option>
+            <option value="2">严重</option>
+          </select>
+          <button class="btn ghost" id="alert-events-refresh" type="button">刷新</button>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table class="ptable">
+          <thead>
+            <tr>
+              <th class="num">时间</th>
+              <th>级别</th>
+              <th>规则</th>
+              <th>内容</th>
+              <th class="hide-sm">投递</th>
+            </tr>
+          </thead>
+          <tbody id="alert-events"></tbody>
+        </table>
+        <div class="empty" id="alert-events-empty" hidden>还没有触发记录</div>
       </div>
     </article>
   </section>
@@ -391,6 +469,64 @@
   </div>
 </aside>
 
+<!-- 告警规则编辑 -->
+<div class="modal-mask" id="alert-mask" hidden>
+  <div class="modal wide" role="dialog" aria-modal="true" aria-label="告警规则">
+    <h3 id="alert-modal-title">新建告警规则</h3>
+    <div class="alert-form">
+      <label class="fld"><span>名称</span><input id="af-name" type="text" maxlength="60" placeholder="例如：内存持续过高"></label>
+      <label class="fld"><span>判据</span><select id="af-metric"></select></label>
+      <label class="fld" id="af-threshold-wrap"><span>阈值</span><input id="af-threshold" type="number" step="0.1" value="90"></label>
+      <label class="fld" id="af-target-wrap" hidden><span id="af-target-label">目标</span><input id="af-target" type="text" maxlength="200" placeholder=""></label>
+      <label class="fld"><span>持续（秒）</span><input id="af-duration" type="number" min="0" max="86400" value="180"></label>
+      <label class="fld"><span>冷却（秒）</span><input id="af-cooldown" type="number" min="30" max="86400" value="900"></label>
+      <label class="fld"><span>级别</span>
+        <select id="af-level">
+          <option value="0">普通</option>
+          <option value="1" selected>警告</option>
+          <option value="2">严重</option>
+        </select>
+      </label>
+      <label class="fld chk"><input id="af-enabled" type="checkbox" checked><span>启用这条规则</span></label>
+      <label class="fld chk"><input id="af-notify-fn" type="checkbox" checked><span>通过飞牛系统通知提醒</span></label>
+      <label class="fld full"><span>Webhook（可选，POST JSON）</span><input id="af-webhook" type="text" placeholder="https://example.com/hook"></label>
+    </div>
+    <p class="hint" id="af-hint">持续时间内一直超标才会提醒，触发后进入冷却期不会重复刷屏。</p>
+    <div class="modal-actions">
+      <button class="btn ghost" id="alert-cancel" type="button">取消</button>
+      <button class="btn ghost" id="alert-test" type="button">发测试通知</button>
+      <button class="btn" id="alert-save" type="button">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- 日志查看 -->
+<div class="modal-mask" id="log-mask" hidden>
+  <div class="modal wide log-modal" role="dialog" aria-modal="true" aria-label="日志">
+    <h3 id="log-title">日志</h3>
+    <div class="log-tools">
+      <select id="log-lines" title="行数">
+        <option value="100">最近 100 行</option>
+        <option value="200" selected>最近 200 行</option>
+        <option value="500">最近 500 行</option>
+        <option value="1000">最近 1000 行</option>
+      </select>
+      <select id="log-priority" title="级别">
+        <option value="">全部级别</option>
+        <option value="3">错误及以上</option>
+        <option value="4">警告及以上</option>
+        <option value="6">信息及以上</option>
+      </select>
+      <input id="log-grep" type="search" placeholder="关键字过滤（回车生效）" autocomplete="off">
+      <button class="btn ghost" id="log-refresh" type="button">刷新</button>
+    </div>
+    <pre class="log-pre" id="log-pre">加载中…</pre>
+    <div class="modal-actions">
+      <button class="btn ghost" id="log-close" type="button">关闭</button>
+    </div>
+  </div>
+</div>
+
 <!-- 确认弹窗 -->
 <div class="modal-mask" id="modal-mask" hidden>
   <div class="modal" role="dialog" aria-modal="true">
@@ -465,6 +601,6 @@
   <img id="lightbox-img" alt="二维码放大">
 </div>
 
-<script src="main.js?v=0.2.1" type="module"></script>
+<script src="main.js?v=0.3.0" type="module"></script>
 </body>
 </html>
