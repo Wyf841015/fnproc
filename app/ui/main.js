@@ -2167,6 +2167,52 @@ function bindEvents() {
     });
   }
 
+  // 调优：nice / OOM 保护 / cgroup 内存软限
+  const tuneApply = async (action, value, label) => {
+    if (!currentDetailPid) return;
+    const pid = currentDetailPid;
+    confirmModal('调整进程参数', `目标：PID ${pid}\n操作：${label}`, '确定', async () => {
+      try {
+        const r = await fetch(API + '/tune', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ pid, action, value, confirm: true }),
+        });
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+        toast(`${label} 已生效`, 'ok');
+        loadAudit();
+        openDetail(pid);
+      } catch (e) {
+        toast(`${label} 失败：` + e.message, 'error');
+      }
+    });
+  };
+  if ($('d-apply-nice')) {
+    $('d-apply-nice').addEventListener('click', () => {
+      tuneApply('renice', Number($('d-nice').value) || 0, `nice = ${Number($('d-nice').value) || 0}`);
+    });
+  }
+  if ($('d-apply-oom')) {
+    $('d-apply-oom').addEventListener('click', () => {
+      const v = Number($('d-oom').value) || 0;
+      tuneApply('oom', v, `OOM 保护 = ${v}`);
+    });
+  }
+  if ($('d-apply-cg')) {
+    $('d-apply-cg').addEventListener('click', () => {
+      const raw = $('d-cg').value.trim();
+      if (!raw) { toast('请输入字节数或 max', 'error'); return; }
+      // 支持 512M / 1G 这类写法
+      let value = raw;
+      const m = raw.match(/^(\d+)\s*([kKmMgG]?)$/);
+      if (m) {
+        const mult = { '': 1, k: 1024, m: 1024 * 1024, g: 1024 * 1024 * 1024 }[m[2].toLowerCase()];
+        value = String(Number(m[1]) * mult);
+      }
+      tuneApply('cgroup-memory-high', value, `cgroup 内存软限 = ${raw}`);
+    });
+  }
+
   // 结束整棵子树：默认 TERM，弹窗里勾选状态预置为「已勾选」
   const ktBtn = $('d-kill-tree');
   if (ktBtn) {

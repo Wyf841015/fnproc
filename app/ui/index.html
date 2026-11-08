@@ -536,6 +536,26 @@
       <div id="d-children" class="chips">—</div>
     </div>
     <div class="dblock">
+      <label>调优</label>
+      <div class="tune-row">
+        <span class="tune-label">nice</span>
+        <input id="d-nice" type="number" min="-20" max="19" value="0" class="tune-input">
+        <button class="btn tiny" id="d-apply-nice" type="button">应用</button>
+        <span class="tune-label">OOM 保护</span>
+        <select id="d-oom" class="tune-input">
+          <option value="-1000">最高</option>
+          <option value="-500">较高</option>
+          <option value="0">默认</option>
+          <option value="500">更容易被杀</option>
+        </select>
+        <button class="btn tiny" id="d-apply-oom" type="button">应用</button>
+        <span class="tune-label">cgroup 内存软限</span>
+        <input id="d-cg" type="text" class="tune-input" placeholder="如 512M 或 max">
+        <button class="btn tiny" id="d-apply-cg" type="button">应用</button>
+      </div>
+      <p class="hint" id="d-tune-hint">nice 越小优先级越高（-20 最高）。cgroup 软限填字节数或 max；超过软限后内核优先回收该组内存，不会直接杀进程。</p>
+    </div>
+    <div class="dblock">
       <label>发送信号</label>
       <div class="signals">
         <button class="btn sig" data-signal="SIGTERM" type="button">TERM 正常结束</button>
