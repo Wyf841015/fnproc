@@ -4,7 +4,49 @@
         "items": [
             {
                 "type": "tips",
-                "helpText": "卸载后将移除进程管家的运行数据，不影响系统中其它应用。"
+                "helpText": "您即将卸载「进程管家」。卸载会停止采集服务并移除程序文件，不会影响系统中其它应用。"
+            },
+            {
+                "type": "radio",
+                "field": "wizard_data_action",
+                "label": "应用数据",
+                "initValue": "keep",
+                "options": [
+                    {
+                        "label": "保留数据（推荐）— 历史曲线、告警规则、操作记录、进程快照都保留，将来重装可继续使用",
+                        "value": "keep"
+                    },
+                    {
+                        "label": "删除全部数据 — 上述数据永久删除，无法恢复",
+                        "value": "delete"
+                    }
+                ],
+                "rules": [
+                    {
+                        "required": true,
+                        "message": "请选择如何处理应用数据"
+                    }
+                ]
+            },
+            {
+                "type": "checkbox",
+                "field": "wizard_clear_notify",
+                "label": "同时清理本应用产生的桌面通知",
+                "initValue": "true",
+                "options": [
+                    {
+                        "label": "删除「进程管家」在系统通知中心留下的告警通知（卸载后这些通知点了也无处可去）",
+                        "value": "true"
+                    }
+                ]
+            },
+            {
+                "type": "tips",
+                "helpText": "<strong>数据位置：</strong>历史采样、告警规则与事件、操作审计、进程快照都存放在应用数据目录（<code>@appdata/fnproc</code>）。选择「保留数据」时这些文件留在原处，下次安装同一应用即可继续读取。"
+            },
+            {
+                "type": "tips",
+                "helpText": "<strong>请注意：</strong>卸载不会撤销您此前对进程做过的调优（nice 值、OOM 保护权重、cgroup 内存软限），这些设置由内核保持，会随相应进程退出而自然失效。"
             }
         ]
     }

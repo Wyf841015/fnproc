@@ -1,2 +1,66 @@
 #!/bin/bash
-echo "fnproc uninstall_init"
+### 进程管家 —— 卸载前钩子（uninstall_init）
+### 时机：用户确认卸载、系统开始移除程序文件之前
+### 职责：把还在跑的采集进程停干净，并输出数据规模，让「保留 / 删除」的选择有依据
+
+set -u
+
+APP=fnproc
+VAR_DIR="${TRIM_PKGVAR:-/vol3/@appdata/${APP}}"
+DEST_DIR="${TRIM_APPDEST:-/vol3/@appcenter/${APP}}"
+PID_FILE="${VAR_DIR}/app.pid"
+
+log() { echo "[${APP}-uninstall] $*"; }
+
+log "uninstall_init 开始"
+
+# ── 1. 停止残留进程 ────────────────────────────────────────────────────────
+# 应用中心通常已经先 stop 过；这里兜底，且必须等进程真的退出再删文件，
+# 否则 SQLite 正在写入时被删除会留下 -wal/-shm 残留。
+pids=""
+if [ -f "$PID_FILE" ]; then
+  p="$(cat "$PID_FILE" 2>/dev/null | tr -dc '0-9')"
+  if [ -n "$p" ] && [ -r "/proc/$p/cmdline" ] \
+     && tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -q "${APP}/ui/server.js"; then
+    pids="$p"
+  else
+    log "pid 文件里的进程已不存在或不是本应用（PID 复用保护），忽略"
+  fi
+fi
+# pid 文件不可靠时按命令行匹配兜底
+extra="$(pgrep -f "${DEST_DIR}/ui/server\.js" 2>/dev/null | tr '\n' ' ')"
+for e in $extra; do case " $pids " in *" $e "*) ;; *) pids="$pids $e" ;; esac; done
+
+if [ -n "${pids// /}" ]; then
+  log "停止采集进程:$pids"
+  for p in $pids; do kill -TERM "$p" 2>/dev/null || true; done
+  # 最多等 3 秒优雅退出（要给 SQLite checkpoint 留时间）
+  for _ in 1 2 3 4 5 6; do
+    alive=0
+    for p in $pids; do [ -d "/proc/$p" ] && alive=1; done
+    [ "$alive" = 0 ] && break
+    sleep 0.5
+  done
+  for p in $pids; do
+    if [ -d "/proc/$p" ]; then
+      log "进程 $p 未响应 TERM，强制结束"
+      kill -KILL "$p" 2>/dev/null || true
+    fi
+  done
+  log "采集进程已停止"
+else
+  log "没有正在运行的采集进程"
+fi
+
+# ── 2. 数据规模（供用户在卸载向导里判断是否保留） ────────────────────────
+if [ -d "$VAR_DIR" ]; then
+  size="$(du -sh "$VAR_DIR" 2>/dev/null | awk '{print $1}')"
+  log "应用数据目录: ${VAR_DIR}（约 ${size:-未知}）"
+  for f in history.db audit.db alerts.db snapshots.db history.jsonl; do
+    [ -f "${VAR_DIR}/data/${f}" ] && \
+      log "  - ${f}: $(du -h "${VAR_DIR}/data/${f}" 2>/dev/null | awk '{print $1}')"
+  done
+fi
+
+log "uninstall_init 完成"
+exit 0

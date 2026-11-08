@@ -1,3 +1,114 @@
 #!/bin/bash
-### 卸载前清理：停掉进程残留 socket
-echo "fnproc uninstall_callback"
+### 进程管家 —— 卸载后钩子（uninstall_callback）
+### 时机：程序文件已被移除之后
+### 依据卸载向导的选择执行清理：
+###   wizard_data_action  = keep（默认，保留数据） / delete（删除数据）
+###   wizard_clear_notify = 是否清理本应用写入系统通知中心的通知（默认清理）
+###
+### 安全约定：删除前必须校验路径形态，任何不符预期的情况一律拒绝删除并记录原因，
+### 绝不因为环境变量为空/异常而删掉上层目录。
+
+set -u
+
+APP=fnproc
+VAR_DIR="${TRIM_PKGVAR:-/vol3/@appdata/${APP}}"
+DEST_DIR="${TRIM_APPDEST:-/vol3/@appcenter/${APP}}"
+
+log() { echo "[${APP}-uninstall] $*"; }
+
+# 演练开关：FNPROC_UNINSTALL_DRYRUN=1 时只打印将要执行的动作，不实际删除。
+# 用于安装包自检与用户自查（卸载脚本删东西，必须有可预演的手段）。
+DRYRUN="${FNPROC_UNINSTALL_DRYRUN:-0}"
+run() {
+  if [ "$DRYRUN" = 1 ]; then
+    log "[演练] 将执行: $*"
+    return 0
+  fi
+  "$@"
+}
+
+log "uninstall_callback 开始${DRYRUN:+$([ "$DRYRUN" = 1 ] && echo '（演练模式，不会删除任何文件）')}"
+
+# 成功日志在演练时必须改口：run() 在演练下直接返回 0，
+# 照抄「已删除」会让演练报告撒谎，用户以为真删了。
+done_log() {
+  if [ "$DRYRUN" = 1 ]; then log "[演练] 将完成: $1"; else log "$1"; fi
+}
+
+# ── 1. 运行时 socket（无论保留还是删除数据都要清） ──────────────────────
+for s in "${DEST_DIR}/${APP}.sock" "${DEST_DIR}/target/${APP}.sock" "/var/apps/${APP}/target/${APP}.sock"; do
+  if [ -e "$s" ] || [ -L "$s" ]; then
+    if run rm -f "$s" 2>/dev/null; then
+      done_log "已删除残留 socket: $s"
+    else
+      log "删除 socket 失败（忽略）: $s"
+    fi
+  fi
+done
+
+# ── 2. 残留进程兜底 ────────────────────────────────────────────────────
+# uninstall_init 已停过；若用户跳过向导或调用顺序变化，这里再保一次，避免进程抱着已删文件继续跑
+left="$(pgrep -f "${DEST_DIR}/ui/server\.js" 2>/dev/null | tr '\n' ' ')"
+if [ -n "${left// /}" ]; then
+  [ "$DRYRUN" = 1 ] && log "[演练] 将结束残留进程:$left" || log "结束残留进程:$left"
+  for p in $left; do run kill -KILL "$p" 2>/dev/null || true; done
+  run sleep 0.3
+fi
+
+# ── 3. 系统通知清理（可选） ─────────────────────────────────────────────
+# 通知写在 fnOS 的 trim.notify / trim.notify_user 里，source 固定为 'fnproc'。
+# 不清理的话通知中心会留下点了没反应的空壳条目。
+# 保守语义：只有明确表示「已勾选」才清理。空值/未传值时保留 ——
+# 卸载脚本删的是用户看得到的通知，宁可留几条可手动删的，也不能因为字段缺失就清空。
+NOTIFY_FLAG="${wizard_clear_notify-}"
+clear_notify=0
+case "$NOTIFY_FLAG" in
+  true|True|TRUE|1|on|ON|yes|YES|*'"true"'*|*"'true'"*|*'true'*) clear_notify=1 ;;
+  *) clear_notify=0 ;;
+esac
+
+if [ "$clear_notify" = 1 ]; then
+  if command -v psql >/dev/null 2>&1; then
+    if run psql -X -q -U postgres -d trim -v ON_ERROR_STOP=1 \
+        -c "DELETE FROM notify_user WHERE notify_id IN (SELECT id FROM notify WHERE source = '${APP}');" \
+        -c "DELETE FROM notify WHERE source = '${APP}';" >/dev/null 2>&1; then
+      done_log "已清理本应用写入的系统通知"
+    else
+      log "系统通知清理失败（不影响卸载，可稍后在通知中心手动删除）"
+    fi
+  else
+    log "未找到 psql，跳过系统通知清理"
+  fi
+else
+  log "按用户选择保留系统通知（wizard_clear_notify=${NOTIFY_FLAG}）"
+fi
+
+# ── 4. 应用数据 ────────────────────────────────────────────────────────
+delete_data=0
+case "${wizard_data_action:-keep}" in
+  delete|DELETE|Delete) delete_data=1 ;;
+  *) delete_data=0 ;;
+esac
+
+if [ "$delete_data" = 1 ]; then
+  # 路径守卫：必须是 …/@appdata/fnproc（允许结尾斜杠），否则拒绝删除
+  case "$VAR_DIR" in
+    */@appdata/${APP}|*/@appdata/${APP}/) : ;;
+    *) log "拒绝删除：路径不符 @appdata/${APP} 形态 → '${VAR_DIR}'"; VAR_DIR="" ;;
+  esac
+  if [ -n "$VAR_DIR" ]; then
+    # 清掉 SQLite 的 -wal / -shm（正常关闭时已 checkpoint，这里只处理异常残留）
+    run rm -f "${VAR_DIR}"/data/*.db-wal "${VAR_DIR}"/data/*.db-shm 2>/dev/null || true
+    if run rm -rf "$VAR_DIR" 2>/dev/null; then
+      done_log "已删除应用数据目录: $VAR_DIR"
+    else
+      log "删除应用数据目录失败: $VAR_DIR（可能权限不足，可手动删除）"
+    fi
+  fi
+else
+  log "已保留应用数据目录: $VAR_DIR"
+  log "重新安装「进程管家」后，历史曲线 / 告警规则 / 操作记录 / 快照会自动继续沿用"
+fi
+
+log "uninstall_callback 完成"
+exit 0
