@@ -1393,8 +1393,9 @@ async function refreshView() {
   const seq = ++refreshSeq;
   try {
     if (currentTab === 'ports') {
-      if (portMode === 'all') { await renderConnections(); return; }
-      await renderPorts(); return;
+      if (portMode === 'all') await renderConnections();
+      else await renderPorts();
+      return;
     }
     if (currentTab === 'containers') { await renderContainers(); return; }
     if (currentTab === 'services') { await renderServices(); return; }
@@ -1409,6 +1410,8 @@ async function refreshView() {
     const r = await fetch(u.toString(), { cache: 'no-store' });
     if (!r.ok) throw new Error('进程列表请求失败: HTTP ' + r.status);
     const d = await r.json();
+    // 定时器 / 切页 / 搜索防抖三路并发时，慢响应后到会覆盖新结果 —— 只认最后一次请求
+    if (seq !== refreshSeq) return;
     rowsCache = d.rows || [];
     if (processView === 'tree') renderTree(rowsCache);
     else renderTable(rowsCache);
