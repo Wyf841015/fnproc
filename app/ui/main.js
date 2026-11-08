@@ -1351,8 +1351,8 @@ function bindEvents() {
   primeBadges();
   loadAudit();
   startStream();
-  // 表格数据 3 秒刷一次（SSE 只推概览与 top30，避免整表每秒重排导致选择/滚动丢失）
-  // SSE 通着的时候页面已经是实时的，表格没必要再每 3 秒重拉一次 107KB。
+  // 表格数据 10 秒刷一次兜底：概览数字由 SSE 实时推送，表格没必要跟着每秒重排。
+  // 页面切到后台时完全跳过（后台标签页不该继续占带宽和 CPU）。
   // 10 秒兜底刷新 + 页面不可见时完全跳过（后台标签页不该占带宽和 CPU）。
   setInterval(() => {
     if (document.visibilityState === 'hidden') return;
