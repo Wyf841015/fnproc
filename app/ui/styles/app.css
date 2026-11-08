@@ -583,3 +583,45 @@ select {
 .timers-block > summary::before { content: '▸'; color: var(--text-mute); font-size: 12px; }
 .timers-block[open] > summary::before { content: '▾'; }
 .timers-block > summary h2 { margin: 0; font-size: 14px; }
+
+/* ── PSI 压力 / 卷用量 ───────────────────────────────────── */
+.extra-row { margin-top: 12px; }
+.psi-grid { display: grid; gap: 10px; }
+.psi-item { display: grid; grid-template-columns: auto 1fr; gap: 4px 10px; align-items: center; }
+.psi-name { font-size: 12px; color: var(--text-mute); }
+.psi-val { font-size: 13px; text-align: right; font-variant-numeric: tabular-nums; }
+.psi-bar { grid-column: 1 / -1; height: 6px; border-radius: 999px; background: var(--bg-2); overflow: hidden; }
+.psi-bar > i { display: block; height: 100%; border-radius: 999px; background: var(--accent); transition: width .4s; }
+.psi-item[data-level="warm"] .psi-bar > i { background: var(--warning, #fbbf24); }
+.psi-item[data-level="hot"] .psi-bar > i { background: var(--danger); }
+.vol-list { display: grid; gap: 10px; }
+.vol-row { display: grid; gap: 4px; }
+.vol-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.vol-name { font-size: 12.5px; }
+.vol-bar { height: 6px; border-radius: 999px; background: var(--bg-2); overflow: hidden; }
+.vol-bar > i { display: block; height: 100%; border-radius: 999px; background: var(--accent); }
+.vol-row[data-level="warm"] .vol-bar > i { background: var(--warning, #fbbf24); }
+.vol-row[data-level="hot"] .vol-bar > i { background: var(--danger); }
+.vol-sub { font-size: 11px; }
+/* ── 快照对比 ───────────────────────────────────────────── */
+.snap-result { max-height: min(52vh, 420px); overflow: auto; }
+.snap-section { margin-bottom: 12px; }
+.snap-section h4 { margin: 0 0 6px; font-size: 12.5px; color: var(--text-mute); font-weight: 600; }
+/* ── 危险提示 ───────────────────────────────────────────── */
+.danger-hint {
+  border: 1px dashed rgba(248, 113, 113, .45); border-radius: var(--radius-sm);
+  background: rgba(248, 113, 113, .07); color: var(--text-dim);
+  padding: 8px 10px; margin: 0 0 10px; font-size: 12px; line-height: 1.5;
+}
+.danger-hint b { color: var(--danger); }
+.svc-actions { display: flex; flex-wrap: wrap; gap: 4px; }
+
+/* 抽屉里可折叠区块（手机上默认收起，见 main.js 的 openDetail） */
+.dblock > summary {
+  cursor: pointer; font-size: 11px; color: var(--text-mute);
+  margin-bottom: 5px; letter-spacing: .3px; list-style: none;
+}
+.dblock > summary::-webkit-details-marker { display: none; }
+.dblock > summary::before { content: '▸ '; font-size: 10px; }
+.dblock[open] > summary::before { content: '▾ '; }
+.dblock > summary + * { margin-top: 2px; }

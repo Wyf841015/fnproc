@@ -223,6 +223,8 @@ function renderKpis(s) {
     node.dataset.busy = v > 80 ? 'hot' : v > 50 ? 'warm' : 'cool';
   });
 
+  if (s.psi) renderPsi(s.psi);
+  if (s.volumes) renderVolumes(s.volumes);
   $('ver').textContent = s.version;
   $('ts-line').textContent = '更新于 ' + new Date(s.ts).toLocaleTimeString();
   if (historyRange === '60s') {
@@ -349,6 +351,74 @@ function renderTable(rows) {
 // ── 视图：进程树 ────────────────────────────────────────────────────────
 // 用 ppid 建树。根节点 = 父进程不在当前结果集里（search/容器过滤后很常见，
 // 不能假设 pid 1 一定是唯一根，否则过滤后整棵树会消失）。
+const treeRefs = new Map();     // pid → 该行需要更新的节点（树视图按行复用，不整表重建）
+
+function treeRow(node, depth, hasKids, isCollapsed, aggVal) {
+  let r = treeRefs.get(node.pid);
+  if (!r) {
+    const tr = el('tr');
+    tr.dataset.pid = node.pid;
+    const pidTd = el('td', 'num mono', node.pid);
+    tr.appendChild(pidTd);
+    const nameTd = el('td', 'tree-cell');
+    tr.appendChild(nameTd);
+    const cpuTd = el('td', 'num mono');
+    const cpuSpan = el('span', 'cpuval', '0');
+    cpuTd.appendChild(cpuSpan);
+    tr.appendChild(cpuTd);
+    const rssTd = el('td', 'num mono');
+    tr.appendChild(rssTd);
+    const thTd = el('td', 'num mono hide-sm');
+    tr.appendChild(thTd);
+    const cTd = el('td', 'hide-md');
+    tr.appendChild(cTd);
+    const actTd = el('td', 'act');
+    const btn = el('button', 'btn tiny', '信号');
+    btn.type = 'button';
+    btn.dataset.action = 'signal';
+    btn.dataset.pid = node.pid;
+    actTd.appendChild(btn);
+    tr.appendChild(actTd);
+    r = { tr, nameTd, cpuTd, cpuSpan, rssTd, thTd, cTd, container: '' };
+    treeRefs.set(node.pid, r);
+  }
+  // 名称单元格：缩进 / 折叠三角 / 名字 / 子树合计，每次重画这 4 个小节点
+  const cell = r.nameTd;
+  cell.textContent = '';
+  const indent = el('span', 'indent');
+  indent.style.paddingLeft = (depth * 16) + 'px';
+  if (hasKids) {
+    const tg = el('button', 'toggle', isCollapsed ? '▶' : '▼');
+    tg.type = 'button';
+    tg.dataset.action = 'toggle';
+    tg.dataset.pid = node.pid;
+    indent.appendChild(tg);
+  } else {
+    indent.appendChild(el('span', 'toggle-ph', '·'));
+  }
+  indent.appendChild(el('span', 'nm', node.name));
+  if (hasKids && (aggVal.cpu > node.cpuPct + 0.05 || aggVal.mem > node.rss * 1.05)) {
+    indent.appendChild(el('span', 'agg', `子树 ${aggVal.cpu}% / ${fmtBytes(aggVal.mem)}`));
+  }
+  cell.appendChild(indent);
+
+  const cpuText = fmtPct(node.cpuPct);
+  if (r.cpuSpan.textContent !== cpuText) r.cpuSpan.textContent = cpuText;
+  if (node.cpuPct > 10) r.cpuTd.dataset.hot = '1'; else delete r.cpuTd.dataset.hot;
+  const rssText = fmtBytes(node.rss);
+  if (r.rssTd.textContent !== rssText) r.rssTd.textContent = rssText;
+  const thText = String(node.threads);
+  if (r.thTd.textContent !== thText) r.thTd.textContent = thText;
+  const cName = node.container ? node.container.name : '';
+  if (cName !== r.container) {
+    r.cTd.textContent = '';
+    if (node.container) r.cTd.appendChild(el('span', 'chip cont', node.container.name));
+    else r.cTd.appendChild(el('span', 'hint', '—'));
+    r.container = cName;
+  }
+  return r.tr;
+}
+
 function renderTree(rows) {
   const byPid = new Map(rows.map((p) => [p.pid, p]));
   const children = new Map();
@@ -376,60 +446,22 @@ function renderTree(rows) {
   for (const r of roots) sum(r);
 
   const tb = $('treebody');
-  tb.textContent = '';
   const frag = document.createDocumentFragment();
+  const seen = new Set();
   const walk = (node, depth) => {
     const kids = (children.get(node.pid) || []).sort((a, b) => b.cpuPct - a.cpuPct);
     const hasKids = kids.length > 0;
     const isCollapsed = collapsed.has(node.pid);
-    const tr = el('tr');
-    tr.dataset.pid = node.pid;
-    tr.appendChild(el('td', 'num mono', node.pid));
-
-    const nameTd = el('td', 'tree-cell');
-    const indent = el('span', 'indent');
-    indent.style.paddingLeft = (depth * 16) + 'px';
-    if (hasKids) {
-      const tg = el('button', 'toggle', isCollapsed ? '▶' : '▼');
-      tg.type = 'button';
-      tg.dataset.action = 'toggle';
-      tg.dataset.pid = node.pid;
-      indent.appendChild(tg);
-    } else {
-      indent.appendChild(el('span', 'toggle-ph', '·'));
-    }
-    indent.appendChild(el('span', 'nm', node.name));
-    const a = agg.get(node.pid);
-    if (hasKids && (a.cpu > node.cpuPct + 0.05 || a.mem > node.rss * 1.05)) {
-      indent.appendChild(el('span', 'agg', `子树 ${a.cpu}% / ${fmtBytes(a.mem)}`));
-    }
-    nameTd.appendChild(indent);
-    tr.appendChild(nameTd);
-
-    const cpuTd = el('td', 'num mono');
-    cpuTd.appendChild(el('span', 'cpuval', fmtPct(node.cpuPct)));
-    if (node.cpuPct > 10) cpuTd.dataset.hot = '1';
-    tr.appendChild(cpuTd);
-    tr.appendChild(el('td', 'num mono', fmtBytes(node.rss)));
-    tr.appendChild(el('td', 'num mono hide-sm', node.threads));
-    const cTd = el('td', 'hide-md');
-    if (node.container) cTd.appendChild(el('span', 'chip cont', node.container.name));
-    else cTd.appendChild(el('span', 'hint', '—'));
-    tr.appendChild(cTd);
-    const actTd = el('td', 'act');
-    const btn = el('button', 'btn tiny', '信号');
-    btn.type = 'button';
-    btn.dataset.action = 'signal';
-    btn.dataset.pid = node.pid;
-    actTd.appendChild(btn);
-    tr.appendChild(actTd);
-    frag.appendChild(tr);
-
+    seen.add(node.pid);
+    frag.appendChild(treeRow(node, depth, hasKids, isCollapsed, agg.get(node.pid) || { cpu: node.cpuPct, mem: node.rss }));
     if (!isCollapsed) for (const k of kids) walk(k, depth + 1);
   };
   roots.sort((a, b) => (agg.get(b.pid)?.cpu || 0) - (agg.get(a.pid)?.cpu || 0));
   for (const r of roots) walk(r, 0);
+  // 顺序会变，但节点是复用的：整块换进去只触发一次重排，不会重建上百行 DOM
+  tb.textContent = '';
   tb.appendChild(frag);
+  for (const pid of [...treeRefs.keys()]) if (!seen.has(pid)) treeRefs.delete(pid);
   $('table-info').textContent = `${rows.length} 个进程 · ${roots.length} 个根节点${collapsed.size ? ` · 已折叠 ${collapsed.size}` : ''}`;
 }
 
@@ -470,6 +502,12 @@ async function renderContainers() {
   const r = await fetch(API + '/containers', { cache: 'no-store' });
   if (!r.ok) throw new Error('容器列表请求失败: HTTP ' + r.status);
   const d = await r.json();
+  // docker stats 单独一次调用：拿真实的 CPU%/内存/网络（进程聚合的口径不算容器开销）
+  let stats = new Map();
+  try {
+    const sd = await (await fetch(API + '/container/stats', { cache: 'no-store' })).json();
+    stats = new Map((sd.stats || []).map((x) => [x.name, x]));
+  } catch { /* docker 不可用就只显示进程聚合 */ }
   const tb = $('contbody');
   tb.textContent = '';
   const frag = document.createDocumentFragment();
@@ -479,16 +517,27 @@ async function renderContainers() {
     nm.appendChild(el('span', 'nm', c.name));
     tr.appendChild(nm);
     tr.appendChild(el('td', 'num mono', c.procs));
-    tr.appendChild(el('td', 'num mono', fmtPct(c.cpuPct)));
-    tr.appendChild(el('td', 'num mono', fmtBytes(c.rss)));
-    tr.appendChild(el('td', 'num mono hide-sm', c.threads));
+    const io = stats.get(c.name) || stats.get(c.id);
+    // 有 docker stats 就用它（CPU%/内存含容器自身开销，比进程相加更准）
+    tr.appendChild(el('td', 'num mono', io && io.cpuPct ? io.cpuPct : fmtPct(c.cpuPct)));
+    tr.appendChild(el('td', 'num mono', io && io.memUsage ? io.memUsage.split(' / ')[0] : fmtBytes(c.rss)));
+    tr.appendChild(el('td', 'num mono hide-sm', io && io.pids ? io.pids : c.threads));
+    tr.appendChild(el('td', 'num mono hide-md hint', io ? `${io.netIO || '—'}` : '—'));
     tr.appendChild(el('td', 'num mono small-id', c.id));
-    const act = el('td', 'act');
-    const btn = el('button', 'btn tiny', '看进程');
-    btn.type = 'button';
-    btn.dataset.action = 'filter-container';
-    btn.dataset.container = c.name;
-    act.appendChild(btn);
+    const act = el('td', 'act svc-actions');
+    const mkBtn = (label, action, cls) => {
+      const b = el('button', 'btn tiny' + (cls ? ' ' + cls : ''), label);
+      b.type = 'button';
+      b.dataset.action = action;
+      b.dataset.container = c.name;
+      return b;
+    };
+    act.append(
+      mkBtn('看进程', 'filter-container'),
+      mkBtn('日志', 'cont-log'),
+      mkBtn('重启', 'cont-restart'),
+      mkBtn('停止', 'cont-stop', 'warn'),
+    );
     tr.appendChild(act);
     frag.appendChild(tr);
   }
@@ -659,6 +708,7 @@ async function loadAlerts() {
     alertLive = d.live || [];
     renderAlertRules();
     await loadAlertEvents();
+    await loadWatchdogs();
     const st = d.stats || {};
     $('alerts-hint').textContent = `${st.rules || 0} 条规则（启用 ${st.enabled || 0}）· 累计 ${st.events || 0} 次事件`;
     const firing = alertLive.filter((x) => x.breaching).length;
@@ -863,12 +913,24 @@ function deleteAlert(id) {
   });
 }
 
-// ── 日志查看（journalctl）─────────────────────────────────────────────────
+// ── 日志查看（journalctl / docker logs）──────────────────────────────────
 let logUnit = '';
+let logKind = 'journal';          // journal | docker
 
 async function openLog(unit) {
+  logKind = 'journal';
   logUnit = unit || '';
   $('log-title').textContent = unit ? `日志 · ${unit}` : '系统日志';
+  $('log-pre').textContent = '加载中…';
+  $('log-mask').hidden = false;
+  requestAnimationFrame(() => $('log-mask').classList.add('show'));
+  await loadLog();
+}
+
+async function openContainerLog(name) {
+  logKind = 'docker';
+  logUnit = name || '';
+  $('log-title').textContent = `容器日志 · ${name}`;
   $('log-pre').textContent = '加载中…';
   $('log-mask').hidden = false;
   requestAnimationFrame(() => $('log-mask').classList.add('show'));
@@ -881,13 +943,18 @@ function closeLog() {
 }
 
 async function loadLog() {
-  const q = new URL(API + '/journal', location.origin);
-  if (logUnit) q.searchParams.set('unit', logUnit);
+  const isDocker = logKind === 'docker';
+  const q = new URL(API + (isDocker ? '/container/logs' : '/journal'), location.origin);
+  if (isDocker) {
+    if (logUnit) q.searchParams.set('name', logUnit);
+  } else {
+    if (logUnit) q.searchParams.set('unit', logUnit);
+    const prio = $('log-priority').value;
+    if (prio) q.searchParams.set('priority', prio);
+    const grep = $('log-grep').value.trim();
+    if (grep) q.searchParams.set('q', grep);
+  }
   q.searchParams.set('lines', $('log-lines').value);
-  const prio = $('log-priority').value;
-  if (prio) q.searchParams.set('priority', prio);
-  const grep = $('log-grep').value.trim();
-  if (grep) q.searchParams.set('q', grep);
   try {
     const r = await fetch(q.toString(), { cache: 'no-store' });
     const d = await r.json();
@@ -921,6 +988,318 @@ async function loadTimers() {
   } catch { /* 忽略 */ }
 }
 
+// ── PSI 压力 / 卷用量（概览底部两张卡）────────────────────────────────────
+function renderPsi(p) {
+  const box = $('psi-grid');
+  if (!box || !p) return;
+  const items = [
+    ['CPU', p.cpu, '进程因 CPU 排队等待'],
+    ['内存', p.mem, '进程因内存回收等待'],
+    ['磁盘 IO', p.io, '进程因 IO 阻塞'],
+  ];
+  box.textContent = '';
+  for (const [name, v, tip] of items) {
+    const cell = el('div', 'psi-item');
+    const val = Number(v) || 0;
+    cell.dataset.level = val > 20 ? 'hot' : (val > 5 ? 'warm' : 'cool');
+    cell.title = tip;
+    cell.appendChild(el('span', 'psi-name', name));
+    cell.appendChild(el('span', 'psi-val', val.toFixed(2) + '%'));
+    const bar = el('div', 'psi-bar');
+    const fill = el('i');
+    fill.style.width = Math.min(100, val * 4) + '%';     // 25% 压力就画满，视觉更敏感
+    bar.appendChild(fill);
+    cell.appendChild(bar);
+    box.appendChild(cell);
+  }
+}
+
+function renderVolumes(list) {
+  const box = $('vol-list');
+  if (!box || !Array.isArray(list)) return;
+  box.textContent = '';
+  if (!list.length) { box.appendChild(el('span', 'hint', '没有检测到已挂载的卷')); return; }
+  for (const v of list) {
+    const row = el('div', 'vol-row');
+    row.dataset.level = v.usedPct > 90 ? 'hot' : (v.usedPct > 75 ? 'warm' : 'cool');
+    const head = el('div', 'vol-head');
+    head.appendChild(el('span', 'vol-name', v.mount));
+    head.appendChild(el('span', 'vol-pct mono', v.usedPct.toFixed(1) + '%'));
+    row.appendChild(head);
+    const bar = el('div', 'vol-bar');
+    const fill = el('i');
+    fill.style.width = Math.min(100, v.usedPct) + '%';
+    bar.appendChild(fill);
+    row.appendChild(bar);
+    row.appendChild(el('span', 'vol-sub hint', `${fmtBytes(v.used)} / ${fmtBytes(v.total)} · 可用 ${fmtBytes(v.avail)}${v.inodesUsedPct > 80 ? ` · inode ${v.inodesUsedPct}%` : ''}`));
+    box.appendChild(row);
+  }
+  const worst = list.reduce((a, b) => (b.usedPct > a.usedPct ? b : a), list[0]);
+  if ($('vol-hint')) $('vol-hint').textContent = `${list.length} 个卷 · 最高 ${worst.mount} ${worst.usedPct.toFixed(1)}%`;
+}
+
+// ── 连接视图（监听 / 全部）────────────────────────────────────────────────
+let portMode = 'listen';
+
+async function renderConnections() {
+  const r = await fetch(API + '/connections', { cache: 'no-store' });
+  if (!r.ok) throw new Error('连接列表请求失败: HTTP ' + r.status);
+  const d = await r.json();
+  const tb = $('connbody');
+  tb.textContent = '';
+  const frag = document.createDocumentFragment();
+  for (const c of d.conns || []) {
+    const tr = el('tr');
+    tr.dataset.pid = c.pid;
+    tr.appendChild(el('td', 'num mono', c.port));
+    tr.appendChild(el('td', 'hint', c.proto));
+    tr.appendChild(el('td', 'mono hide-sm', c.local));
+    tr.appendChild(el('td', 'num mono', c.remotePort || '—'));
+    tr.appendChild(el('td', 'mono hide-md', c.remote || '—'));
+    const st = el('td');
+    const chipCls = 'chip' + (c.state === 'LISTEN' ? ' cont' : (c.state === 'ESTAB' ? ' dim' : ''));
+    st.appendChild(el('span', chipCls, c.state));
+    tr.appendChild(st);
+    tr.appendChild(el('td', 'num mono', c.pid));
+    tr.appendChild(el('td', 'pname', c.name));
+    const ct = el('td', 'hide-md');
+    if (c.container) ct.appendChild(el('span', 'chip cont', c.container.name));
+    else ct.appendChild(el('span', 'hint', '—'));
+    tr.appendChild(ct);
+    frag.appendChild(tr);
+  }
+  tb.appendChild(frag);
+  $('conn-empty').hidden = (d.conns || []).length > 0;
+  if ($('port-hint')) {
+    const cnt = Object.entries(d.counts || {}).map(([k, v]) => `${k} ${v}`).join(' · ');
+    $('port-hint').textContent = `共 ${d.total} 条连接：${cnt || '—'} · 每 10 秒刷新`;
+  }
+}
+
+function setPortMode(mode) {
+  portMode = mode === 'all' ? 'all' : 'listen';
+  for (const b of $('port-views').querySelectorAll('.vbtn')) b.classList.toggle('active', b.dataset.pmode === portMode);
+  $('view-ports-listen').hidden = portMode !== 'listen';
+  $('view-ports-all').hidden = portMode !== 'all';
+  refreshView();
+}
+
+// ── 进程快照 ────────────────────────────────────────────────────────────
+async function saveSnapshot() {
+  try {
+    const r = await fetch(API + '/snapshot', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ label: new Date().toLocaleString() }),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+    toast(`已保存快照 #${d.id}（${d.count} 个进程）`, 'ok');
+  } catch (e) {
+    toast('保存快照失败：' + e.message, 'error');
+  }
+}
+
+async function openSnapshotDiff() {
+  $('snap-mask').hidden = false;
+  requestAnimationFrame(() => $('snap-mask').classList.add('show'));
+  $('snap-result').innerHTML = '<p class="hint">加载中…</p>';
+  try {
+    const d = await (await fetch(API + '/snapshots', { cache: 'no-store' })).json();
+    const list = d.snapshots || [];
+    for (const sel of [$('snap-a'), $('snap-b')]) {
+      const keep = sel.value;
+      sel.textContent = '';
+      const first = document.createElement('option');
+      first.value = '';
+      first.textContent = sel.id === 'snap-a' ? '基准（较早）' : '对比（较晚）';
+      sel.appendChild(first);
+      for (const s of list) {
+        const o = document.createElement('option');
+        o.value = String(s.id);
+        o.textContent = `#${s.id} ${new Date(s.ts).toLocaleString()} · ${s.count} 进程`;
+        sel.appendChild(o);
+      }
+      sel.value = keep;
+    }
+    if (list.length >= 2 && !$('snap-a').value) {
+      $('snap-a').value = String(list[list.length - 1].id);
+      $('snap-b').value = String(list[0].id);
+    }
+    $('snap-result').innerHTML = list.length
+      ? '<p class="hint">选两个快照，点「对比」。</p>'
+      : '<p class="hint">还没有快照。在「进程」页点「存快照」记录当前进程清单。</p>';
+  } catch (e) {
+    $('snap-result').textContent = '读取快照失败：' + e.message;
+  }
+}
+
+async function runSnapshotDiff() {
+  const a = $('snap-a').value;
+  const b = $('snap-b').value;
+  if (!a || !b) { toast('请选择两个快照', 'error'); return; }
+  if (a === b) { toast('请选择两个不同的快照', 'error'); return; }
+  try {
+    const d = await (await fetch(`${API}/snapshot/diff?a=${a}&b=${b}`, { cache: 'no-store' })).json();
+    if (d.error) throw new Error(d.error);
+    const box = $('snap-result');
+    box.textContent = '';
+    const section = (title, rows, muter) => {
+      const wrap = el('div', 'snap-section');
+      wrap.appendChild(el('h4', '', `${title}（${rows.length}）`));
+      if (!rows.length) { wrap.appendChild(el('p', 'hint', '—')); box.appendChild(wrap); return; }
+      const tb = el('div', 'chips');
+      for (const x of rows.slice(0, 60)) {
+        const txt = muter ? `${x.name}(${x.pid}) ${x.delta > 0 ? '+' : ''}${fmtBytes(Math.abs(x.delta))}` : `${x.name}(${x.pid}) ${fmtBytes(x.rss)}`;
+        tb.appendChild(el('span', 'chip dim', txt));
+      }
+      wrap.appendChild(tb);
+      box.appendChild(wrap);
+    };
+    section('新增进程', d.added || []);
+    section('消失进程', d.removed || []);
+    section('内存变化最大', d.changed || [], true);
+  } catch (e) {
+    toast('对比失败：' + e.message, 'error');
+  }
+}
+
+// ── 看门狗 ──────────────────────────────────────────────────────────────
+let watchdogs = [];
+let editingWdId = 0;
+
+async function loadWatchdogs() {
+  try {
+    const d = await (await fetch(API + '/watchdogs', { cache: 'no-store' })).json();
+    watchdogs = d.watchdogs || [];
+    renderWatchdogs();
+  } catch { /* 忽略 */ }
+}
+
+function renderWatchdogs() {
+  const tb = $('wd-body');
+  if (!tb) return;
+  tb.textContent = '';
+  const frag = document.createDocumentFragment();
+  for (const w of watchdogs) {
+    const tr = el('tr');
+    if (!w.enabled) tr.classList.add('row-dim');
+    tr.appendChild(el('td', 'num mono', w.id));
+    tr.appendChild(el('td', 'pname', w.name));
+    tr.appendChild(el('td', 'mono', w.match));
+    tr.appendChild(el('td', 'mono hide-sm hint', w.command.slice(0, 70)));
+    tr.appendChild(el('td', 'num mono hide-sm', fmtDur(w.cooldownSec)));
+    tr.appendChild(el('td', 'num mono hide-sm', w.runs));
+    const st = el('td');
+    st.appendChild(el('span', 'chip' + (w.enabled ? ' cont' : ' dim'), w.enabled ? '启用' : '停用'));
+    tr.appendChild(st);
+    const act = el('td', 'act');
+    const edit = el('button', 'btn tiny', '编辑');
+    edit.type = 'button'; edit.dataset.action = 'wd-edit'; edit.dataset.id = w.id;
+    const del = el('button', 'btn tiny warn', '删除');
+    del.type = 'button'; del.dataset.action = 'wd-del'; del.dataset.id = w.id;
+    act.append(edit, del);
+    tr.appendChild(act);
+    frag.appendChild(tr);
+  }
+  tb.appendChild(frag);
+  if ($('wd-empty')) $('wd-empty').hidden = watchdogs.length > 0;
+  if ($('wd-hint')) $('wd-hint').textContent = `${watchdogs.length} 条 · 启用 ${watchdogs.filter((w) => w.enabled).length} 条`;
+}
+
+function openWatchdogModal(w) {
+  editingWdId = w ? w.id : 0;
+  $('wd-modal-title').textContent = w ? `编辑看门狗 #${w.id}` : '新建看门狗';
+  $('wd-name').value = w ? w.name : '';
+  $('wd-match').value = w ? w.match : '';
+  $('wd-command').value = w ? w.command : '';
+  $('wd-cooldown').value = w ? w.cooldownSec : 300;
+  $('wd-enabled').checked = w ? w.enabled : false;
+  $('wd-mask').hidden = false;
+  requestAnimationFrame(() => $('wd-mask').classList.add('show'));
+}
+
+function closeWatchdogModal() {
+  $('wd-mask').classList.remove('show');
+  setTimeout(() => { $('wd-mask').hidden = true; }, 160);
+}
+
+async function saveWatchdog() {
+  const body = {
+    id: editingWdId || undefined,
+    name: $('wd-name').value.trim(),
+    match: $('wd-match').value.trim(),
+    command: $('wd-command').value.trim(),
+    cooldownSec: Number($('wd-cooldown').value) || 300,
+    enabled: $('wd-enabled').checked,
+    acknowledge: true,
+  };
+  try {
+    const r = await fetch(API + '/watchdogs', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+    toast('看门狗已保存', 'ok');
+    closeWatchdogModal();
+    await loadWatchdogs();
+  } catch (e) {
+    toast('保存失败：' + e.message, 'error');
+  }
+}
+
+function deleteWatchdog(id) {
+  const w = watchdogs.find((x) => x.id === id);
+  confirmModal('删除看门狗', `确定删除「${w ? w.name : '#' + id}」？`, '确定删除', async () => {
+    try {
+      const r = await fetch(API + '/watchdogs/delete', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id, confirm: true }),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+      toast('已删除', 'ok');
+      await loadWatchdogs();
+    } catch (e) { toast('删除失败：' + e.message, 'error'); }
+  });
+}
+
+// ── 定时任务 / 开机耗时 ─────────────────────────────────────────────────
+async function loadCron() {
+  try {
+    const d = await (await fetch(API + '/cron', { cache: 'no-store' })).json();
+    const tb = $('cron-body');
+    if (!tb) return;
+    tb.textContent = '';
+    const frag = document.createDocumentFragment();
+    for (const j of d.jobs || []) {
+      const tr = el('tr');
+      tr.appendChild(el('td', 'hide-sm', j.owner));
+      tr.appendChild(el('td', 'mono', j.schedule));
+      tr.appendChild(el('td', 'mono hint', j.command));
+      tr.appendChild(el('td', 'hide-md hint', j.file));
+      frag.appendChild(tr);
+    }
+    tb.appendChild(frag);
+    if ($('cron-hint')) $('cron-hint').textContent = `${d.count || 0} 条`;
+    if ($('cron-empty')) $('cron-empty').hidden = (d.jobs || []).length > 0;
+  } catch { /* 忽略 */ }
+}
+
+async function loadBoot() {
+  try {
+    const d = await (await fetch(API + '/boot', { cache: 'no-store' })).json();
+    if ($('boot-hint')) {
+      $('boot-hint').textContent = d.kernelSec != null
+        ? `内核 ${d.kernelSec}s · 用户空间 ${d.userspaceSec}s${d.totalSec ? ` · 合计 ${d.totalSec}s` : ''}`
+        : (d.error || '—');
+    }
+    if ($('boot-pre')) {
+      $('boot-pre').textContent = [d.raw || '', '', '耗时最长的服务（systemd-analyze blame）：']
+        .concat(d.blame || []).join('\n').trim();
+    }
+  } catch { /* 忽略 */ }
+}
+
 // ── 一级 tab（功能分类）──────────────────────────────────────────────────
 const TAB_NAMES = ['overview', 'process', 'ports', 'containers', 'services', 'alerts', 'audit'];
 
@@ -933,7 +1312,11 @@ function setTab(name) {
   if (name === 'overview') requestAnimationFrame(() => loadHistoryView());
   if (name === 'audit') loadAudit();
   if (name === 'alerts') loadAlerts();
-  if (name === 'services') loadTimers();
+  if (name === 'services') { loadTimers(); loadCron(); loadBoot(); }
+  if (name === 'ports') {
+    // 端口/连接数据是后台定时刷新的，切过来时可能已经陈旧，强制补一次
+    fetch(API + '/connections', { cache: 'no-store' }).catch(() => {});
+  }
   return refreshView();
 }
 
@@ -951,7 +1334,10 @@ function setView(v) {
 
 async function refreshView() {
   try {
-    if (currentTab === 'ports') { await renderPorts(); return; }
+    if (currentTab === 'ports') {
+      if (portMode === 'all') { await renderConnections(); return; }
+      await renderPorts(); return;
+    }
     if (currentTab === 'containers') { await renderContainers(); return; }
     if (currentTab === 'services') { await renderServices(); return; }
     if (currentTab === 'audit') { await loadAudit(); return; }
@@ -1230,6 +1616,10 @@ async function openDetail(pid) {
     kt.hidden = !(d.descendantCount > 0);
     kt.textContent = `结束整棵子树（${d.descendantCount || 0} 个）`;
 
+    // 手机上把长区块（环境变量/线程/父链）默认收起，避免抽屉一屏塞不下
+    const narrow = window.matchMedia('(max-width: 640px)').matches;
+    for (const d of drawer.querySelectorAll('details.dblock')) d.open = !narrow;
+
     // 更新各信号按钮的 pid
     for (const b of drawer.querySelectorAll('[data-signal]')) b.dataset.pid = pid;
   } catch (e) {
@@ -1368,6 +1758,8 @@ async function loadAudit() {
   if (auditState.action) params.set('action', auditState.action);
   if (auditState.result) params.set('result', auditState.result);
   if (auditState.q) params.set('q', auditState.q);
+  const rangeH = Number($('audit-range') ? $('audit-range').value : 0) || 0;
+  if (rangeH) params.set('since', String(Date.now() - rangeH * 3600 * 1000));
   const ul = $('audit');
   try {
     const r = await fetch(API + '/audit?' + params.toString(), { cache: 'no-store' });
@@ -1603,6 +1995,58 @@ function bindEvents() {
   $('log-grep').addEventListener('keydown', (e) => { if (e.key === 'Enter') loadLog(); });
   $('log-mask').addEventListener('click', (e) => { if (e.target === $('log-mask')) closeLog(); });
 
+  // ── 端口视图切换 ──
+  $('port-views').addEventListener('click', (e) => {
+    const b = e.target.closest('.vbtn');
+    if (b) setPortMode(b.dataset.pmode);
+  });
+
+  // ── 快照 ──
+  $('btn-snapshot').addEventListener('click', saveSnapshot);
+  $('btn-snap-diff').addEventListener('click', openSnapshotDiff);
+  $('snap-close').addEventListener('click', () => {
+    $('snap-mask').classList.remove('show');
+    setTimeout(() => { $('snap-mask').hidden = true; }, 160);
+  });
+  $('snap-mask').addEventListener('click', (e) => {
+    if (e.target === $('snap-mask')) {
+      $('snap-mask').classList.remove('show');
+      setTimeout(() => { $('snap-mask').hidden = true; }, 160);
+    }
+  });
+  $('snap-run').addEventListener('click', runSnapshotDiff);
+  $('snap-del').addEventListener('click', () => {
+    const id = $('snap-b').value || $('snap-a').value;
+    if (!id) { toast('先选一个快照', 'error'); return; }
+    confirmModal('删除快照', `确定删除快照 #${id}？`, '确定删除', async () => {
+      await fetch(API + '/snapshot/delete', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: Number(id), confirm: true }),
+      });
+      toast('已删除', 'ok');
+      openSnapshotDiff();
+    });
+  });
+
+  // ── 看门狗 ──
+  $('wd-add').addEventListener('click', () => openWatchdogModal(null));
+  $('wd-cancel').addEventListener('click', closeWatchdogModal);
+  $('wd-save').addEventListener('click', saveWatchdog);
+  $('wd-mask').addEventListener('click', (e) => { if (e.target === $('wd-mask')) closeWatchdogModal(); });
+  $('wd-body').addEventListener('click', (e) => {
+    const b = e.target.closest('button[data-action]');
+    if (!b) return;
+    const id = Number(b.dataset.id);
+    if (b.dataset.action === 'wd-edit') openWatchdogModal(watchdogs.find((x) => x.id === id));
+    else if (b.dataset.action === 'wd-del') deleteWatchdog(id);
+  });
+
+  // ── 记录：时间范围 + 导出 ──
+  if ($('audit-range')) $('audit-range').addEventListener('change', () => { auditState.page = 0; loadAudit(); });
+  if ($('audit-export')) $('audit-export').addEventListener('click', () => {
+    location.href = `${API}/export?what=audit`;
+  });
+
   // 一级 tab 切换
   $('tabs').addEventListener('click', (e) => {
     const b = e.target.closest('.tab');
@@ -1664,6 +2108,27 @@ function bindEvents() {
     setView('list');
   };
   $('contbody').addEventListener('click', (e) => {
+    const logB = e.target.closest('button[data-action="cont-log"]');
+    if (logB) { openContainerLog(logB.dataset.container); return; }
+    const actB = e.target.closest('button[data-action="cont-restart"], button[data-action="cont-stop"]');
+    if (actB) {
+      const action = actB.dataset.action === 'cont-stop' ? 'stop' : 'restart';
+      const label = action === 'stop' ? '停止' : '重启';
+      const name = actB.dataset.container;
+      confirmModal(`${label}容器`, `容器：${name}\n操作：docker ${action}${action === 'stop' ? '\n\n停止后容器内服务立即中断。' : ''}`, `确定${label}`, async () => {
+        try {
+          const r = await fetch(API + '/container/action', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name, action, confirm: true }),
+          });
+          const d = await r.json();
+          if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+          toast(`${name} ${label}成功`, 'ok');
+          renderContainers();
+        } catch (err) { toast(`${label}失败：` + err.message, 'error'); }
+      });
+      return;
+    }
     const b = e.target.closest('button[data-action="filter-container"]');
     if (b) applyContainerFilter(b.dataset.container);
   });

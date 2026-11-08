@@ -15,11 +15,13 @@ import { fileURLToPath } from 'node:url';
 import { createServer } from 'node:http';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import os from 'node:os';
 import { gzipSync } from 'node:zlib';
 import { openAuditStore } from './audit-db.js';
 import { openHistoryStore } from './history-db.js';
 import { openAlertStore, METRICS, LEVEL_LABEL } from './alert-db.js';
 import { createAlertEngine, readPsiMem, diskUsedPct } from './alerts.js';
+import { openSnapshotStore } from './snapshot-db.js';
 
 const UI_DIR = dirname(fileURLToPath(import.meta.url));
 const TARGET_DIR = dirname(UI_DIR);
@@ -167,7 +169,8 @@ const uidOf = new Map();               // pid → uid（从 status 读，缓存 
 // 第 2 步较贵（几百个进程 × 每个几十个 fd），所以拆到 10 秒一次的定时器里，
 // 不放在 1 秒的主采样里。
 let inodePort = new Map();
-let pidPorts = new Map();
+let pidPorts = new Map();          // 只含 LISTEN 的监听端口归属
+let allConns = new Map();          // 全部连接（含 ESTABLISHED/TIME_WAIT），按 pid 分组
 
 const TCP_STATE = { '01': 'ESTABLISHED', '0A': 'LISTEN', '06': 'TIME_WAIT', '08': 'CLOSE_WAIT', '09': 'LAST_ACK', '0B': 'CLOSING' };
 
@@ -205,6 +208,7 @@ function refreshInodePorts() {
 // 390 个进程 × 每 10 秒 ≈ 上万个 readdir/readlink 系统调用，是第二个 CPU 大户。
 // 现在优先用一次 `ss -tunapH`（内核已经算好了），解析失败才退回旧路径。
 let portsInflight = false;
+let lastPortsAt = 0;
 
 async function refreshPorts() {
   if (portsInflight) return;
@@ -230,7 +234,8 @@ async function portsViaSs() {
   }
   if (!out.trim()) return false;
   const byPid = new Map();
-  let candidates = 0;               // 有多少行「看起来是端口」，用来判断 ss 是否有权限看到进程
+  const conns = new Map();
+  let candidates = 0;               // 「看起来是端口」的行数，仅供诊断
   for (const line of out.split('\n')) {
     const t = line.trim();
     if (!t) continue;
@@ -253,10 +258,25 @@ async function portsViaSs() {
     const addr = local.slice(0, idx).replace(/^\[|\]$/g, '');
     if (!byPid.has(pid)) byPid.set(pid, []);
     byPid.get(pid).push({ port, proto: netid, addr, state: state === 'LISTEN' ? 'LISTEN' : state });
+    // 同一份 ss 结果顺带记一份「全部连接」，连接视图就不用再跑一次 ss 了
+    const peer = f[5] || '';
+    const pIdx = peer.lastIndexOf(':');
+    if (!conns.has(pid)) conns.set(pid, []);
+    conns.get(pid).push({
+      proto: netid,
+      local: local.replace(/^\[|\]$/g, ''),
+      port,
+      remote: pIdx > 0 ? peer.slice(0, pIdx) : peer,
+      remotePort: pIdx > 0 ? num(peer.slice(pIdx + 1)) : 0,
+      state: state === 'LISTEN' ? 'LISTEN' : state,
+    });
   }
-  // 非 root 时 ss 只给得出自己进程的 pid（实测 admin 只有 2 条，root 有 122 条）。
-  // 拿到的比例太低就认为「看不到」，退回遍历 /proc/PID/fd（结果一样但至少不漏）。
-  if (!byPid.size || byPid.size < Math.max(3, candidates * 0.3)) return false;
+  // 非 root 时 ss 只给得出自己进程的 pid：实测 admin 167 行里只有 5 行带 pid，
+  // root 有 129 行。所以判据用「带 pid 的行占比」，而不是按端口数估算
+  // （早先那版把 33 个进程 / 128 个端口误判成「看不到」，直接退回慢路径）。
+  const totalLines = out.split('\n').filter((l) => l.trim()).length || 1;
+  const pidLines = out.split('\n').filter((l) => l.includes('pid=')).length;
+  if (!byPid.size || pidLines / totalLines < 0.3) return false;
   for (const [pid, list] of byPid) {
     const seen = new Set();
     byPid.set(pid, list.filter((p) => {
@@ -267,6 +287,8 @@ async function portsViaSs() {
     }).sort((a, b) => a.port - b.port));
   }
   pidPorts = byPid;
+  allConns = conns;
+  lastPortsAt = Date.now();
   return true;
 }
 
@@ -306,6 +328,7 @@ function refreshPidPorts() {
 // docker-<64位hex>.scope。只认 64 位 hex，避免把 systemd 自己的 slice 误判成容器。
 const cgroupCache = new Map();          // pid → {v, ts}
 let dockerNames = new Map();            // 短ID(12) → 容器名
+let containerStats = { at: 0, map: new Map(), error: '' };   // docker stats 缓存
 let dockerAt = 0;
 
 let dockerInflight = false;
@@ -322,7 +345,12 @@ async function refreshDocker() {
       const [id, name] = line.trim().split('\t');
       if (id && name) names.set(id.slice(0, 12), name);
     }
+    // 容器名变了要清缓存：cgroup → 容器 的映射 TTL 是 30 秒，
+    // 刚启动时 docker ps 还没跑，会把容器名缓存成短 ID 并保持半分钟。
+    let changed = names.size !== dockerNames.size;
+    if (!changed) { for (const [k, v] of names) { if (dockerNames.get(k) !== v) { changed = true; break; } } }
     dockerNames = names;
+    if (changed) cgroupCache.clear();
   } catch {
     /* 没装 docker / 无权限 / 超时：保留上一次结果，静默降级 */
   } finally {
@@ -960,6 +988,15 @@ setInterval(() => {
   if (removed > 0) console.log(`[history] 清理过期采样 ${removed} 行`);
 }, 3600 * 1000);
 
+// ── 进程快照 ────────────────────────────────────────────────────────────
+// 存的是「某一刻的进程清单」，用来跨天对比：谁新起了、谁没了、谁内存涨了。
+const snapshotStore = openSnapshotStore(join(DATA_DIR, 'snapshots.db'), { version: VERSION });
+if (snapshotStore.enabled) {
+  console.log(`[snapshot] 快照库已启用: ${snapshotStore.path} 现有 ${snapshotStore.health().snapshots} 个快照`);
+} else {
+  console.error('[snapshot] 快照库打开失败:', snapshotStore.health().error);
+}
+
 // ── 告警 ────────────────────────────────────────────────────────────────
 // 规则与事件都落 SQLite（alerts.db）；判定每 5 秒一轮，只用已采好的数据。
 const ALERT_DB = join(DATA_DIR, 'alerts.db');
@@ -1228,6 +1265,8 @@ async function handle(req, res, pathname, query) {
 
   // 监听端口视图：把 inode→port 的结果反查成 pid，再补进程名/用户/容器
   if (pathname === '/api/ports') {
+    // 端口数据是 10 秒后台刷新的，刚切过来可能偏旧：超过 5 秒就后台补一次
+    if (Date.now() - lastPortsAt > 5000) { refreshPorts().catch(() => {}); }
     const byPid = new Map(procs.map((p) => [p.pid, p]));
     const out = [];
     for (const [pid, list] of pidPorts) {
@@ -1248,6 +1287,9 @@ async function handle(req, res, pathname, query) {
 
   // 容器维度聚合：进程数 / CPU / 内存（按容器名归堆，非容器进程单独一档 null）
   if (pathname === '/api/containers') {
+    // 首次打开时 docker ps 可能还没跑过（它按活跃度节流），这里补一次，
+    // 否则容器名会显示成 12 位短 ID
+    if (!dockerNames.size) await refreshDocker();
     const map = new Map();
     for (const p of procs) {
       if (!p.container) continue;
@@ -1597,6 +1639,359 @@ async function handle(req, res, pathname, query) {
     return;
   }
 
+  // ── 全部网络连接（不只是监听）────────────────────────────────────────────
+  if (pathname === '/api/connections') {
+    const stateFilter = String(query.get('state') || '').trim().toUpperCase();
+    const pidFilter = num(query.get('pid')) || 0;
+    const byPid = new Map(procs.map((p) => [p.pid, p]));
+    const out = [];
+    for (const [pid, list] of allConns) {
+      if (pidFilter && pid !== pidFilter) continue;
+      const p = byPid.get(pid);
+      for (const c of list) {
+        if (stateFilter && c.state !== stateFilter) continue;
+        out.push({
+          ...c, pid,
+          name: p?.name || '?',
+          user: p?.user || '?',
+          cmd: p?.cmd ? p.cmd.slice(0, 120) : '',
+          container: p?.container || null,
+        });
+      }
+    }
+    // 监听排前面，其余按端口
+    out.sort((a, b) => (a.state === 'LISTEN' ? 0 : 1) - (b.state === 'LISTEN' ? 0 : 1) || a.port - b.port);
+    const counts = {};
+    for (const c of out) counts[c.state] = (counts[c.state] || 0) + 1;
+    sendJSON(res, 200, { ts: state.ts, total: out.length, counts, conns: out.slice(0, 2000) });
+    return;
+  }
+
+  // ── 容器资源（一次 docker stats 覆盖全部容器）────────────────────────────
+  if (pathname === '/api/container/stats') {
+    const now = Date.now();
+    if (now - containerStats.at > 10000) {
+      try {
+        const { stdout } = await execFileP('docker',
+          ['stats', '--no-stream', '--format', '{{json .}}'],
+          { timeout: 8000, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
+        const map = new Map();
+        for (const line of String(stdout || '').split('\n')) {
+          const t = line.trim();
+          if (!t) continue;
+          try {
+            const o = JSON.parse(t);
+            map.set(o.Name, {
+              name: o.Name,
+              cpuPct: o.CPUPerc || '',
+              memUsage: o.MemUsage || '',
+              memPct: o.MemPerc || '',
+              netIO: o.NetIO || '',
+              blockIO: o.BlockIO || '',
+              pids: o.PIDs || '',
+            });
+          } catch { /* 跳过坏行 */ }
+        }
+        containerStats = { at: now, map, error: '' };
+      } catch (e) {
+        containerStats = { at: now, map: containerStats.map, error: String(e.stderr || e.message || e).split('\n')[0].slice(0, 160) };
+      }
+    }
+    sendJSON(res, 200, {
+      ts: containerStats.at, error: containerStats.error,
+      stats: [...containerStats.map.values()],
+    });
+    return;
+  }
+
+  // ── 容器日志 ────────────────────────────────────────────────────────────
+  if (pathname === '/api/container/logs') {
+    const name = String(query.get('name') || '').trim();
+    const lines = Math.min(1000, Math.max(10, num(query.get('lines')) || 200));
+    if (!name || !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,80}$/.test(name)) { sendJSON(res, 400, { error: '容器名不合法' }); return; }
+    try {
+      const { stdout } = await execFileP('docker', ['logs', '--tail', String(lines), name],
+        { timeout: 8000, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
+      sendJSON(res, 200, { name, count: String(stdout || '').split('\n').length, lines: String(stdout || '').split('\n').slice(-lines) });
+    } catch (e) {
+      sendJSON(res, 500, { error: String(e.stderr || e.message || e).split('\n')[0].slice(0, 200) });
+    }
+    return;
+  }
+
+  // ── 容器启停 ────────────────────────────────────────────────────────────
+  if (pathname === '/api/container/action' && req.method === 'POST') {
+    const body = await parseBody(req);
+    const name = String(body.name || '').trim();
+    const action = String(body.action || '').trim();
+    const client = clientOf(req);
+    const tag = 'container.' + (action || 'unknown');
+    const reject = (msg) => {
+      auditRecord({ action: tag, target: name, result: 'rejected', message: msg, client });
+      sendJSON(res, 400, { error: msg });
+    };
+    if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,80}$/.test(name)) return reject('容器名不合法');
+    if (!['start', 'stop', 'restart'].includes(action)) return reject('不支持的操作：' + action);
+    if (body.confirm !== true) return reject('需要 confirm: true 才会执行');
+    try {
+      await execFileP('docker', [action, name], { timeout: 30000, encoding: 'utf8', maxBuffer: 4 * 1024 * 1024 });
+      containerStats.at = 0;                     // 让下一次查询重新拉 stats
+      auditRecord({ action: tag, target: name, result: 'ok', message: `docker ${action} ${name}`, client });
+      sendJSON(res, 200, { success: true, name, action });
+    } catch (e) {
+      const msg = String(e.stderr || e.message || e).split('\n')[0].slice(0, 200);
+      auditRecord({ action: tag, target: name, result: 'error', message: msg || 'docker 执行失败', client });
+      sendJSON(res, 400, { error: msg || 'docker 执行失败' });
+    }
+    return;
+  }
+
+  // ── 进程快照 ────────────────────────────────────────────────────────────
+  if (pathname === '/api/snapshots' && req.method === 'GET') {
+    sendJSON(res, 200, { snapshots: snapshotStore.list(50), health: snapshotStore.health() });
+    return;
+  }
+
+  if (pathname === '/api/snapshot' && req.method === 'POST') {
+    const body = await parseBody(req);
+    ensureFreshProcs();
+    const r = snapshotStore.save(procs, String(body.label || '').trim());
+    if (!r.ok) { sendJSON(res, 400, { error: r.error }); return; }
+    auditRecord({ action: 'snapshot.save', target: String(r.id), result: 'ok', message: `保存快照 #${r.id}（${r.count} 个进程）`, client: clientOf(req) });
+    sendJSON(res, 200, { success: true, ...r });
+    return;
+  }
+
+  if (pathname === '/api/snapshot/delete' && req.method === 'POST') {
+    const body = await parseBody(req);
+    if (body.confirm !== true) { sendJSON(res, 400, { error: '需要 confirm: true' }); return; }
+    const r = snapshotStore.remove(num(body.id));
+    sendJSON(res, r.ok ? 200 : 400, r);
+    return;
+  }
+
+  if (pathname === '/api/snapshot/diff') {
+    const a = num(query.get('a'));
+    const b = num(query.get('b'));
+    if (!a || !b) { sendJSON(res, 400, { error: '需要 a 和 b 两个快照 id' }); return; }
+    sendJSON(res, 200, { a, b, ...snapshotStore.diff(a, b) });
+    return;
+  }
+
+  // ── 看门狗 ──────────────────────────────────────────────────────────────
+  if (pathname === '/api/watchdogs' && req.method === 'GET') {
+    sendJSON(res, 200, { watchdogs: alertStore.listWatchdogs() });
+    return;
+  }
+
+  if (pathname === '/api/watchdogs' && req.method === 'POST') {
+    const body = await parseBody(req);
+    // 执行命令是高风险动作：必须显式确认，且默认不启用
+    if (!body.id && body.acknowledge !== true) {
+      sendJSON(res, 400, { error: '看门狗会以 root 身份执行命令，需要 acknowledge: true 确认已知悉风险' });
+      return;
+    }
+    const r = alertStore.saveWatchdog({ enabled: false, ...body });
+    if (!r.ok) { sendJSON(res, 400, { error: r.error }); return; }
+    auditRecord({
+      action: 'watchdog.save', target: String(r.id), result: 'ok',
+      message: `${body.id ? '更新' : '新建'}看门狗 ${body.name || ''} → ${body.command || ''}`,
+      client: clientOf(req),
+    });
+    sendJSON(res, 200, { success: true, id: r.id });
+    return;
+  }
+
+  if (pathname === '/api/watchdogs/delete' && req.method === 'POST') {
+    const body = await parseBody(req);
+    if (body.confirm !== true) { sendJSON(res, 400, { error: '需要 confirm: true' }); return; }
+    const r = alertStore.deleteWatchdog(num(body.id));
+    if (!r.ok) { sendJSON(res, 400, { error: r.error }); return; }
+    auditRecord({ action: 'watchdog.delete', target: String(body.id), result: 'ok', message: `删除看门狗 #${body.id}`, client: clientOf(req) });
+    sendJSON(res, 200, { success: true, ...r });
+    return;
+  }
+
+  // ── 进程调优（renice / OOM 保护 / cgroup 内存上限）──────────────────────
+  if (pathname === '/api/tune' && req.method === 'POST') {
+    const body = await parseBody(req);
+    const pid = num(body.pid);
+    const action = String(body.action || '').trim();
+    const client = clientOf(req);
+    const tag = 'tune.' + (action || 'unknown');
+    const reject = (msg) => {
+      auditRecord({ action: tag, target: String(pid), result: 'rejected', message: msg, client });
+      sendJSON(res, 400, { error: msg });
+    };
+    if (!pid || pid <= 1) return reject('拒绝：PID 必须 > 1');
+    if (pid === process.pid) return reject('拒绝：不能调自己的优先级');
+    if (body.confirm !== true) return reject('需要 confirm: true 才会执行');
+    if (!existsSync(`/proc/${pid}`)) return reject('进程不存在');
+    try {
+      if (action === 'renice') {
+        const nice = Math.max(-20, Math.min(19, Math.round(Number(body.value) || 0)));
+        os.setPriority(pid, nice);
+        auditRecord({ action: tag, target: String(pid), result: 'ok', message: `renice ${nice}`, client });
+        sendJSON(res, 200, { success: true, pid, nice });
+      } else if (action === 'oom') {
+        const adj = Math.max(-1000, Math.min(1000, Math.round(Number(body.value) || 0)));
+        writeFileSync(`/proc/${pid}/oom_score_adj`, String(adj));
+        auditRecord({ action: tag, target: String(pid), result: 'ok', message: `oom_score_adj=${adj}`, client });
+        sendJSON(res, 200, { success: true, pid, oomScoreAdj: adj });
+      } else if (action === 'cgroup-memory-high') {
+        const cg = readCgroupMem(pid);
+        if (!cg || !cg.path) return reject('该进程没有 cgroup 信息');
+        const base = '/sys/fs/cgroup' + (cg.path === '/' ? '' : cg.path);
+        const raw = String(body.value == null ? '' : body.value).trim();
+        const value = raw === 'max' ? 'max' : String(Math.max(0, Math.round(Number(raw) || 0)));
+        if (value !== 'max' && value === '0') return reject('内存上限必须是正整数或 max');
+        writeFileSync(join(base, 'memory.high'), value);
+        auditRecord({ action: tag, target: String(pid), result: 'ok', message: `memory.high=${value}（${cg.path}）`, client });
+        sendJSON(res, 200, { success: true, pid, value, cgroup: cg.path });
+      } else {
+        return reject('不支持的操作：' + action);
+      }
+    } catch (e) {
+      const msg = (e.code === 'EPERM' ? '权限不足（EPERM）' : (e.code === 'EACCES' ? '内核不允许（EACCES）' : e.message));
+      auditRecord({ action: tag, target: String(pid), result: 'error', message: String(msg).slice(0, 200), client });
+      sendJSON(res, 400, { error: msg });
+    }
+    return;
+  }
+
+  // ── Prometheus 指标 ─────────────────────────────────────────────────────
+  if (pathname === '/metrics') {
+    const L = [];
+    const add = (name, help, val, labels = '') => {
+      L.push(`# HELP ${name} ${help}`, `# TYPE ${name} gauge`, `${name}${labels} ${val}`);
+    };
+    add('fnproc_up', '进程管家是否在运行', 1);
+    add('fnproc_cpu_percent', '整机 CPU 使用率', state.cpu.totalPct);
+    add('fnproc_load1', '1 分钟负载', state.load[0]);
+    add('fnproc_mem_percent', '内存使用率', state.mem.usedPct);
+    add('fnproc_mem_used_bytes', '已用内存', state.mem.used);
+    add('fnproc_swap_percent', 'Swap 使用率', state.swap.usedPct);
+    add('fnproc_procs_total', '进程总数', state.procTotal);
+    add('fnproc_io_read_bps', '磁盘读速率', state.io.readBps);
+    add('fnproc_io_write_bps', '磁盘写速率', state.io.writeBps);
+    add('fnproc_net_rx_bps', '网络收速率', state.net.rxBps);
+    add('fnproc_net_tx_bps', '网络发速率', state.net.txBps);
+    add('fnproc_psi_mem_some_avg60', '内存压力 PSI', psi.mem);
+    for (const v of volumes.list) {
+      add('fnproc_volume_used_percent', '卷使用率', v.usedPct, `{mount="${v.mount}"}`);
+    }
+    for (const a of alertEngine.snapshot()) {
+      add('fnproc_alert_breaching', '规则是否正在违规', a.breaching ? 1 : 0, `{rule="${String(a.name).replace(/["\\]/g, '')}"}`);
+    }
+    add('fnproc_alert_events_total', '历史告警事件数', alertStore.stats().events);
+    // 每个进程只导出内存前 50，避免指标爆炸
+    for (const p of [...procs].sort((a, b) => b.rss - a.rss).slice(0, 50)) {
+      const nm = String(p.name || '').replace(/["\\]/g, '');
+      add('fnproc_process_rss_bytes', '进程常驻内存', p.rss, `{pid="${p.pid}",name="${nm}"}`);
+      add('fnproc_process_cpu_percent', '进程 CPU 使用率', p.cpuPct, `{pid="${p.pid}",name="${nm}"}`);
+    }
+    const body = L.join('\n') + '\n';
+    res.writeHead(200, { 'Content-Type': 'text/plain; version=0.0.4; charset=utf-8' });
+    res.end(body);
+    return;
+  }
+
+  // ── CSV 导出 ────────────────────────────────────────────────────────────
+  if (pathname === '/api/export') {
+    const what = String(query.get('what') || 'processes').trim();
+    const csvCell = (v) => {
+      const s = String(v == null ? '' : v);
+      return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+    };
+    let header = [];
+    let rows = [];
+    if (what === 'processes') {
+      ensureFreshProcs();
+      header = ['pid', 'ppid', 'name', 'user', 'state', 'cpuPct', 'rssBytes', 'threads', 'cpuTimeSec', 'cmd'];
+      rows = procs.map((p) => [p.pid, p.ppid, p.name, p.user, p.state, p.cpuPct, p.rss, p.threads, p.cpuTime, p.cmd]);
+    } else if (what === 'history') {
+      const minutes = Math.min(10080, Math.max(1, num(query.get('minutes')) || 1440));
+      const q = historyStore.query(minutes, 600);
+      header = ['ts', 'isoTime', 'cpu', 'mem', 'swap', 'load1', 'readBps', 'writeBps', 'rxBps', 'txBps'];
+      rows = (q.rows || []).map((r) => [r.ts, new Date(r.ts).toISOString(), r.cpu, r.mem, r.swap, r.load1, r.rd, r.wr, r.rx, r.tx]);
+    } else if (what === 'audit') {
+      const q = auditStore.list({ limit: 5000, offset: 0, q: '', action: '', result: '' });
+      header = ['id', 'isoTime', 'action', 'target', 'result', 'message', 'client', 'detail'];
+      rows = (q.rows || []).map((r) => [r.id, new Date(r.ts).toISOString(), r.action, r.target, r.result, r.message, r.client, r.detail]);
+    } else if (what === 'alerts') {
+      const q = alertStore.listEvents({ limit: 5000, offset: 0 });
+      header = ['id', 'isoTime', 'level', 'rule', 'metric', 'value', 'message', 'delivered'];
+      rows = (q.rows || []).map((r) => [r.id, new Date(r.ts).toISOString(), r.level, r.ruleName, r.metric, r.value, r.message, JSON.stringify(r.delivered)]);
+    } else {
+      sendJSON(res, 400, { error: '不支持的导出类型：' + what });
+      return;
+    }
+    const body = [header.join(','), ...rows.map((r) => r.map(csvCell).join(','))].join('\n') + '\n';
+    res.writeHead(200, {
+      'Content-Type': 'text/csv; charset=utf-8',
+      'Content-Disposition': `attachment; filename="fnproc-${what}-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '')}.csv"`,
+      'Content-Length': Buffer.byteLength(body),
+    });
+    res.end('\ufeff' + body);           // BOM：Excel 打开中文不乱码
+    return;
+  }
+
+  // ── 定时任务（crontab）────────────────────────────────────────────────────
+  if (pathname === '/api/cron') {
+    const jobs = [];
+    const pushFile = (file, owner) => {
+      const raw = readOr(file);
+      if (!raw) return;
+      for (const line of raw.split('\n')) {
+        const t = line.trim();
+        if (!t || t.startsWith('#')) continue;
+        // 环境变量行（KEY=value）不是任务
+        if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(t)) continue;
+        const f = t.split(/\s+/);
+        if (f.length < 6) continue;
+        // /etc/crontab 和 /etc/cron.d/* 多一列「运行用户」，用户级 crontab 没有
+        const hasUserCol = file === '/etc/crontab' || file.startsWith('/etc/cron.d/');
+        const cmdFrom = hasUserCol ? 6 : 5;
+        const who = hasUserCol ? f[5] : owner;
+        if (f.length < cmdFrom + 1) continue;
+        jobs.push({ file, owner: who, schedule: f.slice(0, 5).join(' '), command: f.slice(cmdFrom).join(' ').slice(0, 300) });
+      }
+    };
+    pushFile('/etc/crontab', 'root');
+    try {
+      for (const f of readdirSync('/etc/cron.d')) pushFile(join('/etc/cron.d', f), 'root');
+    } catch { /* 没有 cron.d */ }
+    try {
+      for (const f of readdirSync('/var/spool/cron/crontabs')) pushFile(join('/var/spool/cron/crontabs', f), f);
+    } catch {
+      try { for (const f of readdirSync('/var/spool/cron')) pushFile(join('/var/spool/cron', f), f); } catch { /* 忽略 */ }
+    }
+    sendJSON(res, 200, { count: jobs.length, jobs });
+    return;
+  }
+
+  // ── 开机耗时 ────────────────────────────────────────────────────────────
+  if (pathname === '/api/boot') {
+    const out = { kernelSec: null, userspaceSec: null, blame: [], error: '' };
+    try {
+      const t = await execFileP('systemd-analyze', [], { timeout: 6000, encoding: 'utf8' });
+      const txt = String(t.stdout || '');
+      const k = txt.match(/([\d.]+)s \(kernel\)/);
+      const u = txt.match(/([\d.]+)s \(userspace\)/);
+      const total = txt.match(/=\s*([\d.]+)s/);
+      if (k) out.kernelSec = Number(k[1]);
+      if (u) out.userspaceSec = Number(u[1]);
+      if (total) out.totalSec = Number(total[1]);
+      out.raw = txt.trim().replace(/\s+/g, ' ').slice(0, 300);
+    } catch (e) { out.error = String(e.stderr || e.message || '').slice(0, 160); }
+    try {
+      const b = await execFileP('systemd-analyze', ['blame'], { timeout: 8000, encoding: 'utf8', maxBuffer: 4 * 1024 * 1024 });
+      out.blame = String(b.stdout || '').split('\n').filter(Boolean).slice(0, 15).map((l) => l.trim());
+    } catch { /* 忽略 */ }
+    sendJSON(res, 200, out);
+    return;
+  }
+
   // 操作审计：从 SQLite 分页查，支持按动作 / 结果 / 关键字过滤
   if (pathname === '/api/audit') {
     const limit = num(query.get('limit')) || 50;
@@ -1604,7 +1999,9 @@ async function handle(req, res, pathname, query) {
     const q = String(query.get('q') || '').trim();
     const action = String(query.get('action') || '').trim();
     const result = String(query.get('result') || '').trim();
-    const { rows, total, degraded } = auditStore.list({ limit, offset, q, action, result });
+    // since：毫秒时间戳，用于「最近 1 小时 / 24 小时 / 7 天」筛选
+    const since = num(query.get('since')) || 0;
+    const { rows, total, degraded } = auditStore.list({ limit, offset, q, action, result, since });
     sendJSON(res, 200, {
       actions: rows, total, limit, offset, degraded,
       stats: auditStore.stats(),
@@ -1638,7 +2035,7 @@ const httpServer = createServer(async (req, res) => {
   } catch { /* 忽略 */ }
   if (pathname === GATEWAY_PREFIX) pathname = '/';
   else if (pathname.startsWith(GATEWAY_PREFIX + '/')) pathname = pathname.slice(GATEWAY_PREFIX.length);
-  if (pathname.startsWith('/api/')) {
+  if (pathname.startsWith('/api/') || pathname === '/metrics') {
     try { await handle(req, res, pathname, query); }
     catch (e) { console.error('[api]', e); sendJSON(res, 500, { error: String(e.message || e) }); }
     return;

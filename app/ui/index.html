@@ -138,6 +138,16 @@
         </div>
       </article>
     </div>
+    <div class="charts extra-row">
+      <article class="card">
+        <div class="card-head"><h2>资源压力（PSI）</h2><span class="hint">进程正在等待资源的时间占比</span></div>
+        <div class="psi-grid" id="psi-grid"><span class="hint">加载中…</span></div>
+      </article>
+      <article class="card">
+        <div class="card-head"><h2>卷用量</h2><span class="hint" id="vol-hint">—</span></div>
+        <div class="vol-list" id="vol-list"><span class="hint">加载中…</span></div>
+      </article>
+    </div>
   </section>
 
   <!-- ── 进程 ── -->
@@ -163,6 +173,8 @@
             <option value="start">按启动时间</option>
           </select>
           <button class="btn ghost" id="btn-refresh" type="button" title="立即刷新">刷新</button>
+          <button class="btn ghost" id="btn-snapshot" type="button" title="保存当前进程清单，用于事后对比">存快照</button>
+          <button class="btn ghost" id="btn-snap-diff" type="button" title="对比两个快照，看谁新起/谁没了">快照对比</button>
         </div>
       </div>
 
@@ -215,10 +227,14 @@
   <section class="tab-panel" id="panel-ports" role="tabpanel" hidden>
     <article class="card">
       <div class="card-head panel-head">
-        <h2>监听端口</h2>
-        <span class="hint">TCP LISTEN + UDP · 有人在看时 10 秒刷新，空闲时 60 秒</span>
+        <h2>网络端口</h2>
+        <div class="views" id="port-views">
+          <button class="vbtn active" data-pmode="listen" type="button">监听端口</button>
+          <button class="vbtn" data-pmode="all" type="button">全部连接</button>
+        </div>
+        <span class="hint" id="port-hint">TCP LISTEN + UDP · 有人在看时 10 秒刷新，空闲时 60 秒</span>
       </div>
-      <div class="table-wrap">
+      <div class="table-wrap" id="view-ports-listen">
         <table class="ptable">
           <thead>
             <tr>
@@ -232,9 +248,28 @@
             </tr>
           </thead>
           <tbody id="portbody"></tbody>
-        </table>
-        <div class="empty" id="ports-empty" hidden>没有采集到监听端口</div>
-      </div>
+          </table>
+          <div class="empty" id="ports-empty" hidden>没有采集到监听端口</div>
+          </div>
+          <div class="table-wrap" id="view-ports-all" hidden>
+          <table class="ptable">
+          <thead>
+            <tr>
+              <th class="num">本地端口</th>
+              <th>协议</th>
+              <th class="hide-sm">本地地址</th>
+              <th class="num">远端端口</th>
+              <th class="hide-md">远端地址</th>
+              <th>状态</th>
+              <th class="num">PID</th>
+              <th>进程</th>
+              <th class="hide-md">容器</th>
+            </tr>
+          </thead>
+          <tbody id="connbody"></tbody>
+          </table>
+          <div class="empty" id="conn-empty" hidden>没有采集到连接</div>
+          </div>
     </article>
   </section>
 
@@ -253,7 +288,8 @@
               <th class="num">进程数</th>
               <th class="num">CPU%</th>
               <th class="num">内存</th>
-              <th class="num hide-sm">线程</th>
+              <th class="num hide-sm">线程 / PID</th>
+              <th class="num hide-md">网络 IO</th>
               <th class="num hide-md">容器 ID</th>
               <th>操作</th>
             </tr>
@@ -305,6 +341,24 @@
           </table>
           <div class="empty" id="timers-empty" hidden>没有定时器</div>
         </div>
+        </details>
+        </article>
+        <article class="card">
+        <details class="timers-block">
+        <summary><h2>定时任务（crontab）</h2><span class="hint" id="cron-hint">—</span></summary>
+        <div class="table-wrap">
+          <table class="ptable">
+            <thead><tr><th class="hide-sm">用户</th><th>时间表达式</th><th>命令</th><th class="hide-md">来源</th></tr></thead>
+            <tbody id="cron-body"></tbody>
+          </table>
+          <div class="empty" id="cron-empty" hidden>没有 crontab 任务</div>
+        </div>
+        </details>
+        </article>
+        <article class="card">
+        <details class="timers-block">
+        <summary><h2>开机耗时</h2><span class="hint" id="boot-hint">—</span></summary>
+        <pre class="log-pre" id="boot-pre" style="max-height:260px">加载中…</pre>
         </details>
         </article>
         </section>
@@ -370,6 +424,26 @@
         <div class="empty" id="alert-events-empty" hidden>还没有触发记录</div>
       </div>
     </article>
+
+    <article class="card">
+      <div class="card-head panel-head">
+        <h2>看门狗</h2>
+        <div class="procs-tools">
+          <span class="hint" id="wd-hint">监视的进程不在了，就执行一条命令把它拉回来</span>
+          <button class="btn" id="wd-add" type="button">＋ 新建看门狗</button>
+        </div>
+      </div>
+      <p class="hint danger-hint">⚠️ 看门狗执行的命令会以 <b>root</b> 身份运行（<code>/bin/sh -c</code>）。新建时默认不启用，确认命令无误后再手动打开。</p>
+      <div class="table-wrap">
+        <table class="ptable">
+          <thead>
+            <tr><th class="num">#</th><th>名称</th><th>监视进程</th><th class="hide-sm">执行命令</th><th class="num hide-sm">冷却</th><th class="num hide-sm">已执行</th><th>状态</th><th>操作</th></tr>
+          </thead>
+          <tbody id="wd-body"></tbody>
+        </table>
+        <div class="empty" id="wd-empty" hidden>还没有看门狗</div>
+      </div>
+    </article>
   </section>
 
   <!-- ── 记录 ── -->
@@ -394,8 +468,15 @@
           <option value="error">失败</option>
         </select>
         <input class="au-input" id="audit-q" type="search" placeholder="搜索目标 / 说明…" aria-label="搜索记录">
+        <select id="audit-range" aria-label="时间范围">
+          <option value="">全部时间</option>
+          <option value="1">最近 1 小时</option>
+          <option value="24">最近 24 小时</option>
+          <option value="168">最近 7 天</option>
+        </select>
         <button class="btn tiny" id="audit-refresh" type="button">刷新</button>
-      </div>
+        <button class="btn tiny ghost" id="audit-export" type="button" title="导出当前筛选结果为 CSV">导出 CSV</button>
+        </div>
 
       <div class="audit-meta" id="audit-meta"></div>
       <ul class="audit" id="audit"><li class="hint">暂无操作</li></ul>
@@ -426,18 +507,18 @@
   </div>
   <div class="drawer-body">
     <div class="dgrid" id="d-grid"></div>
-    <div class="dblock">
-      <label>父进程链</label>
+    <details class="dblock" open>
+      <summary>父进程链</summary>
       <div id="d-parents" class="chips">—</div>
-    </div>
+    </details>
     <div class="dblock" id="d-cgroup-block">
       <label>控制组（cgroup）· 内存额度</label>
       <div id="d-cgroup" class="chips">—</div>
     </div>
-    <div class="dblock">
-      <label>线程 <span class="hint" id="d-thread-count"></span></label>
+    <details class="dblock" open>
+      <summary>线程 <span class="hint" id="d-thread-count"></span></summary>
       <div id="d-threads" class="chips">—</div>
-    </div>
+    </details>
     <div class="dblock">
       <label>命令行</label>
       <pre id="d-cmd">—</pre>
@@ -446,10 +527,10 @@
       <label>可执行文件 / 工作目录</label>
       <pre id="d-paths">—</pre>
     </div>
-    <div class="dblock">
-      <label>环境变量 <span class="hint" id="d-env-count"></span></label>
+    <details class="dblock" open>
+      <summary>环境变量 <span class="hint" id="d-env-count"></span></summary>
       <pre id="d-env" class="env-pre">—</pre>
-    </div>
+    </details>
     <div class="dblock">
       <label>子进程</label>
       <div id="d-children" class="chips">—</div>
@@ -523,6 +604,42 @@
     <pre class="log-pre" id="log-pre">加载中…</pre>
     <div class="modal-actions">
       <button class="btn ghost" id="log-close" type="button">关闭</button>
+    </div>
+  </div>
+</div>
+
+<!-- 快照对比 -->
+<div class="modal-mask" id="snap-mask" hidden>
+  <div class="modal wide" role="dialog" aria-modal="true" aria-label="快照对比">
+    <h3>快照对比</h3>
+    <div class="log-tools">
+      <select id="snap-a" title="基准快照"><option value="">基准（较早）</option></select>
+      <select id="snap-b" title="对比快照"><option value="">对比（较晚）</option></select>
+      <button class="btn ghost" id="snap-run" type="button">对比</button>
+      <button class="btn ghost" id="snap-del" type="button">删除选中</button>
+    </div>
+    <div id="snap-result" class="snap-result"><p class="hint">选两个快照，点「对比」：会列出新起的进程、消失的进程，以及内存变化最大的进程。</p></div>
+    <div class="modal-actions">
+      <button class="btn ghost" id="snap-close" type="button">关闭</button>
+    </div>
+  </div>
+</div>
+
+<!-- 看门狗编辑 -->
+<div class="modal-mask" id="wd-mask" hidden>
+  <div class="modal wide" role="dialog" aria-modal="true" aria-label="看门狗">
+    <h3 id="wd-modal-title">新建看门狗</h3>
+    <div class="alert-form">
+      <label class="fld"><span>名称</span><input id="wd-name" type="text" maxlength="60" placeholder="例如：拉起 nginx"></label>
+      <label class="fld"><span>监视（进程名或 PID）</span><input id="wd-match" type="text" maxlength="200" placeholder="例如：nginx"></label>
+      <label class="fld full"><span>命令（root 执行，/bin/sh -c）</span><input id="wd-command" type="text" maxlength="500" placeholder="例如：systemctl start nginx"></label>
+      <label class="fld"><span>冷却（秒）</span><input id="wd-cooldown" type="number" min="30" max="86400" value="300"></label>
+      <label class="fld chk"><input id="wd-enabled" type="checkbox"><span>启用（勾选后立即生效）</span></label>
+    </div>
+    <p class="hint danger-hint">命令会以 root 身份执行。启用前请先在终端手动验证一遍。</p>
+    <div class="modal-actions">
+      <button class="btn ghost" id="wd-cancel" type="button">取消</button>
+      <button class="btn" id="wd-save" type="button">保存</button>
     </div>
   </div>
 </div>

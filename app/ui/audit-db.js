@@ -142,7 +142,7 @@ export function openAuditStore(dbPath, { version = '' } = {}) {
     }
   }
 
-  function list({ limit = 50, offset = 0, q = '', action = '', result = '' } = {}) {
+  function list({ limit = 50, offset = 0, q = '', action = '', result = '', since = 0 } = {}) {
     if (!db) {
       const rows = pending.slice().reverse().map((r, i) => toLegacy({ ...r, id: pending.length - i }));
       return { rows, total: rows.length, degraded: true };
@@ -151,6 +151,7 @@ export function openAuditStore(dbPath, { version = '' } = {}) {
     const args = [];
     if (action) { where.push('action LIKE ?'); args.push(action + '%'); }
     if (result) { where.push('result = ?'); args.push(result); }
+    if (since) { where.push('ts >= ?'); args.push(Number(since) || 0); }
     if (q) {
       where.push('(target LIKE ? OR message LIKE ? OR action LIKE ? OR detail LIKE ?)');
       const like = `%${q}%`;

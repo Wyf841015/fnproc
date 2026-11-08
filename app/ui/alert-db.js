@@ -43,6 +43,17 @@ CREATE TABLE IF NOT EXISTS alert_events (
   version    TEXT    NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_alert_events_ts ON alert_events(ts DESC);
+CREATE TABLE IF NOT EXISTS watchdogs (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  name         TEXT    NOT NULL,
+  match        TEXT    NOT NULL,
+  command      TEXT    NOT NULL DEFAULT '',
+  enabled      INTEGER NOT NULL DEFAULT 0,
+  cooldown_sec INTEGER NOT NULL DEFAULT 300,
+  last_run     INTEGER NOT NULL DEFAULT 0,
+  runs         INTEGER NOT NULL DEFAULT 0,
+  created      INTEGER NOT NULL DEFAULT 0
+);
 `;
 
 // 支持的判据：metric → 人类可读说明（前端也用它做提示）
@@ -183,6 +194,60 @@ export function openAlertStore(dbPath, { version = '' } = {}) {
       }
     },
 
+    // ── 看门狗（进程消失后执行命令）────────────────────────────────────
+    listWatchdogs() {
+      if (!db) return [];
+      try {
+        return db.prepare('SELECT * FROM watchdogs ORDER BY id').all().map((r) => ({
+          id: r.id, name: r.name, match: r.match, command: r.command,
+          enabled: !!r.enabled, cooldownSec: r.cooldown_sec,
+          lastRun: r.last_run, runs: r.runs, created: r.created,
+        }));
+      } catch { return []; }
+    },
+
+    saveWatchdog(input) {
+      if (!db) return { ok: false, error: '告警库不可用' };
+      const name = String(input.name || '').trim().slice(0, 80);
+      const match = String(input.match || '').trim().slice(0, 200);
+      const command = String(input.command || '').trim().slice(0, 1000);
+      if (!name) return { ok: false, error: '名称不能为空' };
+      if (!match) return { ok: false, error: '必须填写要监视的进程（名称或 PID）' };
+      if (!command) return { ok: false, error: '必须填写要执行的命令' };
+      try {
+        const id = Number(input.id) || 0;
+        const vals = [name, match, command, input.enabled ? 1 : 0,
+          Math.max(30, Math.min(86400, Math.round(Number(input.cooldownSec) || 300)))];
+        if (id) {
+          db.prepare('UPDATE watchdogs SET name=?, match=?, command=?, enabled=?, cooldown_sec=? WHERE id=?')
+            .run(...vals, id);
+          return { ok: true, id };
+        }
+        const info = db.prepare(
+          'INSERT INTO watchdogs (name, match, command, enabled, cooldown_sec, created) VALUES (?,?,?,?,?,?)',
+        ).run(...vals, Date.now());
+        return { ok: true, id: Number(info.lastInsertRowid) };
+      } catch (e) {
+        error = e.message;
+        return { ok: false, error: e.message };
+      }
+    },
+
+    deleteWatchdog(id) {
+      if (!db) return { ok: false, error: '告警库不可用' };
+      try {
+        const info = db.prepare('DELETE FROM watchdogs WHERE id = ?').run(Number(id) || 0);
+        return { ok: true, removed: Number(info.changes) || 0 };
+      } catch (e) {
+        return { ok: false, error: e.message };
+      }
+    },
+
+    touchWatchdog(id, ts = Date.now()) {
+      if (!db) return;
+      try { db.prepare('UPDATE watchdogs SET last_run = ?, runs = runs + 1 WHERE id = ?').run(ts, id); } catch { /* 忽略 */ }
+    },
+
     listEvents({ limit = 100, offset = 0, level = '', ruleId = 0 } = {}) {
       if (!db) return { rows: [], total: 0 };
       try {
@@ -218,7 +283,8 @@ export function openAlertStore(dbPath, { version = '' } = {}) {
       try {
         const r = db.prepare('SELECT count(*) AS c, sum(enabled) AS e FROM alert_rules').get();
         const ev = db.prepare('SELECT count(*) AS c, max(ts) AS m FROM alert_events').get();
-        return { rules: r.c || 0, enabled: r.e || 0, events: ev.c || 0, lastEventTs: ev.m || 0 };
+        const wd = db.prepare('SELECT count(*) AS c FROM watchdogs').get();
+        return { rules: r.c || 0, enabled: r.e || 0, events: ev.c || 0, lastEventTs: ev.m || 0, watchdogs: wd.c || 0 };
       } catch { return { rules: 0, enabled: 0, events: 0, lastEventTs: 0 }; }
     },
 

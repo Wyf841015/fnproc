@@ -210,12 +210,50 @@ SELECT uid, id, 0 FROM users, n;`.trim();
     return { id, ts, message, delivered };
   }
 
+  // ── 看门狗：进程不在就执行指定命令 ────────────────────────────────────────
+  // 这是本项目唯一会「主动跑命令」的功能，风险面明确写在界面上：
+  // 命令以 root 身份通过 /bin/sh -c 执行，只在启用且冷却期外执行一次。
+  async function runWatchdogs() {
+    const list = store.listWatchdogs().filter((w) => w.enabled);
+    if (!list.length) return;
+    for (const w of list) {
+      const key = String(w.match || '').trim();
+      if (!key) continue;
+      const alive = /^\d+$/.test(key)
+        ? ctx.procs.some((p) => p.pid === Number(key))
+        : ctx.procs.some((p) => (p.name || '').toLowerCase() === key.toLowerCase()
+            || (p.cmd || '').toLowerCase().includes(key.toLowerCase()));
+      if (alive) continue;
+      if (Date.now() - (w.lastRun || 0) < Math.max(30, w.cooldownSec) * 1000) continue;
+      let out = { ok: false, error: '' };
+      try {
+        const { stdout, stderr } = await execFileP('/bin/sh', ['-c', w.command],
+          { timeout: 15000, encoding: 'utf8', maxBuffer: 1024 * 1024 });
+        out = { ok: true, stdout: String(stdout || '').slice(-400), stderr: String(stderr || '').slice(-200) };
+      } catch (e) {
+        out = { ok: false, error: String(e.stderr || e.message || e).slice(0, 300) };
+      }
+      store.touchWatchdog(w.id);
+      const message = `看门狗「${w.name}」：未找到 ${w.match}，执行命令 ${out.ok ? '成功' : '失败（' + out.error + '）'}`;
+      const delivered = {};
+      if (w.command) delivered.watchdog = out;
+      store.addEvent({
+        ts: Date.now(), ruleId: 0, ruleName: w.name, metric: 'watchdog',
+        value: 0, level: out.ok ? 1 : 2, message, delivered,
+      });
+      log(`[watchdog] ${message}`);
+    }
+  }
+
   // ── 判定主循环 ──────────────────────────────────────────────────────────
   async function evaluate() {
     if (!store.enabled || delivering) return;
     delivering = true;
     lastEvalAt = Date.now();
     try {
+      // 看门狗先跑（它只看进程在不在，很便宜；有命令才会真的执行）
+      try { await runWatchdogs(); } catch (e) { log('[watchdog] 异常: ' + (e.message || e)); }
+
       // systemd 单元状态按需补一次（有 unit_failed 规则时）
       const rules = store.listRules().filter((r) => r.enabled);
       const needUnits = rules.some((r) => r.metric === 'unit_failed');
@@ -262,6 +300,7 @@ SELECT uid, id, 0 FROM users, n;`.trim();
     setContext(next) { ctx = next; },
     evaluate,
     snapshot,
+    watchdogs: () => store.listWatchdogs(),
     lastEvalAt: () => lastEvalAt,
     // 测试投递：不写 last_fired，不影响冷却
     async test(rule, value = 0) {
