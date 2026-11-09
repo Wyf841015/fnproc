@@ -43,6 +43,10 @@ CREATE TABLE IF NOT EXISTS alert_events (
   version    TEXT    NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_alert_events_ts ON alert_events(ts DESC);
+CREATE TABLE IF NOT EXISTS app_settings (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL DEFAULT ''
+);
 CREATE TABLE IF NOT EXISTS pinned_services (
   name   TEXT PRIMARY KEY,
   ts     INTEGER NOT NULL DEFAULT 0
@@ -228,6 +232,25 @@ export function openAlertStore(dbPath, { version = '' } = {}) {
     },
 
     // ── 看门狗（进程消失后执行命令）────────────────────────────────────
+    // ── 通用键值设置（自动快照等少量开关） ─────────────────────────────
+    getSetting(key, dflt = null) {
+      if (!db) return dflt;
+      try {
+        const row = db.prepare('SELECT value FROM app_settings WHERE key = ?').get(String(key));
+        if (!row) return dflt;
+        try { return JSON.parse(row.value); } catch { return row.value; }
+      } catch { return dflt; }
+    },
+
+    setSetting(key, value) {
+      if (!db) return { ok: false, error: '库不可用' };
+      try {
+        db.prepare('INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, ?)')
+          .run(String(key).slice(0, 60), JSON.stringify(value ?? null));
+        return { ok: true };
+      } catch (e) { return { ok: false, error: e.message }; }
+    },
+
     // ── 关注的服务（钉在服务列表顶部） ──────────────────────────────────
     listPinned() {
       if (!db) return [];

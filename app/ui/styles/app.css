@@ -799,3 +799,15 @@ select {
   .ptable.cardify .pname .cmd { white-space: normal; overflow-wrap: anywhere; }
   .ptable.cardify .svc-desc { display: none; }
 }
+
+/* ── 快照自动保存行 ───────────────────────────────────── */
+.snap-auto-row {
+  display: flex; align-items: flex-end; gap: 10px; flex-wrap: wrap;
+  margin: 4px 0 10px; padding: 8px 10px;
+  border: 1px dashed var(--line); border-radius: var(--radius-sm);
+  background: rgba(56, 189, 248, .04);
+}
+.snap-auto-row .fld { margin: 0; }
+.snap-auto-row .fld input[type="number"] { width: 88px; }
+.snap-auto-row .fld.chk { align-self: center; }
+.footer #btn-diagnose { margin-left: auto; }

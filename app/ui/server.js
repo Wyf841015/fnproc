@@ -2142,6 +2142,100 @@ async function handle(req, res, pathname, query) {
   }
 
   // ── 进程快照 ────────────────────────────────────────────────────────────
+  // ── 诊断包：把排查常用的几样东西打成一个 tar.gz 交出去 ─────────────────
+  // 用户报「机器有问题」时，来回问日志 / 快照 / 服务状态效率很低。
+  // 这里一次性打包：运行日志、当前进程快照、端口归属、服务状态、历史曲线、
+  // 告警规则与事件、最近操作记录、版本与环境信息。
+  if (pathname === '/api/diagnose') {
+    ensureFreshProcs();
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const files = [];
+    const addText = (name, text) => files.push({ name, data: Buffer.from(String(text), 'utf8') });
+    const addJSON = (name, obj) => addText(name, JSON.stringify(obj, null, 2));
+
+    addJSON('meta.json', {
+      version: VERSION, node: process.version, platform: process.platform, arch: process.arch,
+      host: HOST_NAME, generatedAt: new Date().toISOString(),
+      uptimeSec: Math.round(process.uptime()), procCount: procs.length,
+      dataDir: PKGVAR, snapshotEnabled: snapshotStore.enabled,
+      historyEnabled: historyStore.enabled, auditEnabled: auditStore.enabled, alertEnabled: alertStore.enabled,
+    });
+    addJSON('processes.json', procs.map((p) => ({
+      pid: p.pid, ppid: p.ppid, name: p.name, user: p.user, state: p.state,
+      threads: p.threads, cpuPct: p.cpuPct, rss: p.rss, cpuTime: p.cpuTime,
+      cmd: String(p.cmd || '').slice(0, 400), container: p.container ? p.container.name : '',
+    })));
+    try { addJSON('ports.json', [...pidPorts.entries()].map(([pid, list]) => ({ pid, ports: list }))); } catch { /* 忽略 */ }
+    try { addJSON('history.json', historyStore.enabled ? historyStore.query(60, 240).rows : []); } catch { /* 忽略 */ }
+    try { addJSON('alerts.json', { rules: alertStore.listRules(), events: alertStore.listEvents({ limit: 100 }).rows }); } catch { /* 忽略 */ }
+    try { addJSON('audit.json', auditStore.enabled ? auditStore.list({ limit: 200 }).rows : []); } catch { /* 忽略 */ }
+    try { addJSON('snapshots.json', snapshotStore.enabled ? snapshotStore.list(20) : []); } catch { /* 忽略 */ }
+    const logPath = join(PKGVAR, 'info.log');
+    if (existsSync(logPath)) {
+      try {
+        const buf = readFileSync(logPath);
+        files.push({ name: 'info.log', data: buf.length > 4 * 1024 * 1024 ? buf.subarray(buf.length - 4 * 1024 * 1024) : buf });
+      } catch { /* 忽略 */ }
+    }
+
+    // 手写 tar（零依赖）：512 字节头 + 内容按 512 对齐
+    const blocks = [];
+    const push = (b) => blocks.push(b);
+    for (const f of files) {
+      const header = Buffer.alloc(512, 0);
+      header.write(f.name.slice(0, 99), 0, 'utf8');
+      header.write('0000644 ', 100);                       // mode
+      header.write('0000000 ', 108);                      // uid
+      header.write('0000000 ', 116);                      // gid
+      header.write(f.data.length.toString(8).padStart(11, '0') + ' ', 124);
+      header.write(Math.floor(Date.now() / 1000).toString(8) + ' ', 136);
+      header.write('        ', 148);                       // checksum 占位（空格）
+      header.write('0', 156);                              // typeflag: 普通文件
+      header.write('ustar ', 257);
+      header.write('00', 263);
+      let sum = 0;
+      for (const b of header) sum += b;
+      header.write(sum.toString(8).padStart(6, '0') + '  ', 148);
+      push(header);
+      push(f.data);
+      const pad = (512 - (f.data.length % 512)) % 512;
+      if (pad) push(Buffer.alloc(pad, 0));
+    }
+    push(Buffer.alloc(1024, 0));                            // tar 结尾两个空块
+    const tar = gzipSync(Buffer.concat(blocks));
+    auditRecord({ action: 'diagnose', target: `${files.length} 个文件`, result: 'ok', message: '导出诊断包', client: clientOf(req) });
+    res.writeHead(200, {
+      'Content-Type': 'application/gzip',
+      'Content-Disposition': `attachment; filename="fnproc-diag-${stamp}.tar.gz"`,
+      'Content-Length': tar.length,
+      'Cache-Control': 'no-store',
+    });
+    res.end(tar);
+    return;
+  }
+
+  if (pathname === '/api/settings') {
+    if (req.method === 'GET') {
+      sendJSON(res, 200, {
+        snapshotAuto: alertStore.getSetting('snapshotAuto', { enabled: false, keepDays: 30 }),
+      });
+      return;
+    }
+    const body = await readBody(req, res);
+    if (!body) return;
+    if (body.snapshotAuto && typeof body.snapshotAuto === 'object') {
+      const keepDays = Math.max(1, Math.min(365, Number(body.snapshotAuto.keepDays) || 30));
+      const enabled = body.snapshotAuto.enabled === true;
+      alertStore.setSetting('snapshotAuto', { enabled, keepDays });
+      auditRecord({
+        action: 'settings.update', target: 'snapshotAuto', result: 'ok',
+        message: `自动快照 ${enabled ? '开启' : '关闭'}，保留 ${keepDays} 天`, client: clientOf(req),
+      });
+    }
+    sendJSON(res, 200, { ok: true, snapshotAuto: alertStore.getSetting('snapshotAuto', { enabled: false, keepDays: 30 }) });
+    return;
+  }
+
   if (pathname === '/api/snapshots' && req.method === 'GET') {
     sendJSON(res, 200, { snapshots: snapshotStore.list(50), health: snapshotStore.health() });
     return;
@@ -2461,7 +2555,8 @@ async function handle(req, res, pathname, query) {
   const POST_ONLY = new Set(['/api/kill', '/api/service', '/api/service/enable', '/api/alerts',
     '/api/alerts/delete', '/api/alerts/test', '/api/watchdogs', '/api/watchdogs/delete',
     '/api/snapshot', '/api/snapshot/delete', '/api/container/action', '/api/tune',
-    '/api/watches', '/api/watches/delete', '/api/service/pin', '/api/kill/batch']);
+    '/api/watches', '/api/watches/delete', '/api/service/pin', '/api/kill/batch',
+    '/api/settings']);
   if (POST_ONLY.has(pathname)) {
     sendJSON(res, 405, { error: '该接口只接受 POST' });
     return;
@@ -2552,6 +2647,35 @@ refreshDocker();
 refreshInodePorts();
 refreshPidPorts();
 setInterval(appendHistory, 30000);   // 历史每 30 秒一行
+// 自动快照：每小时检查一次，按配置每天存 1 个、定期裁旧。
+// 手动快照靠人记得点，长期没人点就永远只有一个基准 —— 定时快照才让
+// 「上周和现在的进程清单差在哪」这类问题问得出来。
+setInterval(() => {
+  try {
+    if (!snapshotStore.enabled) return;
+    const auto = alertStore.getSetting('snapshotAuto', null) || {};
+    if (auto.enabled !== true) return;
+    const keepDays = Math.max(1, Math.min(365, Number(auto.keepDays) || 30));
+    const list = snapshotStore.list(200);
+    const autoMarks = list.filter((s) => String(s.label || '').startsWith('自动'));
+    const lastAuto = autoMarks[0];
+    const dayMs = 86400000;
+    const due = !lastAuto || (Date.now() - Number(lastAuto.ts || 0)) > dayMs;
+    if (due) {
+      const label = '自动 ' + new Date().toISOString().slice(0, 10);
+      const r2 = snapshotStore.save(procs, label);
+      if (r2 && r2.id) console.log(`[snapshot] 已自动快照 #${r2.id}（${label}）`);
+    }
+    // 裁掉超期的自动快照（手动的一个都不动）
+    const cutoff = Date.now() - keepDays * dayMs;
+    for (const s of autoMarks) {
+      if (Number(s.ts || 0) < cutoff) {
+        snapshotStore.remove(s.id);
+        console.log(`[snapshot] 已清理超期自动快照 #${s.id}`);
+      }
+    }
+  } catch (e) { console.error('[snapshot] 自动快照失败:', e.message); }
+}, 3600000);
 let portsTick = 0;
 setInterval(() => {
   portsTick += 1;

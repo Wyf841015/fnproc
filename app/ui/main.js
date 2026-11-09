@@ -55,15 +55,52 @@ function toast(msg, kind = 'info') {
 }
 
 // ── 主题 ────────────────────────────────────────────────────────────────
-function applyTheme(t) {
-  document.documentElement.dataset.theme = t;
-  $('theme-icon').textContent = t === 'light' ? '☀️' : '🌙';
-  localStorage.setItem('fnproc-theme', t);
+// 三态：light / dark / auto（跟随系统）。auto 时不写死具体主题，
+// 而是跟着 prefers-color-scheme 走，并在系统切换时实时跟随。
+const THEME_MODES = ['light', 'dark', 'auto'];
+const THEME_ICON = { light: '☀️', dark: '🌙', auto: '🌗' };
+const THEME_NAME = { light: '亮色', dark: '暗色', auto: '跟随系统' };
+
+function systemPrefersLight() {
+  return !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches);
 }
+
+function resolveTheme(mode) {
+  if (mode === 'auto') return systemPrefersLight() ? 'light' : 'dark';
+  return mode === 'light' ? 'light' : 'dark';
+}
+
+function applyTheme(mode, { persist = true } = {}) {
+  const m = THEME_MODES.includes(mode) ? mode : 'auto';
+  document.documentElement.dataset.theme = resolveTheme(m);
+  document.documentElement.dataset.themeMode = m;
+  const icon = $('theme-icon');
+  if (icon) icon.textContent = THEME_ICON[m];
+  const btn = $('btn-theme');
+  if (btn) btn.title = `主题：${THEME_NAME[m]}（点击切换）`;
+  if (persist) localStorage.setItem('fnproc-theme', m);
+}
+
+function cycleTheme() {
+  const cur = localStorage.getItem('fnproc-theme') || 'auto';
+  const i = THEME_MODES.indexOf(cur);
+  applyTheme(THEME_MODES[(i + 1) % THEME_MODES.length]);
+  toast(`主题：${THEME_NAME[THEME_MODES[(i + 1) % THEME_MODES.length]]}`, 'ok');
+}
+
 (function initTheme() {
   const saved = localStorage.getItem('fnproc-theme');
-  const prefersLight = window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches;
-  applyTheme(saved || (prefersLight ? 'light' : 'dark'));
+  applyTheme(saved || 'auto', { persist: false });
+  // 系统主题变化时，只有 auto 模式跟随；手动选过亮/暗的不动
+  if (window.matchMedia) {
+    const mq = window.matchMedia('(prefers-color-scheme: light)');
+    const onChange = () => {
+      const mode = localStorage.getItem('fnproc-theme') || 'auto';
+      if (mode === 'auto') applyTheme('auto', { persist: false });
+    };
+    if (mq.addEventListener) mq.addEventListener('change', onChange);
+    else if (mq.addListener) mq.addListener(onChange);
+  }
 })();
 
 // ── 图表（SVG 实现）────────────────────────────────────────────────────
@@ -1396,6 +1433,12 @@ async function saveSnapshot() {
 async function openSnapshotDiff() {
   showMask($('snap-mask'));
   $('snap-result').innerHTML = '<p class="hint">加载中…</p>';
+  // 自动快照开关：读后端设置回填（读失败就按关闭显示，不挡着对比功能）
+  fetch(API + '/settings', { cache: 'no-store' }).then((x) => x.json()).then((cfg) => {
+    const a = cfg.snapshotAuto || {};
+    if ($('snap-auto')) $('snap-auto').checked = a.enabled === true;
+    if ($('snap-auto-keep')) $('snap-auto-keep').value = String(a.keepDays || 30);
+  }).catch(() => {});
   try {
     const d = await (await fetch(API + '/snapshots', { cache: 'no-store' })).json();
     const list = d.snapshots || [];
@@ -2387,11 +2430,41 @@ function bindEvents() {
   }
 
   $('btn-theme').addEventListener('click', () => {
-    applyTheme(document.documentElement.dataset.theme === 'light' ? 'dark' : 'light');
+    cycleTheme();
     loadHistoryView();
   });
 
   $('btn-refresh').addEventListener('click', () => { refreshAll(); loadHistoryView(); });
+
+  // 导出诊断包：fetch → Blob → 临时 a 触发下载。
+  // 不用 a[download] 直接跳转：fnOS 网关对新窗口/下载附件处理不一致，
+  // 实测走 Blob 全程同源最稳。
+  $('btn-diagnose').addEventListener('click', async () => {
+    const btn = $('btn-diagnose');
+    const old = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = '打包中…';
+    try {
+      const r = await fetch(API + '/diagnose', { cache: 'no-store' });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const blob = await r.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+      a.href = url;
+      a.download = `fnproc-diag-${stamp}.tar.gz`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 4000);
+      toast(`诊断包已导出（${fmtBytes(blob.size)}）`, 'ok');
+    } catch (e) {
+      toast('导出失败：' + e.message, 'error');
+    } finally {
+      btn.disabled = false;
+      btn.textContent = old;
+    }
+  });
 
   // 图表时间范围
   $('range').addEventListener('change', (e) => {
@@ -2464,6 +2537,19 @@ function bindEvents() {
     if (e.target === $('snap-mask')) closeSnapModal();
   });
   $('snap-run').addEventListener('click', runSnapshotDiff);
+  $('snap-auto-save').addEventListener('click', async () => {
+    const enabled = $('snap-auto').checked;
+    const keepDays = Math.max(1, Math.min(365, Number($('snap-auto-keep').value) || 30));
+    try {
+      const rs = await fetch(API + '/settings', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ snapshotAuto: { enabled, keepDays } }),
+      });
+      const ds = await rs.json().catch(() => ({}));
+      if (!rs.ok) throw new Error(ds.error || ('HTTP ' + rs.status));
+      toast(enabled ? `已开启：每天自动快照，保留 ${keepDays} 天` : '已关闭自动快照', 'ok');
+    } catch (e) { toast('保存失败：' + e.message, 'error'); }
+  });
   $('snap-del').addEventListener('click', () => {
     // 早期实现静默优先删「对比（较晚）」那个，且不看响应就报成功。
     // 现在：两个下拉各自有明确的删除按钮语义 —— 删「对比快照」，并要求两个下拉都选好。

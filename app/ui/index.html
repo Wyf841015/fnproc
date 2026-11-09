@@ -575,6 +575,7 @@
     <span>进程管家 <b id="ver">—</b> · 数据来自 /proc</span>
     <span id="table-info" class="hint">—</span>
     <span id="ts-line">—</span>
+    <button class="btn tiny ghost" id="btn-diagnose" type="button" title="把日志、进程快照、服务状态、历史曲线等打成一个 tar.gz">导出诊断包</button>
   </footer>
 </div>
 
@@ -724,6 +725,11 @@
       <select id="snap-b" title="对比快照"><option value="">对比（较晚）</option></select>
       <button class="btn ghost" id="snap-run" type="button">对比</button>
       <button class="btn ghost" id="snap-del" type="button">删除选中</button>
+    </div>
+    <div class="snap-auto-row">
+      <label class="fld chk"><input id="snap-auto" type="checkbox"><span>每天自动存一个快照</span></label>
+      <label class="fld"><span>保留天数</span><input id="snap-auto-keep" type="number" min="1" max="365" value="30"></label>
+      <button class="btn tiny ghost" id="snap-auto-save" type="button">保存</button>
     </div>
     <div id="snap-result" class="snap-result"><p class="hint">选两个快照，点「对比」：会列出新起的进程、消失的进程，以及内存变化最大的进程。</p></div>
     <div class="modal-actions">
