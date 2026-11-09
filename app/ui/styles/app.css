@@ -181,7 +181,13 @@ body {
 .charts-bar select { padding: 5px 9px; font-size: 12.5px; }
 /* ── 图表 ─────────────────────────────────────────────── */
 .charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; }
-.card { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); backdrop-filter: blur(8px); }
+.card {
+  background: var(--card); border: 1px solid var(--line); border-radius: var(--radius);
+  box-shadow: var(--shadow); backdrop-filter: blur(8px);
+  /* grid 项默认 min-width:auto（= min-content），表格的 min-width 会顺着把
+     卡片乃至整个页面撑开 —— 横向溢出就是这么来的。必须显式允许收缩。 */
+  min-width: 0;
+}
 .chart-card { padding: 12px 14px 10px; min-width: 0; }
 .card-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
 .card-head h2 { margin: 0; font-size: 13px; font-weight: 600; color: var(--text-dim); letter-spacing: .3px; }
@@ -243,7 +249,10 @@ select {
   padding: 7px 10px; border-radius: 10px; border: 1px solid var(--line);
   background: var(--bg-2); color: var(--text); font-size: 13px; outline: none;
 }
-.table-wrap { overflow-x: auto; margin-top: 10px; -webkit-overflow-scrolling: touch; }
+.table-wrap {
+  overflow-x: auto; margin-top: 10px; -webkit-overflow-scrolling: touch;
+  min-width: 0; max-width: 100%;
+}
 .ptable { width: 100%; border-collapse: collapse; min-width: 640px; }
 .ptable th, .ptable td { padding: 8px 10px; text-align: left; border-bottom: 1px solid var(--line); white-space: nowrap; }
 .ptable th {
@@ -822,3 +831,58 @@ select {
   flex: 0 0 auto;
 }
 .audit li { align-items: center; }
+
+/* ── 移动端：概览页的表格与区块 ──────────────────────────────────────────
+   .ptable 在 760 以下有 min-width:520px 的下限（进程/端口表列多，需要横向
+   滚动）。但磁盘 IO 排行只有「进程 / 读 / 写」三列，360 屏完全放得下，
+   沿用 520px 会把整张卡片连页面一起撑宽 → 用户看到的就是「概览没有自适应」。 */
+@media (max-width: 760px) {
+  .io-table { min-width: 0; }
+  .io-table th, .io-table td { padding: 7px 6px; }
+  .io-table td:first-child, .io-table th:first-child {
+    max-width: 42vw; overflow: hidden; text-overflow: ellipsis;
+  }
+  .io-table .cmd { font-size: 10.5px; }
+  /* 卷与 PSI：数值与说明在窄屏更容易撞在一起，改成可换行 */
+  .vol-head { flex-wrap: wrap; gap: 2px 8px; }
+  .vol-sub { line-height: 1.5; }
+  .psi-item { gap: 3px 8px; }
+}
+
+@media (max-width: 560px) {
+  .io-table th, .io-table td { padding: 6px 4px; font-size: 12px; }
+  .io-table td:first-child { max-width: 38vw; }
+  /* 概览里并排的两块（PSI / 卷）在窄屏一律单列堆叠 */
+  .psi-grid, .vol-list { gap: 8px; }
+}
+
+/* ── 移动端：各页表格的自适应策略 ────────────────────────────────────────
+   760 以下 .ptable 原来统一有 min-width:520px 下限，等于让所有表格都横向
+   滚动。实际情况是：只有「进程表」和「端口表」列多到必须横滚，其余表格
+   （容器 / 服务 / 定时器 / crontab / 告警 / 事件 / 看门狗 / 用户 / IO）
+   列数不多，360 屏完全可以撑满容器显示 —— 给它们 520px 下限只会白白多出
+   一条横向滚动条，看起来就是「没有自适应」。 */
+@media (max-width: 760px) {
+  .ptable { min-width: 0; }
+  .ptable th, .ptable td { white-space: normal; }
+  .ptable .mono, .ptable .num { white-space: nowrap; }
+
+  /* 只有这两张保留横滚：9 列 / 8 列的表格压进 360 会看不清 */
+  #view-list > .ptable, #view-ports-listen > .ptable, #view-ports-all > .ptable {
+    min-width: 520px;
+  }
+  #view-list > .ptable th, #view-list > .ptable td,
+  #view-ports-listen > .ptable th, #view-ports-listen > .ptable td,
+  #view-ports-all > .ptable th, #view-ports-all > .ptable td {
+    white-space: nowrap;
+  }
+}
+
+@media (max-width: 560px) {
+  .ptable th, .ptable td { padding: 7px 7px; font-size: 12.5px; }
+  /* 窄屏下把「次要信息」列收窄：长文本省略号而不是撑宽表格 */
+  .ptable td .cmd, .ptable td.hint { max-width: 40vw; overflow: hidden; text-overflow: ellipsis; }
+  /* 表格里的操作按钮组在窄屏容易换行成两行，压一压间距 */
+  .ptable td.act .btn { padding: 2px 7px; font-size: 11.5px; }
+  .ptable td.act { display: flex; gap: 4px; flex-wrap: wrap; }
+}
