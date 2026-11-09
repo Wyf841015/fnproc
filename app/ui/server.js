@@ -252,6 +252,8 @@ function refreshInodePorts() {
 // 端口 ↔ 进程：原来靠遍历 /proc/<pid>/fd 反查 socket inode 归属，
 // 390 个进程 × 每 10 秒 ≈ 上万个 readdir/readlink 系统调用，是第二个 CPU 大户。
 // 现在优先用一次 `ss -tunapH`（内核已经算好了），解析失败才退回旧路径。
+// /metrics?proc= 一次最多声明多少个进程名（防误配置把 URL 写成几百个）
+const PROC_METRICS_LIMIT = 20;
 let portsInflight = false;
 // 上次采集时见过的 PID 数量与集合摘要，用来判断「进程集合变了没」
 let portsPidSig = '';
@@ -2463,8 +2465,13 @@ async function handle(req, res, pathname, query) {
     // label 值必须转义：进程 comm 可以用 prctl 设成含换行的任意字节，
     // 不处理就能在指标输出里伪造整行（指标注入）
     const lbl = (s) => String(s == null ? '' : s).replace(/[\\"\n\r\t]/g, '_').slice(0, 80);
+    const declared = new Set();
     const add = (name, help, val, labels = '') => {
-      L.push(`# HELP ${name} ${help}`, `# TYPE ${name} gauge`, `${name}${labels} ${val}`);
+      if (!declared.has(name)) {
+        declared.add(name);
+        L.push(`# HELP ${name} ${help}`, `# TYPE ${name} gauge`);
+      }
+      L.push(`${name}${labels} ${val}`);
     };
     add('fnproc_up', '进程管家是否在运行', 1);
     add('fnproc_cpu_percent', '整机 CPU 使用率', state.cpu.totalPct);
@@ -2485,11 +2492,32 @@ async function handle(req, res, pathname, query) {
       add('fnproc_alert_breaching', '规则是否正在违规', a.breaching ? 1 : 0, `{rule="${lbl(a.name)}"}`);
     }
     add('fnproc_alert_events_total', '历史告警事件数', alertStore.stats().events);
-    // 每个进程只导出内存前 50，避免指标爆炸
-    for (const p of [...procs].sort((a, b) => b.rss - a.rss).slice(0, 50)) {
-      const nm = lbl(p.name);
-      add('fnproc_process_rss_bytes', '进程常驻内存', p.rss, `{pid="${p.pid}",name="${nm}"}`);
-      add('fnproc_process_cpu_percent', '进程 CPU 使用率', p.cpuPct, `{pid="${p.pid}",name="${nm}"}`);
+
+    // ── 进程级指标：由抓取端指定要看谁 ──────────────────────────────────────
+    // 进程级 label 是永久成本：每出现过一个 name 组合就会在 Prometheus 里留一条
+    // 序列，即使该进程早已消失。所以默认不导出任何进程级指标，改由抓取端用
+    //   /metrics?proc=nginx&proc=postgres
+    // 显式声明要看哪些进程。这样「要监控谁」这件事写在 prometheus.yml 里，
+    // 基数由那几行配置决定，永远不会随机器上的进程变动而膨胀。
+    const wanted = [...new Set((query.getAll ? query.getAll('proc') : [query.get('proc')])
+      .filter(Boolean).map((s) => String(s).trim()).filter(Boolean))].slice(0, PROC_METRICS_LIMIT);
+    const ignored = (query.getAll ? query.getAll('proc') : []).filter(Boolean).length - wanted.length;
+    add('fnproc_proc_metrics_requested', '本次抓取请求的进程级指标个数', wanted.length);
+    if (ignored > 0) {
+      add('fnproc_proc_metrics_ignored', '超出上限被忽略的 proc 参数个数', ignored);
+    }
+    for (const want of wanted) {
+      // 精确匹配进程名（comm）。同名多进程全部导出，用 pid 区分 ——
+      // 进程重启后 pid 变了，Prometheus 视为新序列，这是正常的。
+      const hits = procs.filter((p) => p.name === want);
+      add('fnproc_process_matches', '该进程名当前匹配到的进程数', hits.length, `{name="${lbl(want)}"}`);
+      for (const p of hits) {
+        const nm = lbl(p.name);
+        add('fnproc_process_rss_bytes', '进程常驻内存', p.rss, `{pid="${p.pid}",name="${nm}"}`);
+        add('fnproc_process_cpu_percent', '进程 CPU 使用率', p.cpuPct, `{pid="${p.pid}",name="${nm}"}`);
+        add('fnproc_process_threads', '进程线程数', p.threads, `{pid="${p.pid}",name="${nm}"}`);
+        add('fnproc_process_start_time_seconds', '进程启动时间（Unix 秒）', Math.round((p.startMs || 0) / 1000), `{pid="${p.pid}",name="${nm}"}`);
+      }
     }
     const body = L.join('\n') + '\n';
     res.writeHead(200, { 'Content-Type': 'text/plain; version=0.0.4; charset=utf-8' });
