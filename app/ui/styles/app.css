@@ -146,8 +146,6 @@ body {
 .kpi-mem .bar > i { background: linear-gradient(90deg, #818cf8, #a78bfa); }
 .kpi-swap .bar > i { background: linear-gradient(90deg, #fbbf24, #f97316); }
 
-
-
 /* ── 功能分类 tab ─────────────────────────────────────── */
 .tabs {
   display: flex; gap: 6px; padding: 5px; border-radius: 14px;
@@ -211,7 +209,6 @@ body {
 .legend { display: flex; gap: 14px; margin-top: 6px; font-size: 11px; color: var(--text-mute); flex-wrap: wrap; }
 .legend .sw { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 5px; }
 .sw-mem { background: #a78bfa; } .sw-rd { background: #34d399; } .sw-wr { background: #fbbf24; }
-
 
 /* 负载三列（替代一长串数字，字号统一） */
 .triple { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin-top: 8px; }
@@ -280,7 +277,6 @@ select {
 .empty { padding: 28px 14px; text-align: center; color: var(--text-mute); }
 .table-foot { display: flex; justify-content: space-between; gap: 10px; padding: 10px 14px; border-top: 1px solid var(--line); font-size: 12px; color: var(--text-dim); }
 
-
 /* ── 视图切换标签 ─────────────────────────────────────── */
 .views { display: inline-flex; gap: 2px; padding: 3px; border-radius: 11px; background: var(--bg-2); border: 1px solid var(--line); }
 .vbtn {
@@ -320,7 +316,6 @@ select {
 /* 端口表 */
 .ptable td.port { font-weight: 650; }
 .ptable td.small-id { font-size: 11px; color: var(--text-mute); }
-
 
 /* ── systemd 服务视图 ─────────────────────────────────── */
 .svc-tools { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 14px 4px; flex-wrap: wrap; }
@@ -451,7 +446,6 @@ select {
   .audit-msg { flex: 1 1 100%; }
 }
 .footer { display: flex; justify-content: space-between; gap: 10px; color: var(--text-mute); font-size: 12px; padding: 4px 2px; }
-
 
 /* ── 赞助 / 反馈 弹层 ─────────────────────────────────── */
 .sheet-mask {
@@ -672,43 +666,6 @@ select {
    这一块必须放在文件最后：上方 @media (max-width: 760px) 里虽有同名规则，
    但 .log-tools / .ptable 的基础样式写在它之后，同特异性下后写者胜，
    移动端规则会被无声覆盖（症状：下拉框被挤成只剩箭头）。 */
-@media (max-width: 760px) {
-  /* 弹窗：满宽、内容超高时在窗内滚动、按钮等分 */
-  .modal-mask, .sheet-mask { padding: 10px; align-items: center; }
-  .modal, .modal.wide { width: 100%; max-width: 100%; max-height: calc(100vh - 20px); padding: 14px; }
-  .sheet { width: 100%; max-width: 100%; max-height: calc(100vh - 20px); padding: 14px 14px 18px; }
-  .modal h3 { font-size: 14.5px; }
-  .modal p { margin-bottom: 12px; }
-  .modal-actions { flex-wrap: wrap; gap: 10px; }
-  .modal-actions .btn { flex: 1 1 120px; justify-content: center; min-height: 38px; }
-  .modal-check { font-size: 12.5px; }
-
-  /* 日志筛选条：两个下拉各占半行（保住「最近 200 行」「全部级别」的文字），
-     关键字框与刷新按钮各占一行 */
-  .log-tools { gap: 6px; }
-  .log-tools select { flex: 1 1 40%; min-width: 0; }
-  .log-tools input { flex: 1 1 100%; min-width: 0; }
-  .log-tools .btn { flex: 1 1 100%; height: 34px; }
-  /* 手机看日志：长行折行，不用左右拖 */
-  .log-modal .log-pre {
-    font-size: 11px; height: 52vh; min-height: 0;
-    white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word;
-  }
-
-  /* 宽表格：把「操作」列钉在右侧，横滚到任何位置都能直接点 */
-  .ptable th:last-child, .ptable td:last-child {
-    position: sticky; right: 0; z-index: 2;
-    background: var(--card-solid);
-    box-shadow: -10px 0 12px -10px rgba(2, 8, 23, .45);
-  }
-  .ptable th:last-child { top: 0; z-index: 3; }
-  .ptable tbody tr:hover td:last-child { background: var(--card-solid); }
-
-  /* 批量操作条与勾选列：窄屏改竖排，按钮等分 */
-  .batch-bar { flex-direction: column; align-items: stretch; gap: 8px; }
-  .batch-actions .btn { flex: 1 1 auto; }
-  .pickcol { width: 30px; }
-}
 
 /* ── 批量处置 ─────────────────────────────────────────── */
 .pickcol { width: 34px; text-align: center; padding-left: 8px !important; padding-right: 4px !important; }
@@ -771,6 +728,107 @@ select {
    360 屏上横向滚动找按钮很难用。只对「列少、语义清晰」的容器表与服务表
    做卡片化；进程表列多，摊成卡片后信息密度反而更差，它继续用表格 +
    操作列钉右（见上方 760 断点的 .ptable td:last-child sticky）。 */
+
+/* ── 快照自动保存行 ───────────────────────────────────── */
+.snap-auto-row {
+  display: flex; align-items: flex-end; gap: 10px; flex-wrap: wrap;
+  margin: 4px 0 10px; padding: 8px 10px;
+  border: 1px dashed var(--line); border-radius: var(--radius-sm);
+  background: rgba(56, 189, 248, .04);
+}
+.snap-auto-row .fld { margin: 0; }
+.snap-auto-row .fld input[type="number"] { width: 88px; }
+.snap-auto-row .fld.chk { align-self: center; }
+.footer #btn-diagnose { margin-left: auto; }
+
+/* ── 审计行「重做」按钮 ───────────────────────────────── */
+.audit-replay {
+  margin-left: 6px;
+  padding: 1px 8px;
+  font-size: 11px;
+  line-height: 18px;
+  min-height: 0;
+  flex: 0 0 auto;
+}
+.audit li { align-items: center; }
+
+/* ── 移动端：概览页的表格与区块 ──────────────────────────────────────────
+   .ptable 在 760 以下有 min-width:520px 的下限（进程/端口表列多，需要横向
+   滚动）。但磁盘 IO 排行只有「进程 / 读 / 写」三列，360 屏完全放得下，
+   沿用 520px 会把整张卡片连页面一起撑宽 → 用户看到的就是「概览没有自适应」。 */
+
+/* ── 移动端：各页表格的自适应策略 ────────────────────────────────────────
+   760 以下 .ptable 原来统一有 min-width:520px 下限，等于让所有表格都横向
+   滚动。实际情况是：只有「进程表」和「端口表」列多到必须横滚，其余表格
+   （容器 / 服务 / 定时器 / crontab / 告警 / 事件 / 看门狗 / 用户 / IO）
+   列数不多，360 屏完全可以撑满容器显示 —— 给它们 520px 下限只会白白多出
+   一条横向滚动条，看起来就是「没有自适应」。 */
+
+/* ══ 移动端覆盖层 ══════════════════════════════════════════════════════
+   这一节必须留在文件最末尾：同特异性下后写者胜，任何写在它后面的基础
+   规则都会把这里的移动端适配无声覆盖掉（踩过：日志筛选条下拉框被压成
+   只剩箭头、表格 min-width 把整页撑到 520px）。新增移动端规则请并进来。 */
+@media (max-width: 760px) {
+  /* 弹窗：满宽、内容超高时在窗内滚动、按钮等分 */
+  .modal-mask, .sheet-mask { padding: 10px; align-items: center; }
+  .modal, .modal.wide { width: 100%; max-width: 100%; max-height: calc(100vh - 20px); padding: 14px; }
+  .sheet { width: 100%; max-width: 100%; max-height: calc(100vh - 20px); padding: 14px 14px 18px; }
+  .modal h3 { font-size: 14.5px; }
+  .modal p { margin-bottom: 12px; }
+  .modal-actions { flex-wrap: wrap; gap: 10px; }
+  .modal-actions .btn { flex: 1 1 120px; justify-content: center; min-height: 38px; }
+  .modal-check { font-size: 12.5px; }
+
+  /* 日志筛选条：两个下拉各占半行（保住「最近 200 行」「全部级别」的文字），
+     关键字框与刷新按钮各占一行 */
+  .log-tools { gap: 6px; }
+  .log-tools select { flex: 1 1 40%; min-width: 0; }
+  .log-tools input { flex: 1 1 100%; min-width: 0; }
+  .log-tools .btn { flex: 1 1 100%; height: 34px; }
+  /* 手机看日志：长行折行，不用左右拖 */
+  .log-modal .log-pre {
+    font-size: 11px; height: 52vh; min-height: 0;
+    white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word;
+  }
+
+  /* 宽表格：把「操作」列钉在右侧，横滚到任何位置都能直接点 */
+  .ptable th:last-child, .ptable td:last-child {
+    position: sticky; right: 0; z-index: 2;
+    background: var(--card-solid);
+    box-shadow: -10px 0 12px -10px rgba(2, 8, 23, .45);
+  }
+  .ptable th:last-child { top: 0; z-index: 3; }
+  .ptable tbody tr:hover td:last-child { background: var(--card-solid); }
+
+  /* 批量操作条与勾选列：窄屏改竖排，按钮等分 */
+  .batch-bar { flex-direction: column; align-items: stretch; gap: 8px; }
+  .batch-actions .btn { flex: 1 1 auto; }
+  .pickcol { width: 30px; }
+  .io-table { min-width: 0; }
+  .io-table th, .io-table td { padding: 7px 6px; }
+  .io-table td:first-child, .io-table th:first-child {
+    max-width: 42vw; overflow: hidden; text-overflow: ellipsis;
+  }
+  .io-table .cmd { font-size: 10.5px; }
+  /* 卷与 PSI：数值与说明在窄屏更容易撞在一起，改成可换行 */
+  .vol-head { flex-wrap: wrap; gap: 2px 8px; }
+  .vol-sub { line-height: 1.5; }
+  .psi-item { gap: 3px 8px; }
+  .ptable { min-width: 0; }
+  .ptable th, .ptable td { white-space: normal; }
+  .ptable .mono, .ptable .num { white-space: nowrap; }
+
+  /* 只有这两张保留横滚：9 列 / 8 列的表格压进 360 会看不清 */
+  #view-list > .ptable, #view-ports-listen > .ptable, #view-ports-all > .ptable {
+    min-width: 520px;
+  }
+  #view-list > .ptable th, #view-list > .ptable td,
+  #view-ports-listen > .ptable th, #view-ports-listen > .ptable td,
+  #view-ports-all > .ptable th, #view-ports-all > .ptable td {
+    white-space: nowrap;
+  }
+}
+
 @media (max-width: 560px) {
   .ptable.cardify thead { display: none; }
   .ptable.cardify tbody tr {
@@ -807,78 +865,10 @@ select {
   .ptable.cardify tbody td.hide-md { display: none; }
   .ptable.cardify .pname .cmd { white-space: normal; overflow-wrap: anywhere; }
   .ptable.cardify .svc-desc { display: none; }
-}
-
-/* ── 快照自动保存行 ───────────────────────────────────── */
-.snap-auto-row {
-  display: flex; align-items: flex-end; gap: 10px; flex-wrap: wrap;
-  margin: 4px 0 10px; padding: 8px 10px;
-  border: 1px dashed var(--line); border-radius: var(--radius-sm);
-  background: rgba(56, 189, 248, .04);
-}
-.snap-auto-row .fld { margin: 0; }
-.snap-auto-row .fld input[type="number"] { width: 88px; }
-.snap-auto-row .fld.chk { align-self: center; }
-.footer #btn-diagnose { margin-left: auto; }
-
-/* ── 审计行「重做」按钮 ───────────────────────────────── */
-.audit-replay {
-  margin-left: 6px;
-  padding: 1px 8px;
-  font-size: 11px;
-  line-height: 18px;
-  min-height: 0;
-  flex: 0 0 auto;
-}
-.audit li { align-items: center; }
-
-/* ── 移动端：概览页的表格与区块 ──────────────────────────────────────────
-   .ptable 在 760 以下有 min-width:520px 的下限（进程/端口表列多，需要横向
-   滚动）。但磁盘 IO 排行只有「进程 / 读 / 写」三列，360 屏完全放得下，
-   沿用 520px 会把整张卡片连页面一起撑宽 → 用户看到的就是「概览没有自适应」。 */
-@media (max-width: 760px) {
-  .io-table { min-width: 0; }
-  .io-table th, .io-table td { padding: 7px 6px; }
-  .io-table td:first-child, .io-table th:first-child {
-    max-width: 42vw; overflow: hidden; text-overflow: ellipsis;
-  }
-  .io-table .cmd { font-size: 10.5px; }
-  /* 卷与 PSI：数值与说明在窄屏更容易撞在一起，改成可换行 */
-  .vol-head { flex-wrap: wrap; gap: 2px 8px; }
-  .vol-sub { line-height: 1.5; }
-  .psi-item { gap: 3px 8px; }
-}
-
-@media (max-width: 560px) {
   .io-table th, .io-table td { padding: 6px 4px; font-size: 12px; }
   .io-table td:first-child { max-width: 38vw; }
   /* 概览里并排的两块（PSI / 卷）在窄屏一律单列堆叠 */
   .psi-grid, .vol-list { gap: 8px; }
-}
-
-/* ── 移动端：各页表格的自适应策略 ────────────────────────────────────────
-   760 以下 .ptable 原来统一有 min-width:520px 下限，等于让所有表格都横向
-   滚动。实际情况是：只有「进程表」和「端口表」列多到必须横滚，其余表格
-   （容器 / 服务 / 定时器 / crontab / 告警 / 事件 / 看门狗 / 用户 / IO）
-   列数不多，360 屏完全可以撑满容器显示 —— 给它们 520px 下限只会白白多出
-   一条横向滚动条，看起来就是「没有自适应」。 */
-@media (max-width: 760px) {
-  .ptable { min-width: 0; }
-  .ptable th, .ptable td { white-space: normal; }
-  .ptable .mono, .ptable .num { white-space: nowrap; }
-
-  /* 只有这两张保留横滚：9 列 / 8 列的表格压进 360 会看不清 */
-  #view-list > .ptable, #view-ports-listen > .ptable, #view-ports-all > .ptable {
-    min-width: 520px;
-  }
-  #view-list > .ptable th, #view-list > .ptable td,
-  #view-ports-listen > .ptable th, #view-ports-listen > .ptable td,
-  #view-ports-all > .ptable th, #view-ports-all > .ptable td {
-    white-space: nowrap;
-  }
-}
-
-@media (max-width: 560px) {
   .ptable th, .ptable td { padding: 7px 7px; font-size: 12.5px; }
   /* 窄屏下把「次要信息」列收窄：长文本省略号而不是撑宽表格 */
   .ptable td .cmd, .ptable td.hint { max-width: 40vw; overflow: hidden; text-overflow: ellipsis; }
