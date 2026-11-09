@@ -6,7 +6,7 @@
 <base href="/app/fnproc/">
 <title>进程管家 · fnproc</title>
 <link rel="icon" href="images/icon_64.png">
-<link rel="stylesheet" href="styles/app.css?v=0.3.1">
+<link rel="stylesheet" href="styles/app.css?v=0.4.0">
 </head>
 <body>
 <div class="app">
@@ -183,10 +183,20 @@
         <button class="btn tiny ghost" id="cfilter-clear" type="button">清除</button>
       </div>
 
+      <div class="batch-bar" id="batch-bar" hidden>
+        <span class="batch-count" id="batch-count">已选 0 项</span>
+        <div class="batch-actions">
+          <button class="btn ghost" id="batch-sigterm" type="button">结束（SIGTERM）</button>
+          <button class="btn danger" id="batch-sigkill" type="button">强制结束（SIGKILL）</button>
+          <button class="btn ghost" id="batch-clear" type="button">取消选择</button>
+        </div>
+      </div>
+
       <div class="table-wrap" id="view-list">
         <table class="ptable">
           <thead>
             <tr>
+              <th class="pickcol"><input type="checkbox" id="pick-all" title="全选当前页" aria-label="全选"></th>
               <th data-sort="pid" class="num">PID</th>
               <th data-sort="name">名称</th>
               <th data-sort="cpu" class="num">CPU%</th>
@@ -320,6 +330,7 @@
         <table class="ptable">
           <thead>
             <tr>
+              <th class="pickcol" title="关注的服务会排在最前">关注</th>
               <th>服务</th>
               <th>状态</th>
               <th class="hide-sm">说明</th>
@@ -442,6 +453,47 @@
           <tbody id="wd-body"></tbody>
         </table>
         <div class="empty" id="wd-empty" hidden>还没有看门狗</div>
+      </div>
+    </article>
+
+    <article class="card">
+      <div class="card-head panel-head">
+        <h2>进程追踪</h2>
+        <div class="procs-tools">
+          <span class="hint" id="watch-hint">记住某个关键字的进程清单，之后有新进程冒出来就记一条</span>
+          <button class="btn" id="watch-add" type="button">＋ 新建追踪</button>
+        </div>
+      </div>
+      <p class="hint">只观察、只记录，不会执行任何命令。适合盯「某服务是不是被偷偷重启了」「某个 worker 是不是反复重生」。</p>
+      <div class="table-wrap">
+        <table class="ptable">
+          <thead>
+            <tr><th class="num">#</th><th>名称</th><th>匹配关键字</th><th class="num hide-sm">当前进程数</th><th class="hide-sm">上次检查</th><th>状态</th><th>操作</th></tr>
+          </thead>
+          <tbody id="watch-body"></tbody>
+        </table>
+        <div class="empty" id="watch-empty" hidden>还没有追踪项</div>
+      </div>
+
+      <div class="watch-events-block">
+        <div class="card-head panel-head">
+          <h3>新进程记录</h3>
+          <div class="procs-tools">
+            <select id="watch-events-filter" title="按追踪项筛选">
+              <option value="">全部追踪项</option>
+            </select>
+            <button class="btn ghost" id="watch-events-refresh" type="button">刷新</button>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table class="ptable">
+            <thead>
+              <tr><th class="num">时间</th><th>追踪项</th><th class="num">PID</th><th>进程</th><th class="hide-sm">命令行</th></tr>
+            </thead>
+            <tbody id="watch-events"></tbody>
+          </table>
+          <div class="empty" id="watch-events-empty" hidden>还没有发现新进程</div>
+        </div>
       </div>
     </article>
   </section>
@@ -646,6 +698,25 @@
 </div>
 
 <!-- 看门狗编辑 -->
+<div class="modal-mask" id="watch-mask" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-label="进程追踪">
+    <h3 id="watch-title">新建进程追踪</h3>
+    <div class="modal-field">
+      <label for="watch-name">名称</label>
+      <input id="watch-name" type="text" placeholder="如：日志哨兵 worker" maxlength="60" autocomplete="off">
+    </div>
+    <div class="modal-field">
+      <label for="watch-pattern">匹配关键字</label>
+      <input id="watch-pattern" type="text" placeholder="进程名或命令行片段，如 fnlogpush" maxlength="120" autocomplete="off">
+      <span class="hint">不区分大小写；命中「进程名」或「完整命令行」任一处即可。</span>
+    </div>
+    <div class="modal-actions">
+      <button class="btn ghost" id="watch-cancel" type="button">取消</button>
+      <button class="btn" id="watch-save" type="button">保存</button>
+    </div>
+  </div>
+</div>
+
 <div class="modal-mask" id="wd-mask" hidden>
   <div class="modal wide" role="dialog" aria-modal="true" aria-label="看门狗">
     <h3 id="wd-modal-title">新建看门狗</h3>
@@ -738,6 +809,6 @@
   <img id="lightbox-img" alt="二维码放大">
 </div>
 
-<script src="main.js?v=0.3.1" type="module"></script>
+<script src="main.js?v=0.4.0" type="module"></script>
 </body>
 </html>

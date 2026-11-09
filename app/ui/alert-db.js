@@ -43,6 +43,32 @@ CREATE TABLE IF NOT EXISTS alert_events (
   version    TEXT    NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_alert_events_ts ON alert_events(ts DESC);
+CREATE TABLE IF NOT EXISTS pinned_services (
+  name   TEXT PRIMARY KEY,
+  ts     INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS proc_watches (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  name        TEXT    NOT NULL,
+  pattern     TEXT    NOT NULL,
+  enabled     INTEGER NOT NULL DEFAULT 1,
+  baseline    TEXT    NOT NULL DEFAULT '[]',
+  last_check  INTEGER NOT NULL DEFAULT 0,
+  seen_count  INTEGER NOT NULL DEFAULT 0,
+  created     INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_proc_watches_enabled ON proc_watches(enabled);
+CREATE TABLE IF NOT EXISTS watch_events (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts         INTEGER NOT NULL,
+  watch_id   INTEGER NOT NULL DEFAULT 0,
+  watch_name TEXT    NOT NULL DEFAULT '',
+  kind       TEXT    NOT NULL DEFAULT 'appear',
+  pid        INTEGER NOT NULL DEFAULT 0,
+  pname      TEXT    NOT NULL DEFAULT '',
+  cmd        TEXT    NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_watch_events_ts ON watch_events(ts DESC);
 CREATE TABLE IF NOT EXISTS watchdogs (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
   name         TEXT    NOT NULL,
@@ -202,6 +228,116 @@ export function openAlertStore(dbPath, { version = '' } = {}) {
     },
 
     // ── 看门狗（进程消失后执行命令）────────────────────────────────────
+    // ── 关注的服务（钉在服务列表顶部） ──────────────────────────────────
+    listPinned() {
+      if (!db) return [];
+      try { return db.prepare('SELECT name FROM pinned_services ORDER BY ts ASC').all().map((r) => r.name); }
+      catch { return []; }
+    },
+
+    setPinned(name, pinned) {
+      if (!db) return { ok: false, error: '库不可用' };
+      const n = String(name || '').trim();
+      if (!n) return { ok: false, error: '服务名不能为空' };
+      try {
+        if (pinned) db.prepare('INSERT OR REPLACE INTO pinned_services (name, ts) VALUES (?, ?)').run(n, Date.now());
+        else db.prepare('DELETE FROM pinned_services WHERE name = ?').run(n);
+        return { ok: true, pinned: !!pinned };
+      } catch (e) { return { ok: false, error: e.message }; }
+    },
+
+    // ── 进程追踪：记录某个模式下的进程集合变化 ──────────────────────────
+    // 只观察、不执行任何命令（与看门狗的区别就在这里）。
+    listWatches() {
+      if (!db) return [];
+      try {
+        return db.prepare('SELECT id, name, pattern, enabled, baseline, last_check, seen_count, created FROM proc_watches ORDER BY id ASC')
+          .all().map((r) => {
+            let base = [];
+            try { base = JSON.parse(r.baseline || '[]'); } catch { base = []; }
+            return {
+              id: r.id, name: r.name, pattern: r.pattern, enabled: !!r.enabled,
+              baselineCount: base.length, baseline: base,
+              lastCheck: r.last_check, seenCount: r.seen_count, created: r.created,
+            };
+          });
+      } catch { return []; }
+    },
+
+    saveWatch(input = {}) {
+      if (!db) return { ok: false, error: '库不可用' };
+      const name = String(input.name || '').trim();
+      const pattern = String(input.pattern || '').trim();
+      if (!name) return { ok: false, error: '名称不能为空' };
+      if (!pattern) return { ok: false, error: '匹配关键字不能为空' };
+      if (pattern.length > 120) return { ok: false, error: '匹配关键字过长（上限 120）' };
+      const enabled = typeof input.enabled === 'boolean' ? (input.enabled ? 1 : 0) : 1;
+      const id = Number(input.id) || 0;
+      try {
+        if (id) {
+          const prev = db.prepare('SELECT id FROM proc_watches WHERE id = ?').get(id);
+          if (!prev) return { ok: false, error: '追踪不存在' };
+          // 改关键字就重设基准，否则新旧模式的进程集合会被混为一谈
+          const old = db.prepare('SELECT pattern FROM proc_watches WHERE id = ?').get(id);
+          const reset = old && old.pattern !== pattern;
+          db.prepare(`UPDATE proc_watches SET name = ?, pattern = ?, enabled = ?${reset ? ', baseline = \'[]\'' : ''} WHERE id = ?`)
+            .run(name, pattern, enabled, id);
+          return { ok: true, id };
+        }
+        const info = db.prepare('INSERT INTO proc_watches (name, pattern, enabled, baseline, created) VALUES (?, ?, ?, \'[]\', ?)')
+          .run(name, pattern, enabled, Date.now());
+        return { ok: true, id: Number(info.lastInsertRowid) };
+      } catch (e) { return { ok: false, error: e.message }; }
+    },
+
+    deleteWatch(id) {
+      if (!db) return false;
+      try {
+        db.prepare('DELETE FROM proc_watches WHERE id = ?').run(Number(id) || 0);
+        db.prepare('DELETE FROM watch_events WHERE watch_id = ?').run(Number(id) || 0);
+        return true;
+      } catch { return false; }
+    },
+
+    updateWatchBaseline(id, pids, ts = Date.now()) {
+      if (!db) return false;
+      try {
+        db.prepare('UPDATE proc_watches SET baseline = ?, last_check = ?, seen_count = ? WHERE id = ?')
+          .run(JSON.stringify(pids.map(Number).filter((n) => n > 0).slice(0, 2000)), ts, pids.length, Number(id) || 0);
+        return true;
+      } catch { return false; }
+    },
+
+    addWatchEvent({ ts = Date.now(), watchId = 0, watchName = '', kind = 'appear', pid = 0, pname = '', cmd = '' }) {
+      if (!db) return false;
+      try {
+        db.prepare('INSERT INTO watch_events (ts, watch_id, watch_name, kind, pid, pname, cmd) VALUES (?, ?, ?, ?, ?, ?, ?)')
+          .run(ts, Number(watchId) || 0, String(watchName || '').slice(0, 120), String(kind || 'appear').slice(0, 20),
+            Number(pid) || 0, String(pname || '').slice(0, 120), String(cmd || '').slice(0, 400));
+        return true;
+      } catch { return false; }
+    },
+
+    listWatchEvents({ limit = 100, watchId = 0 } = {}) {
+      if (!db) return { rows: [], total: 0 };
+      const lim = Math.max(1, Math.min(1000, Number(limit) || 100));
+      try {
+        const where = Number(watchId) ? 'WHERE watch_id = ?' : '';
+        const args = Number(watchId) ? [Number(watchId)] : [];
+        const rows = db.prepare(`SELECT * FROM watch_events ${where} ORDER BY ts DESC LIMIT ${lim}`).all(...args);
+        const total = (db.prepare(`SELECT count(*) AS c FROM watch_events ${where}`).get(...args) || {}).c || 0;
+        return { rows, total };
+      } catch { return { rows: [], total: 0 }; }
+    },
+
+    pruneWatchEvents(days = 30) {
+      if (!db) return 0;
+      try {
+        const cutoff = Date.now() - Math.max(1, days) * 86400000;
+        return Number(db.prepare('DELETE FROM watch_events WHERE ts < ?').run(cutoff).changes) || 0;
+      } catch { return 0; }
+    },
+
     listWatchdogs() {
       if (!db) return [];
       try {

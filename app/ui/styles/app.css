@@ -190,7 +190,9 @@ body {
 .chart {
   width: 100%; height: 110px; display: block; margin-top: 8px; overflow: visible;
 }
-.chart .grid-line { stroke: var(--grid); stroke-width: 1; vector-effect: non-scaling-stroke; }
+.chart .event-layer .ev-line { stroke: rgba(56, 189, 248, .55); stroke-width: 1; stroke-dasharray: 3 3; }
+.event-layer .ev-line.bad { stroke: rgba(248, 113, 113, .8); }
+.grid-line { stroke: var(--grid); stroke-width: 1; vector-effect: non-scaling-stroke; }
 .chart polyline { fill: none; stroke-width: 1.6; stroke-linejoin: round; stroke-linecap: round; vector-effect: non-scaling-stroke; }
 .chart polygon { stroke: none; }
 .cores { display: grid; grid-template-columns: repeat(auto-fit, minmax(112px, 1fr)); gap: 6px 12px; margin-top: 8px; }
@@ -508,6 +510,7 @@ select {
 }
 .toast.ok { border-color: rgba(52, 211, 153, .5); }
 .toast.error { border-color: rgba(248, 113, 113, .5); }
+.toast.warn { border-color: rgba(251, 191, 36, .55); }
 .toast.out { opacity: 0; transform: translateX(12px); transition: .3s; }
 @keyframes tin { to { opacity: 1; transform: translateX(0); } }
 
@@ -691,4 +694,35 @@ select {
   }
   .ptable th:last-child { top: 0; z-index: 3; }
   .ptable tbody tr:hover td:last-child { background: var(--card-solid); }
+}
+
+/* ── 批量处置 ─────────────────────────────────────────── */
+.pickcol { width: 34px; text-align: center; padding-left: 8px !important; padding-right: 4px !important; }
+.pickcol input[type="checkbox"] { width: 15px; height: 15px; cursor: pointer; accent-color: var(--accent); }
+.batch-bar {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  margin: 8px 0 0; padding: 9px 12px; border-radius: var(--radius-sm);
+  background: rgba(56, 189, 248, .10); border: 1px solid rgba(56, 189, 248, .35);
+}
+.batch-count { font-size: 13px; font-weight: 600; color: var(--accent); }
+.batch-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+
+/* ── 服务关注星标 ─────────────────────────────────────── */
+.pin-btn {
+  background: none; border: none; cursor: pointer; padding: 2px 4px;
+  font-size: 15px; line-height: 1; color: var(--text-mute); border-radius: 6px;
+}
+.pin-btn:hover { color: var(--warn); background: rgba(251, 191, 36, .12); }
+.pin-btn.on { color: var(--warn); }
+.pin-btn:disabled { opacity: .5; cursor: default; }
+
+/* ── 进程追踪 ─────────────────────────────────────────── */
+.watch-events-block { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 6px; }
+.watch-events-block h3 { margin: 10px 0 6px; font-size: 14px; }
+.row-dim td { opacity: .6; }
+
+@media (max-width: 760px) {
+  .batch-bar { flex-direction: column; align-items: stretch; gap: 8px; }
+  .batch-actions .btn { flex: 1 1 auto; }
+  .pickcol { width: 30px; }
 }

@@ -104,6 +104,14 @@ function makeChart(svg, opts) {
     return { s, poly, fillEl };
   });
 
+  // 事件标记层：把审计事件（发信号、服务启停、改配置）画成竖线。
+  // 只画一张图（CPU 图）就够 —— 三张图的横轴是同一时间窗。
+  let eventLayer = null;
+  if (opts.events !== false) {
+    eventLayer = elNS('g', { class: 'event-layer' });
+    svg.appendChild(eventLayer);
+  }
+
   function pts(data, getter, maxV) {
     const n = Math.max(2, data.length);
     const stepX = CH_W / (n - 1);
@@ -116,8 +124,30 @@ function makeChart(svg, opts) {
   }
 
   return {
-    draw(data) {
+    draw(data, events) {
       const rows = Array.isArray(data) ? data : [];
+      if (eventLayer) {
+        eventLayer.textContent = '';
+        const evs = Array.isArray(events) ? events : [];
+        if (rows.length >= 2 && evs.length) {
+          const t0 = Number(rows[0].ts);
+          const t1 = Number(rows[rows.length - 1].ts);
+          const span = Math.max(1, t1 - t0);
+          for (const ev of evs.slice(0, 120)) {
+            const t = Number(ev.ts);
+            if (!t || t < t0 || t > t1) continue;
+            const x = ((t - t0) / span) * CH_W;
+            const line = elNS('line', {
+              class: 'ev-line' + (/reject|error|fail/.test(String(ev.result || '')) ? ' bad' : ''),
+              x1: x.toFixed(1), y1: 0, x2: x.toFixed(1), y2: CH_H,
+            });
+            const tip = elNS('title');
+            tip.textContent = `${fmtClock(t)} ${ev.action} ${ev.target || ''}\n${ev.message || ''}`;
+            line.appendChild(tip);
+            eventLayer.appendChild(line);
+          }
+        }
+      }
       for (const { s, poly, fillEl } of layers) {
         const maxV = typeof s.max === 'function' ? s.max(rows) : (s.max || 100);
         const p = pts(rows, s.get, maxV || 1);
@@ -135,16 +165,19 @@ function makeChart(svg, opts) {
 
 const chartCpu = makeChart($('chart-cpu'), {
   yLabels: true,
+  events: true,
   series: [{ get: (d) => d.cpu, color: '#38bdf8', fill: 'rgba(56,189,248,.14)', max: 100 }],
 });
 const chartMem = makeChart($('chart-mem'), {
   yLabels: true,
+  events: false,
   series: [
     { get: (d) => d.mem, color: '#a78bfa', fill: 'rgba(167,139,250,.12)', max: 100 },
     { get: (d) => d.swap, color: '#fb923c', max: 100 },
   ],
 });
 const chartIo = makeChart($('chart-io'), {
+  events: false,
   series: [
     { get: (d) => d.rd, color: '#34d399', max: (rows) => Math.max(1024, ...rows.map((r) => r.rd || 0)) * 1.15 },
     { get: (d) => d.wr, color: '#fbbf24', max: (rows) => Math.max(1024, ...rows.map((r) => r.wr || 0)) * 1.15 },
@@ -272,6 +305,17 @@ const rowRefs = new Map();          // pid → 该行需要更新的节点引用
 function buildRow(p) {
   const tr = el('tr');
   tr.dataset.pid = p.pid;
+  // 勾选列：批量处置的前提。用原生 checkbox（不是自绘），
+  // 这样键盘、触屏、辅助技术都能正常操作
+  const pickTd = el('td', 'pickcol');
+  const pickCb = document.createElement('input');
+  pickCb.type = 'checkbox';
+  pickCb.className = 'pick';
+  pickCb.dataset.pid = String(p.pid);
+  pickCb.checked = picked.has(p.pid);
+  pickCb.setAttribute('aria-label', `选择进程 ${p.pid}`);
+  pickTd.appendChild(pickCb);
+  tr.appendChild(pickTd);
   tr.appendChild(el('td', 'num mono', p.pid));
   const nameTd = el('td', 'pname');
   const nm = el('span', 'nm', p.name);
@@ -312,7 +356,7 @@ function buildRow(p) {
   btn.dataset.pid = p.pid;
   actTd.appendChild(btn);
   tr.appendChild(actTd);
-  rowRefs.set(p.pid, { tr, cpuTd, cpuSpan, rssTd, thTd, userTd, stSpan, stTd, cTd, ctTd, nm, nameTd, cmdEl, container: p.container ? p.container.name : '' });
+  rowRefs.set(p.pid, { tr, pickCb, cpuTd, cpuSpan, rssTd, thTd, userTd, stSpan, stTd, cTd, ctTd, nm, nameTd, cmdEl, container: p.container ? p.container.name : '' });
   return tr;
 }
 
@@ -324,6 +368,10 @@ function setText(node, v) {
 
 function patchRow(p, r) {
   if (!r) return;
+  if (r.pickCb) {
+    const want = picked.has(p.pid);
+    if (r.pickCb.checked !== want) r.pickCb.checked = want;
+  }
   setText(r.cpuSpan, fmtPct(p.cpuPct) );
   if (p.cpuPct > 10) r.cpuTd.dataset.hot = '1'; else delete r.cpuTd.dataset.hot;
   setText(r.rssTd, fmtBytes(p.rss));
@@ -371,7 +419,14 @@ function renderTable(rows) {
     for (const p of rows) frag.appendChild(buildRow(p));
     tb.appendChild(frag);
     tablePids = rows.map((p) => p.pid);
-  }
+    }
+    // 勾选中的进程可能已经消失，清掉这些"幽灵选中"
+    let pruned = false;
+    for (const pid of [...picked]) {
+    if (!rows.some((p) => p.pid === pid)) { picked.delete(pid); pruned = true; }
+    }
+    if (pruned) toast('部分已选进程已退出，已自动取消勾选', 'warn');
+    updateBatchBar();
   $('empty').hidden = rows.length > 0;
   $('table-info').textContent = `${rows.length} 个进程${query ? `（已过滤，共 ${lastSnapshot?.procTotal ?? '?'} 个）` : ''}`;
 }
@@ -600,6 +655,17 @@ async function renderServices() {
   for (const u of d.units || []) {
     const tr = el('tr');
     tr.dataset.unit = u.name;
+    // 关注列：钉住的服务排在最前（后端已排序），这里只负责点星
+    const pinTd = el('td', 'pickcol');
+    const pinBtn = el('button', 'pin-btn' + (u.pinned ? ' on' : ''), u.pinned ? '★' : '☆');
+    pinBtn.type = 'button';
+    pinBtn.dataset.action = 'svc-pin';
+    pinBtn.dataset.unit = u.name;
+    pinBtn.dataset.pinned = u.pinned ? '1' : '0';
+    pinBtn.title = u.pinned ? '取消关注' : '加入关注（会排到最前）';
+    pinBtn.setAttribute('aria-label', (u.pinned ? '取消关注 ' : '加入关注 ') + u.name);
+    pinTd.appendChild(pinBtn);
+    tr.appendChild(pinTd);
     const nm = el('td', 'svc-name mono', u.name.replace(/\.service$/, ''));
     tr.appendChild(nm);
     const stTd = el('td');
@@ -718,6 +784,15 @@ function fmtAgo(ts) {
   return `${Math.round(s / 86400)} 天前`;
 }
 
+// 追踪面板里的时间：只到分钟，避免表格里塞满秒级噪音
+function fmtClock(ts) {
+  if (!ts) return '—';
+  const d = new Date(Number(ts));
+  if (Number.isNaN(d.getTime())) return '—';
+  const p = (n) => String(n).padStart(2, '0');
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
 function fmtDur(sec) {
   const s = Number(sec) || 0;
   if (!s) return '立即';
@@ -736,6 +811,7 @@ function metricText(rule) {
 }
 
 async function loadAlerts() {
+  loadWatches();
   try {
     const r = await fetch(API + '/alerts', { cache: 'no-store' });
     const d = await r.json();
@@ -1111,6 +1187,29 @@ function renderVolumes(list) {
 // ── 连接视图（监听 / 全部）────────────────────────────────────────────────
 let portMode = 'listen';
 let svcQuery = '';               // 服务页独立筛选词（不共用进程页搜索框）
+const picked = new Set();        // 批量处置：勾选的 PID
+const PICK_LIMIT = 50;           // 与后端上限一致，先在前端拦住
+
+function updateBatchBar() {
+  const bar = $('batch-bar');
+  if (!bar) return;
+  const n = picked.size;
+  bar.hidden = n === 0;
+  const c = $('batch-count');
+  if (c) c.textContent = `已选 ${n} 项` + (n >= PICK_LIMIT ? `（上限 ${PICK_LIMIT}）` : '');
+  const all = $('pick-all');
+  if (all) {
+    const total = rowsCache.length;
+    all.checked = n > 0 && n === total;
+    all.indeterminate = n > 0 && n < total;
+  }
+}
+
+function clearPicked() {
+  picked.clear();
+  for (const r of rowRefs.values()) if (r.pickCb) r.pickCb.checked = false;
+  updateBatchBar();
+}
 
 async function renderConnections() {
   const r = await fetch(API + '/connections', { cache: 'no-store' });
@@ -1245,6 +1344,120 @@ async function loadWatchdogs() {
     watchdogs = d.watchdogs || [];
     renderWatchdogs();
   } catch (e) { console.warn('[watchdogs] 读取失败:', e.message); }
+}
+
+// ── 进程追踪 ─────────────────────────────────────────────────────────────
+let watches = [];
+let watchEvents = [];
+let editingWatchId = 0;
+
+async function loadWatches() {
+  try {
+    const r = await fetch(API + '/watches?limit=50', { cache: 'no-store' });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const d = await r.json();
+    watches = d.watches || [];
+    watchEvents = d.events || [];
+    renderWatches();
+    renderWatchEvents();
+    const sel = $('watch-events-filter');
+    if (sel) {
+      const cur = sel.value;
+      sel.textContent = '';
+      sel.appendChild(new Option('全部追踪项', ''));
+      for (const w of watches) sel.appendChild(new Option(w.name, String(w.id)));
+      sel.value = cur;
+    }
+    if ($('watch-empty')) $('watch-empty').hidden = watches.length > 0;
+    if ($('watch-hint')) {
+      $('watch-hint').textContent = watches.length
+        ? `${watches.length} 项追踪中 · 只观察不执行命令`
+        : '记住某个关键字的进程清单，之后有新进程冒出来就记一条';
+    }
+  } catch (e) {
+    console.warn('[watches] 读取失败:', e.message);
+    if ($('watch-hint')) $('watch-hint').textContent = '读取失败：' + e.message;
+  }
+}
+
+function renderWatches() {
+  const tb = $('watch-body');
+  if (!tb) return;
+  tb.textContent = '';
+  const frag = document.createDocumentFragment();
+  for (const w of watches) {
+    const tr = el('tr');
+    if (!w.enabled) tr.classList.add('row-dim');
+    tr.appendChild(el('td', 'num mono', w.id));
+    tr.appendChild(el('td', 'pname', w.name));
+    tr.appendChild(el('td', 'mono', w.pattern));
+    tr.appendChild(el('td', 'num mono hide-sm', w.baselineCount));
+    tr.appendChild(el('td', 'hint hide-sm', w.lastCheck ? fmtClock(w.lastCheck) : '—'));
+    const st = el('td');
+    st.appendChild(el('span', 'chip' + (w.enabled ? ' cont' : ' dim'), w.enabled ? '追踪中' : '已停用'));
+    tr.appendChild(st);
+    const act = el('td', 'act');
+    const edit = el('button', 'btn tiny', '编辑');
+    edit.type = 'button'; edit.dataset.action = 'watch-edit'; edit.dataset.id = w.id;
+    const tog = el('button', 'btn tiny ghost', w.enabled ? '停用' : '启用');
+    tog.type = 'button'; tog.dataset.action = 'watch-toggle'; tog.dataset.id = w.id;
+    const del = el('button', 'btn tiny warn', '删除');
+    del.type = 'button'; del.dataset.action = 'watch-del'; del.dataset.id = w.id;
+    act.append(edit, tog, del);
+    tr.appendChild(act);
+    frag.appendChild(tr);
+  }
+  tb.appendChild(frag);
+  if ($('watch-empty')) $('watch-empty').hidden = watches.length > 0;
+}
+
+function renderWatchEvents() {
+  const tb = $('watch-events');
+  if (!tb) return;
+  tb.textContent = '';
+  const frag = document.createDocumentFragment();
+  for (const ev of watchEvents) {
+    const tr = el('tr');
+    tr.appendChild(el('td', 'num mono', fmtClock(ev.ts)));
+    tr.appendChild(el('td', '', ev.watch_name || '—'));
+    tr.appendChild(el('td', 'num mono', ev.pid));
+    tr.appendChild(el('td', 'pname', ev.pname || '—'));
+    tr.appendChild(el('td', 'mono hide-sm hint', String(ev.cmd || '').slice(0, 80)));
+    frag.appendChild(tr);
+  }
+  tb.appendChild(frag);
+  if ($('watch-events-empty')) $('watch-events-empty').hidden = watchEvents.length > 0;
+}
+
+function openWatchModal(id = 0) {
+  editingWatchId = id;
+  const w = watches.find((x) => x.id === id) || null;
+  $('watch-title').textContent = w ? `编辑进程追踪 #${w.id}` : '新建进程追踪';
+  $('watch-name').value = w ? w.name : '';
+  $('watch-pattern').value = w ? w.pattern : '';
+  showMask($('watch-mask'));
+}
+
+function closeWatchModal() { closeMask($('watch-mask')); }
+
+async function saveWatch() {
+  const name = $('watch-name').value.trim();
+  const pattern = $('watch-pattern').value.trim();
+  if (!name) { toast('请填写名称', 'error'); return; }
+  if (!pattern) { toast('请填写匹配关键字', 'error'); return; }
+  try {
+    const r = await fetch(API + '/watches', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: editingWatchId || undefined, name, pattern }),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+    closeWatchModal();
+    toast(editingWatchId ? '追踪已更新' : '追踪已创建（下一次检查会记下当前进程作为基准）', 'ok');
+    await loadWatches();
+  } catch (e) {
+    toast('保存失败：' + e.message, 'error');
+  }
 }
 
 function renderWatchdogs() {
@@ -1488,7 +1701,7 @@ async function loadHistoryView() {
   if (historyRange === '60s') {
     // 实时模式：直接用 SSE 快照里的 60 个采样点（1 秒粒度）
     const h = lastSnapshot?.history || [];
-    chartCpu.draw(h);
+    chartCpu.draw(h, []);
     chartMem.draw(h);
     chartIo.draw(h);
     $('range-hint').textContent = '实时 · 最近 60 秒';
@@ -1504,7 +1717,9 @@ async function loadHistoryView() {
       ts: x.ts, cpu: x.cpu, mem: x.mem, swap: x.swap,
       rd: x.rd, wr: x.wr, rx: x.rx, tx: x.tx,
     }));
-    chartCpu.draw(rows); chartMem.draw(rows); chartIo.draw(rows);
+    // 事件只画在 CPU 图上：三张图横轴相同，重复画三条一样的竖线只是噪音
+    chartCpu.draw(rows, d.events || []);
+    chartMem.draw(rows); chartIo.draw(rows);
     // 后端按窗口自动分桶（30s / 90s / 6min / 1h…），提示里写清楚聚合粒度，
     // 否则 7 天曲线被压成 240 个点时会让人误以为是采样丢了。
     const bucket = Number(d.bucket || 30);
@@ -2110,6 +2325,59 @@ function bindEvents() {
   });
 
   // ── 看门狗 ──
+  $('watch-add').addEventListener('click', () => openWatchModal(0));
+  $('watch-cancel').addEventListener('click', closeWatchModal);
+  $('watch-save').addEventListener('click', saveWatch);
+  $('watch-mask').addEventListener('click', (e) => { if (e.target === $('watch-mask')) closeWatchModal(); });
+  $('watch-events-refresh').addEventListener('click', () => loadWatches().catch(() => {}));
+  $('watch-events-filter').addEventListener('change', async () => {
+    const id = Number($('watch-events-filter').value) || 0;
+    try {
+      const r2 = await fetch(API + '/watches/events?limit=200' + (id ? `&watchId=${id}` : ''), { cache: 'no-store' });
+      const d2 = await r2.json().catch(() => ({}));
+      if (!r2.ok) throw new Error(d2.error || ('HTTP ' + r2.status));
+      watchEvents = d2.rows || [];
+      renderWatchEvents();
+    } catch (e) { toast('读取追踪记录失败：' + e.message, 'error'); }
+  });
+  $('watch-body').addEventListener('click', async (e) => {
+    const edit = e.target.closest('button[data-action="watch-edit"]');
+    if (edit) { openWatchModal(Number(edit.dataset.id)); return; }
+    const tog = e.target.closest('button[data-action="watch-toggle"]');
+    if (tog) {
+      const w = watches.find((x) => x.id === Number(tog.dataset.id));
+      if (!w) return;
+      tog.disabled = true;
+      try {
+        const r2 = await fetch(API + '/watches', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: w.id, name: w.name, pattern: w.pattern, enabled: !w.enabled }),
+        });
+        const d2 = await r2.json().catch(() => ({}));
+        if (!r2.ok) throw new Error(d2.error || ('HTTP ' + r2.status));
+        await loadWatches();
+      } catch (err) { toast('切换失败：' + err.message, 'error'); tog.disabled = false; }
+      return;
+    }
+    const del = e.target.closest('button[data-action="watch-del"]');
+    if (del) {
+      const w = watches.find((x) => x.id === Number(del.dataset.id));
+      if (!w) return;
+      confirmModal('删除进程追踪', `确定删除「${w.name}」？\n它的历史记录也会一并删除。`, '确定删除', async () => {
+        try {
+          const r2 = await fetch(API + '/watches/delete', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id: w.id, confirm: true }),
+          });
+          const d2 = await r2.json().catch(() => ({}));
+          if (!r2.ok) throw new Error(d2.error || ('HTTP ' + r2.status));
+          toast('已删除', 'ok');
+          await loadWatches();
+        } catch (err) { toast('删除失败：' + err.message, 'error'); }
+      });
+    }
+  });
+
   $('wd-add').addEventListener('click', () => openWatchdogModal(null));
   $('wd-cancel').addEventListener('click', closeWatchdogModal);
   $('wd-save').addEventListener('click', saveWatchdog);
@@ -2171,7 +2439,28 @@ function bindEvents() {
   });
 
   // 服务视图：启动 / 停止 / 重启 / 看日志 / 改开机自启
-  $('svcbody').addEventListener('click', (e) => {
+  $('svcbody').addEventListener('click', async (e) => {
+    const pinB = e.target.closest('button[data-action="svc-pin"]');
+    if (pinB) {
+      e.stopPropagation();
+      const unit = pinB.dataset.unit;
+      const want = pinB.dataset.pinned !== '1';
+      pinB.disabled = true;
+      try {
+        const res = await fetch(API + '/service/pin', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: unit, pinned: want }),
+        });
+        const d = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(d.error || ('HTTP ' + res.status));
+        // 重新拉一次：关注会影响排序，只改本地状态会和后端顺序不一致
+        await renderServices();
+      } catch (err) {
+        toast('关注设置失败：' + err.message, 'error');
+        pinB.disabled = false;
+      }
+      return;
+    }
     const logB = e.target.closest('button[data-action="svc-log"]');
     if (logB) { e.stopPropagation(); openLog(logB.dataset.unit); return; }
     const enB = e.target.closest('button[data-action="svc-enable"]');
@@ -2231,6 +2520,71 @@ function bindEvents() {
   }
 
   // 表格行点击：详情 / 信号按钮
+  // 勾选：用 change 事件（checkbox 不触发 click 委托里的判断也能工作，但 change 语义更准）
+  $('ptbody').addEventListener('change', (e) => {
+    const cb = e.target.closest('input.pick');
+    if (!cb) return;
+    const pid = Number(cb.dataset.pid);
+    if (!pid) return;
+    if (cb.checked) {
+      if (picked.size >= PICK_LIMIT) {
+        cb.checked = false;
+        toast(`一次最多选 ${PICK_LIMIT} 个进程`, 'error');
+        return;
+      }
+      picked.add(pid);
+    } else picked.delete(pid);
+    updateBatchBar();
+  });
+
+  $('pick-all').addEventListener('change', (e) => {
+    const on = e.target.checked;
+    if (on && rowsCache.length > PICK_LIMIT) {
+      toast(`当前列表 ${rowsCache.length} 个，超出上限 ${PICK_LIMIT}；请先筛选或缩小范围`, 'error');
+      e.target.checked = false;
+      return;
+    }
+    picked.clear();
+    for (const r of rowRefs.values()) if (r.pickCb) r.pickCb.checked = on;
+    if (on) for (const p of rowsCache) picked.add(p.pid);
+    updateBatchBar();
+  });
+
+  $('batch-clear').addEventListener('click', clearPicked);
+
+  for (const [id, sig] of [['batch-sigterm', 'SIGTERM'], ['batch-sigkill', 'SIGKILL']]) {
+    $(id).addEventListener('click', () => {
+      const pids = [...picked];
+      if (!pids.length) { toast('还没有选中进程', 'error'); return; }
+      const strong = sig === 'SIGKILL';
+      confirmModal(
+        strong ? '强制结束所选进程' : '结束所选进程',
+        `将对 ${pids.length} 个进程发送 ${sig}${strong ? '（不做清理、不可拦截）' : '（可被进程拦截，通常会优雅退出）'}。\n`
+        + `PID：${pids.slice(0, 12).join('、')}${pids.length > 12 ? ` …等 ${pids.length} 个` : ''}`,
+        strong ? '确认强制结束' : '确认结束',
+        async () => {
+          try {
+            const r = await fetch(API + '/kill', {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ pids, signal: sig, confirm: true }),
+            });
+            const d = await r.json().catch(() => ({}));
+            if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+            if (d.failed) {
+              toast(`成功 ${d.okCount} 个，失败 ${d.failed} 个（详情见操作记录）`, 'warn');
+            } else {
+              toast(`已对 ${d.okCount} 个进程发送 ${sig}`, 'ok');
+            }
+            clearPicked();
+            await refreshView();
+          } catch (err) {
+            toast('批量处置失败：' + err.message, 'error');
+          }
+        },
+      );
+    });
+  }
+
   // 一个委托监听处理三种点击，按优先级 return：
   // 早期这件事被写成两个 addEventListener 挂在同一个 tbody 上，
   // 而 stopPropagation 只阻止向祖先传播、拦不住同节点上的第二个监听器 ——
@@ -2331,7 +2685,7 @@ function bindEvents() {
     if (e.key === 'Escape') {
       // 新增的四个弹层也要能被 ESC 关掉（之前只绑了"点遮罩"）
       closeModal(); closeDetail(); closeSheets();
-      closeAlertModal(); closeLog(); closeWatchdogModal(); closeSnapModal();
+      closeAlertModal(); closeLog(); closeWatchdogModal(); closeSnapModal(); closeWatchModal();
     }
     // 只在「没在输入」时接管 `/`：早期只排除了搜索框自身，
     // 于是 webhook 地址、看门狗命令、记录搜索里打斜杠会被吞掉并把焦点抢走

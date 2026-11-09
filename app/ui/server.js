@@ -32,7 +32,7 @@ const PORT = parseInt(process.env.PORT || '47951', 10);
 const SOCK_DIR = process.env.FNPROC_SOCK_DIR || TARGET_DIR;
 const SOCK_PATH = join(SOCK_DIR, 'fnproc.sock');
 const GATEWAY_PREFIX = '/app/fnproc';
-const VERSION = '0.3.1';
+const VERSION = '0.4.0';
 const SAMPLE_MS = 1000;
 const HISTORY_MAX = 120;              // 内存里保留 120 个采样点，够前端画满图
 
@@ -256,6 +256,44 @@ let portsInflight = false;
 let lastPortsAt = 0;
 let portsSsOk = false;            // 本轮是否用 ss 采集成功（失败时连接视图为空，前端要能区分）
 let allConnsDegraded = false;
+
+// ── 进程追踪检查 ──────────────────────────────────────────────────────────
+// 语义：给一个关键字（进程名 / 命令行片段），记住第一次看到的 PID 集合，
+// 之后有新 PID 出现就记一条事件。只记录，绝不执行命令 —— 这和看门狗是两件事。
+function checkWatches() {
+  const watches = alertStore.listWatches();
+  if (!watches.length) return 0;
+  let added = 0;
+  const now = Date.now();
+  for (const w of watches) {
+    if (!w.enabled) continue;
+    const pat = String(w.pattern || '').toLowerCase();
+    if (!pat) continue;
+    const hits = procs.filter((p) => String(p.name || '').toLowerCase().includes(pat)
+      || String(p.cmd || '').toLowerCase().includes(pat));
+    const current = hits.map((p) => p.pid);
+    const base = new Set(w.baseline || []);
+    // 第一次（baseline 为空）只建基准，不把当下已在跑的进程全报成"新出现"
+    if (!w.baseline || w.baseline.length === 0) {
+      alertStore.updateWatchBaseline(w.id, current, now);
+      continue;
+    }
+    if (now - (w.lastCheck || 0) < 4000) continue;
+    for (const p of hits) {
+      if (base.has(p.pid)) continue;
+      alertStore.addWatchEvent({
+        ts: now, watchId: w.id, watchName: w.name, kind: 'appear',
+        pid: p.pid, pname: p.name, cmd: p.cmd || '',
+      });
+      added += 1;
+      if (added > 200) break;                      // 防爆：一轮最多记 200 条
+    }
+    const gone = [];                               // 消失的只在基准里记下，不单独刷事件
+    void gone;
+    alertStore.updateWatchBaseline(w.id, current, now);
+  }
+  return added;
+}
 
 async function refreshPorts() {
   if (portsInflight) return;
@@ -1055,6 +1093,8 @@ setInterval(() => {
   if (removed > 0) console.log(`[history] 清理过期采样 ${removed} 行`);
   const evRemoved = alertStore.pruneEvents(ALERT_EVENT_RETENTION_DAYS);
   if (evRemoved > 0) console.log(`[alert] 清理过期告警事件 ${evRemoved} 行`);
+  const wRemoved = alertStore.pruneWatchEvents(30);
+  if (wRemoved > 0) console.log(`[watch] 清理过期追踪事件 ${wRemoved} 行`);
 }, 3600 * 1000);
 
 // ── 进程快照 ────────────────────────────────────────────────────────────
@@ -1484,6 +1524,54 @@ async function handle(req, res, pathname, query) {
   if (pathname === '/api/kill' && req.method === 'POST') {
     const body = await readBody(req, res);
     if (!body) return;
+
+    // ── 批量处置 ─────────────────────────────────────────────────────────
+    // 排查时经常要一次处理一组进程（比如十几个 python worker）。批量本身
+    // 是危险动作，所以约束比单条更紧：上限 50 个、不支持 tree、逐个走完整
+    // 校验、逐个记审计，任何一条被拦都不影响其它条。
+    if (Array.isArray(body.pids)) {
+      const client = clientOf(req);
+      const sig = String(body.signal || 'SIGTERM').toUpperCase();
+      const raw = body.pids.map((x) => num(x)).filter((x) => x > 0);
+      const uniq = [...new Set(raw)];
+      const guard = (msg) => {
+        auditRecord({
+          action: 'kill.batch', target: `n=${raw.length}`, result: 'rejected',
+          message: msg, client, detail: { pids: uniq.slice(0, 50), signal: sig },
+        });
+        sendJSON(res, 400, { error: msg });
+      };
+      if (body.tree === true) return guard('批量处置不支持 tree，请逐个结束子树');
+      if (!uniq.length) return guard('缺少 pids');
+      if (uniq.length > 50) return guard(`拒绝：一次最多 50 个进程（当前 ${uniq.length} 个）`);
+      if (!SIGNALS.has(sig)) return guard(`拒绝：不支持的信号 ${sig}`);
+      if (body.confirm !== true) return guard('需要 confirm: true 才会执行');
+
+      const results = [];
+      let okCount = 0;
+      for (const p of uniq) {
+        const info = procs.find((x) => x.pid === p);
+        const nm = info?.name || '?';
+        if (p <= 1) { results.push({ pid: p, ok: false, error: '受保护：PID ≤ 1', name: nm }); continue; }
+        if (p === process.pid) { results.push({ pid: p, ok: false, error: '受保护：不能结束自身', name: nm }); continue; }
+        try {
+          process.kill(p, sig);
+          okCount += 1;
+          results.push({ pid: p, ok: true, name: nm });
+        } catch (e) {
+          results.push({ pid: p, ok: false, error: e.code === 'ESRCH' ? '进程不存在' : (e.code === 'EPERM' ? '权限不足' : e.message), name: nm });
+        }
+      }
+      const failed = results.filter((r) => !r.ok);
+      const id = auditRecord({
+        action: 'kill.batch', target: `${uniq.length} 个进程`, result: failed.length ? 'partial' : 'ok',
+        message: `${sig}：成功 ${okCount} · 失败 ${failed.length}`,
+        client, detail: { signal: sig, results: results.slice(0, 50) },
+      });
+      sendJSON(res, 200, { success: true, id, at: new Date().toISOString(), signal: sig, total: uniq.length, okCount, failed: failed.length, results });
+      return;
+    }
+
     const pid = num(body.pid);
     const sig = String(body.signal || 'SIGTERM').toUpperCase();
     const client = clientOf(req);
@@ -1556,9 +1644,18 @@ async function handle(req, res, pathname, query) {
     if (historyStore.enabled) {
       const points = Math.min(600, Math.max(60, num(query.get('points')) || 240));
       const q = historyStore.query(minutes, points);
+      // 把这段时间内的审计事件一并带上：曲线上标出「那一刻谁动过什么」，
+      // 内存暴涨的时间点就能直接对上是重启了服务还是杀了进程
+      const since = Date.now() - minutes * 60000;
+      const acts = auditStore.enabled
+        ? auditStore.list({ limit: 200, since, action: '', result: '' }).rows
+          .filter((e) => /^(kill|service\.|app\.|tune)/.test(String(e.action || '')))
+          .map((e) => ({ ts: e.ts, action: e.action, target: e.target, result: e.result, message: e.message }))
+        : [];
       sendJSON(res, 200, {
         ts: Date.now(), minutes, count: q.rows.length, bucket: q.bucket,
         source: q.source, file: HISTORY_DB, rows: q.rows, health: historyStore.health(),
+        events: acts,
       });
       return;
     }
@@ -1583,9 +1680,78 @@ async function handle(req, res, pathname, query) {
       if (u.active === 'active') counts.running += 1;
       if (u.active === 'failed' || u.sub === 'failed') counts.failed += 1;
     }
-    sendJSON(res, 200, { ts: state.ts, total: list.length, counts, units: list.slice(0, 400) });
+    // 关注的服务置顶：日常只盯那 5～10 个，239 个平铺时是被噪音淹掉的
+    const pinnedSet = new Set(alertStore.listPinned());
+    for (const u of list) u.pinned = pinnedSet.has(u.name);
+    list.sort((a, b) => (Number(b.pinned) - Number(a.pinned))
+      || a.name.localeCompare(b.name));
+    sendJSON(res, 200, {
+      ts: state.ts, total: list.length, counts, pinnedCount: pinnedSet.size,
+      units: list.slice(0, 400),
+    });
     return;
-  }
+    }
+
+    // ── 进程追踪：只记录出现/消失，不执行任何命令 ────────────────────────
+    if (pathname === '/api/watches') {
+      if (req.method === 'GET') {
+        sendJSON(res, 200, {
+          watches: alertStore.listWatches(),
+          events: alertStore.listWatchEvents({ limit: Math.min(200, num(query.get('limit')) || 50) }).rows,
+          storeEnabled: alertStore.enabled,
+        });
+        return;
+      }
+      const body = await readBody(req, res);
+      if (!body) return;
+      const input = { id: num(body.id) || 0, name: body.name, pattern: body.pattern };
+      if (typeof body.enabled === 'boolean') input.enabled = body.enabled;
+      const r2 = alertStore.saveWatch(input);
+      if (!r2.ok) { sendJSON(res, 400, { error: r2.error }); return; }
+      auditRecord({
+        action: input.id ? 'watch.update' : 'watch.add', target: String(input.name || '').slice(0, 120),
+        result: 'ok', message: `追踪关键字：${String(input.pattern || '').slice(0, 120)}`, client: clientOf(req),
+      });
+      sendJSON(res, 200, { ok: true, id: r2.id, watches: alertStore.listWatches() });
+      return;
+    }
+
+    if (pathname === '/api/watches/delete' && req.method === 'POST') {
+      const body = await readBody(req, res);
+      if (!body) return;
+      const id = num(body.id) || 0;
+      if (!id) { sendJSON(res, 400, { error: '缺少 id' }); return; }
+      if (body.confirm !== true) { sendJSON(res, 400, { error: '需要 confirm: true' }); return; }
+      alertStore.deleteWatch(id);
+      auditRecord({ action: 'watch.delete', target: `watch:${id}`, result: 'ok', message: '删除进程追踪', client: clientOf(req) });
+      sendJSON(res, 200, { ok: true, watches: alertStore.listWatches() });
+      return;
+    }
+
+    if (pathname === '/api/watches/events') {
+      const r3 = alertStore.listWatchEvents({
+        limit: Math.min(500, num(query.get('limit')) || 100),
+        watchId: num(query.get('watchId')) || 0,
+      });
+      sendJSON(res, 200, { ts: Date.now(), total: r3.total, rows: r3.rows });
+      return;
+    }
+
+    if (pathname === '/api/service/pin' && req.method === 'POST') {
+    const body = await readBody(req, res);
+    if (!body) return;
+    const name = String(body.name || '').trim();
+    const want = body.pinned === true || body.pinned === 'true' || body.pinned === 1;
+    if (!UNIT_RE.test(name)) { sendJSON(res, 400, { error: '服务名不合法' }); return; }
+    const r = alertStore.setPinned(name, want);
+    if (!r.ok) { sendJSON(res, 500, { error: r.error || '保存失败' }); return; }
+    auditRecord({
+      action: want ? 'service.pin' : 'service.unpin', target: name, result: 'ok',
+      message: want ? '加入关注' : '取消关注', client: clientOf(req),
+    });
+    sendJSON(res, 200, { ok: true, name, pinned: r.pinned });
+    return;
+    }
 
   if (pathname === '/api/service' && req.method === 'POST') {
     const body = await readBody(req, res);
@@ -2199,7 +2365,8 @@ async function handle(req, res, pathname, query) {
   // 写端点被 GET 访问时回 405，比 404 更能说明问题（避免把「方法不对」当成「接口不存在」）
   const POST_ONLY = new Set(['/api/kill', '/api/service', '/api/service/enable', '/api/alerts',
     '/api/alerts/delete', '/api/alerts/test', '/api/watchdogs', '/api/watchdogs/delete',
-    '/api/snapshot', '/api/snapshot/delete', '/api/container/action', '/api/tune']);
+    '/api/snapshot', '/api/snapshot/delete', '/api/container/action', '/api/tune',
+    '/api/watches', '/api/watches/delete', '/api/service/pin', '/api/kill/batch']);
   if (POST_ONLY.has(pathname)) {
     sendJSON(res, 405, { error: '该接口只接受 POST' });
     return;
@@ -2306,6 +2473,7 @@ setInterval(() => {
 tick();
 setInterval(tick, SAMPLE_MS);
 alertEngine.start(5000);        // 告警判定每 5 秒一轮，只用已采好的数据
+setInterval(() => { try { checkWatches(); } catch (e) { console.error('[watch]', e.message); } }, 5000);
 
 // 应用自身的启停也进审计 —— 这样「谁在什么时候重启过这个应用」也查得到
 auditRecord({
