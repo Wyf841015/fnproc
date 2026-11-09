@@ -609,6 +609,8 @@ select {
 .timers-block > summary::before { content: '▸'; color: var(--text-mute); font-size: 12px; }
 .timers-block[open] > summary::before { content: '▾'; }
 .timers-block > summary h2 { margin: 0; font-size: 14px; }
+.timers-block > summary:hover h2 { color: var(--accent); }
+.timers-block > summary .hint { margin-left: auto; text-align: right; }
 
 /* systemd 服务：改成和定时器一样的可折叠块后，状态筛选单独占一行 */
 .svc-filter-row {

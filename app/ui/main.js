@@ -1047,6 +1047,10 @@ async function loadAlertEvents() {
     }
     tb.appendChild(frag);
     $('alert-events-empty').hidden = (d.rows || []).length > 0;
+    if ($('alerts-ev-hint')) {
+      const n = (d.rows || []).length;
+      $('alerts-ev-hint').textContent = n ? `${n} 条记录` : '暂无记录';
+    }
   } catch (e) { console.warn('[alerts/events] 读取失败:', e.message); }
 }
 
@@ -2291,6 +2295,25 @@ async function loadAudit() {
   }
 }
 
+// ── 折叠块状态记忆 ──────────────────────────────────────────────────────
+// 全应用的区块（服务 / 告警规则 / 告警事件 / 看门狗 / 进程追踪 / 定时器 /
+// crontab / 开机耗时）统一用 <details class="timers-block">，默认策略是
+// 「查看类展开、配置类收起」。用户手动改过之后按 id 记住，下次进来保持原样 ——
+// 否则每次刷新都要重新收一遍。
+const COLLAPSE_KEY = 'fnproc-collapse';
+function initCollapseMemory() {
+  let saved = {};
+  try { saved = JSON.parse(localStorage.getItem(COLLAPSE_KEY) || '{}') || {}; } catch (e) { saved = {}; }
+  for (const d of document.querySelectorAll('details.timers-block')) {
+    if (!d.id) continue;
+    if (typeof saved[d.id] === 'boolean') d.open = saved[d.id];
+    d.addEventListener('toggle', () => {
+      saved[d.id] = d.open;
+      try { localStorage.setItem(COLLAPSE_KEY, JSON.stringify(saved)); } catch (e) { /* 忽略 */ }
+    });
+  }
+}
+
 // 可重放的审计动作白名单（与后端 REPLAYABLE 保持一致）
 const REPLAYABLE_ACTIONS = new Set(['service.start', 'service.stop', 'service.restart']);
 
@@ -2495,6 +2518,7 @@ function bindEvents() {
     loadHistoryView();
   });
 
+  initCollapseMemory();          // 折叠状态按 id 记忆
   $('btn-refresh').addEventListener('click', () => { refreshAll(); loadHistoryView(); });
 
   // 导出诊断包：fetch → Blob → 临时 a 触发下载。

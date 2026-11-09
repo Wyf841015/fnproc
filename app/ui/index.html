@@ -372,7 +372,7 @@
         </details>
         </article>
         <article class="card">
-        <details class="timers-block">
+        <details class="timers-block" id="timers-block">
         <summary><h2>定时器（systemd timer）</h2><span class="hint" id="timers-hint">—</span></summary>
         <div class="table-wrap">
           <table class="ptable">
@@ -384,7 +384,7 @@
         </details>
         </article>
         <article class="card">
-        <details class="timers-block">
+        <details class="timers-block" id="cron-block">
         <summary><h2>定时任务（crontab）</h2><span class="hint" id="cron-hint">—</span></summary>
         <div class="table-wrap">
           <table class="ptable">
@@ -396,7 +396,7 @@
         </details>
         </article>
         <article class="card">
-        <details class="timers-block">
+        <details class="timers-block" id="boot-block">
         <summary><h2>开机耗时</h2><span class="hint" id="boot-hint">—</span></summary>
         <div class="boot-bars" id="boot-bars"></div>
         <pre class="log-pre" id="boot-pre" style="max-height:200px">加载中…</pre>
@@ -407,12 +407,10 @@
   <!-- ── 告警 ── -->
   <section class="tab-panel" id="panel-alerts" role="tabpanel" hidden>
     <article class="card">
-      <div class="card-head panel-head">
-        <h2>告警规则</h2>
-        <div class="procs-tools">
-          <span class="hint" id="alerts-hint">—</span>
-          <button class="btn" id="alert-add" type="button">＋ 新建规则</button>
-        </div>
+      <details class="timers-block" id="alerts-block" open>
+      <summary><h2>告警规则</h2><span class="hint" id="alerts-hint">—</span></summary>
+      <div class="svc-filter-row">
+        <button class="btn" id="alert-add" type="button">＋ 新建规则</button>
       </div>
       <div class="table-wrap">
         <table class="ptable">
@@ -432,22 +430,22 @@
           </thead>
           <tbody id="alert-body"></tbody>
         </table>
-        <div class="empty" id="alerts-empty" hidden>还没有告警规则，点右上角「新建规则」加一条</div>
+        <div class="empty" id="alerts-empty" hidden>还没有告警规则，点「新建规则」加一条</div>
       </div>
+      </details>
     </article>
 
     <article class="card">
-      <div class="card-head panel-head">
-        <h2>告警事件</h2>
-        <div class="procs-tools">
-          <select id="alert-level-filter" title="按级别筛选">
-            <option value="">全部级别</option>
-            <option value="0">普通</option>
-            <option value="1">警告</option>
-            <option value="2">严重</option>
-          </select>
-          <button class="btn ghost" id="alert-events-refresh" type="button">刷新</button>
-        </div>
+      <details class="timers-block" id="alerts-ev-block" open>
+      <summary><h2>告警事件</h2><span class="hint" id="alerts-ev-hint">—</span></summary>
+      <div class="svc-filter-row">
+        <select id="alert-level-filter" title="按级别筛选">
+          <option value="">全部级别</option>
+          <option value="0">普通</option>
+          <option value="1">警告</option>
+          <option value="2">严重</option>
+        </select>
+        <button class="btn ghost" id="alert-events-refresh" type="button">刷新</button>
       </div>
       <div class="table-wrap">
         <table class="ptable">
@@ -464,15 +462,14 @@
         </table>
         <div class="empty" id="alert-events-empty" hidden>还没有触发记录</div>
       </div>
+      </details>
     </article>
 
     <article class="card">
-      <div class="card-head panel-head">
-        <h2>看门狗</h2>
-        <div class="procs-tools">
-          <span class="hint" id="wd-hint">监视的进程不在了，就执行一条命令把它拉回来</span>
-          <button class="btn" id="wd-add" type="button">＋ 新建看门狗</button>
-        </div>
+      <details class="timers-block" id="wd-block">
+      <summary><h2>看门狗</h2><span class="hint" id="wd-hint">监视的进程不在了，就执行一条命令把它拉回来</span></summary>
+      <div class="svc-filter-row">
+        <button class="btn" id="wd-add" type="button">＋ 新建看门狗</button>
       </div>
       <p class="hint danger-hint">⚠️ 看门狗执行的命令会以 <b>root</b> 身份运行（<code>/bin/sh -c</code>）。新建时默认不启用，确认命令无误后再手动打开。</p>
       <div class="table-wrap">
@@ -484,15 +481,14 @@
         </table>
         <div class="empty" id="wd-empty" hidden>还没有看门狗</div>
       </div>
+      </details>
     </article>
 
     <article class="card">
-      <div class="card-head panel-head">
-        <h2>进程追踪</h2>
-        <div class="procs-tools">
-          <span class="hint" id="watch-hint">记住某个关键字的进程清单，之后有新进程冒出来就记一条</span>
-          <button class="btn" id="watch-add" type="button">＋ 新建追踪</button>
-        </div>
+      <details class="timers-block" id="watch-block">
+      <summary><h2>进程追踪</h2><span class="hint" id="watch-hint">记住某个关键字的进程清单，之后有新进程冒出来就记一条</span></summary>
+      <div class="svc-filter-row">
+        <button class="btn" id="watch-add" type="button">＋ 新建追踪</button>
       </div>
       <p class="hint">只观察、只记录，不会执行任何命令。适合盯「某服务是不是被偷偷重启了」「某个 worker 是不是反复重生」。</p>
       <div class="table-wrap">
@@ -525,6 +521,7 @@
           <div class="empty" id="watch-events-empty" hidden>还没有发现新进程</div>
         </div>
       </div>
+      </details>
     </article>
   </section>
 
