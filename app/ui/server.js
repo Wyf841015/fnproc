@@ -253,6 +253,23 @@ function refreshInodePorts() {
 // 390 个进程 × 每 10 秒 ≈ 上万个 readdir/readlink 系统调用，是第二个 CPU 大户。
 // 现在优先用一次 `ss -tunapH`（内核已经算好了），解析失败才退回旧路径。
 let portsInflight = false;
+// 上次采集时见过的 PID 数量与集合摘要，用来判断「进程集合变了没」
+let portsPidSig = '';
+/**
+ * 是否需要重新采集端口归属：
+ * ① 从未采集过；② 距上次超过 30 秒；③ 进程集合发生了增删。
+ * 判断③只看「数量 + 一个轻量摘要」，不做全量集合比较，377 个 PID 也就几百次
+ * 字符串拼接，比 fork 一个 ss 便宜两个数量级。
+ */
+function portsNeedRefresh() {
+  if (portsInflight) return false;
+  const now = Date.now();
+  if (!lastPortsAt) return true;
+  if (now - lastPortsAt > 30000) return true;
+  const sig = procs.length + ':' + procs.reduce((a, p) => a + (p.pid % 997), 0);
+  if (sig !== portsPidSig) return true;
+  return false;
+}
 let lastPortsAt = 0;
 let portsSsOk = false;            // 本轮是否用 ss 采集成功（失败时连接视图为空，前端要能区分）
 let allConnsDegraded = false;
@@ -308,6 +325,7 @@ async function refreshPorts() {
     // 走回退路径（没装 ss / 无权限）时也要记时间戳，
     // 否则每个 /api/ports 请求都会触发一次全量 fd 扫描（数百进程同步 readdir/readlink）
     lastPortsAt = Date.now();
+    portsPidSig = procs.length + ':' + procs.reduce((a, p) => a + (p.pid % 997), 0);
     allConnsDegraded = !portsSsOk;
     portsInflight = false;
   }
@@ -379,6 +397,7 @@ async function portsViaSs() {
   pidPorts = byPid;
   allConns = conns;
   lastPortsAt = Date.now();
+  portsPidSig = procs.length + ':' + procs.reduce((a, p) => a + (p.pid % 997), 0);
   return true;
 }
 
@@ -607,7 +626,10 @@ function procCmdline(pid, force = false) {
 function procIo(pid, force = false) {
   const now = Date.now();
   const c = ioCache.get(pid);
-  if (!force && c && now - c.ts < 5000) return c.v;
+  // IO 是累计计数器，1 分钟粒度足够看清「谁在写盘」，没必要每秒重读。
+  // 377 个进程 × 每 5 秒一次 = 每分钟 4500 次文件读取，改成 60 秒后降到 377 次。
+  // 需要精确值的路径（/api/io 卡片）自己带 force 或依赖本缓存即可。
+  if (!force && c && now - c.ts < 60000) return c.v;
   const v = { read: 0, write: 0 };
   for (const line of readOr(`/proc/${pid}/io`).split('\n')) {
     const [k, val] = line.split(':');
@@ -994,8 +1016,12 @@ function histCompact() {
   }
   return out;
 }
+// 实时帧里的历史曲线：曲线每 5 秒才需要前进一格（appendHistory 是 30 秒一个
+// 采样点），每秒重推一遍一模一样的数组纯属浪费带宽。这里只在曲线真的变了
+// 之后才带上 h/hk，其余帧省掉这两个字段 —— 前端沿用上一份即可。
+let lastHistPayload = '';
 function sseSnapshot() {
-  return {
+  const base = {
     ts: state.ts,
     version: VERSION,
     cpu: state.cpu,
@@ -1006,9 +1032,15 @@ function sseSnapshot() {
     procTotal: state.procTotal,
     io: state.io,
     net: state.net,
-    hk: HIST_KEYS,
-    h: histCompact(),
   };
+  const h = histCompact();
+  const sig = h.length + '|' + (h.length ? h[h.length - 1].join(',') : '');
+  if (sig !== lastHistPayload) {
+    lastHistPayload = sig;
+    base.hk = HIST_KEYS;
+    base.h = h;
+  }
+  return base;
 }
 
 function broadcast() {
@@ -1409,7 +1441,11 @@ async function handle(req, res, pathname, query) {
   // 监听端口视图：把 inode→port 的结果反查成 pid，再补进程名/用户/容器
   if (pathname === '/api/ports') {
     // 端口数据是 10 秒后台刷新的，刚切过来可能偏旧：超过 5 秒就后台补一次
-    if (Date.now() - lastPortsAt > 5000) { refreshPorts().catch(() => {}); }
+    // 端口归属只在「进程集合变化」或「距上次采集超过 30 秒」时重算。
+    // 每次重算要 fork 一个 ss 进程（约 20~40ms CPU），而端口归属其实只在
+    // 服务启停时变 —— 每秒/每 5 秒跑一遍纯属浪费。
+    // 新 PID 出现时立即重算，保证「刚起的服务」马上能看到它监听的端口。
+    if (portsNeedRefresh()) { refreshPorts().catch(() => {}); }
     const byPid = new Map(procs.map((p) => [p.pid, p]));
     const out = [];
     for (const [pid, list] of pidPorts) {

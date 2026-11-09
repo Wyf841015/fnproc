@@ -528,8 +528,19 @@ async function renderUsers() {
   if ($('user-empty')) $('user-empty').hidden = rows.length > 0;
 }
 
+// 单页最多渲染多少行。正常 300~400 个进程全渲染没问题（浏览器几千行也能扛），
+// 这里防的是异常情况：某天进程数涨到几千（进程泄漏 / fork 风暴），
+// 全量建 DOM 会把界面卡住。宁可少显示几行并明确告知，也不要白屏。
+const ROW_LIMIT = 800;
+
 function renderTable(rows) {
   rowsCache = rows;
+  const totalRows = rows.length;
+  let limited = false;
+  if (rows.length > ROW_LIMIT) {
+    rows = rows.slice(0, ROW_LIMIT);
+    limited = true;
+  }
   const tb = $('ptbody');
   const sameShape = rows.length === tablePids.length && rows.every((p, i) => p.pid === tablePids[i]);
   if (sameShape && rowRefs.size) {
@@ -550,7 +561,9 @@ function renderTable(rows) {
     if (pruned) toast('部分已选进程已退出，已自动取消勾选', 'warn');
     updateBatchBar();
   $('empty').hidden = rows.length > 0;
-  $('table-info').textContent = `${rows.length} 个进程${query ? `（已过滤，共 ${lastSnapshot?.procTotal ?? '?'} 个）` : ''}`;
+  $('table-info').textContent = limited
+    ? `显示前 ${ROW_LIMIT} 个（共 ${totalRows} 个，请用搜索或排序缩小范围）`
+    : `${rows.length} 个进程${query ? `（已过滤，共 ${lastSnapshot?.procTotal ?? '?'} 个）` : ''}`;
 }
 
 // ── 视图：进程树 ────────────────────────────────────────────────────────
