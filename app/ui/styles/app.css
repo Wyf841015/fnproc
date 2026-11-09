@@ -380,11 +380,21 @@ select {
 /* ── 弹窗 ─────────────────────────────────────────────── */
 .modal-mask {
   position: fixed; inset: 0; z-index: 60; display: grid; place-items: center;
+  /* 关键：显式把列/行固定成「不超过容器」。grid 默认 auto 列会按内容的 max-content
+     定宽 —— 日志预览里一条长行（实测 2076px）就能把列撑到两千多，弹窗在这条超大列里
+     居中，结果整块跑到视口右边界外：移动端只剩一层遮罩，桌面上也只在极宽窗口里才看得见。 */
+  grid-template-columns: minmax(0, 1fr);
+  grid-auto-rows: minmax(0, auto);
   background: rgba(2, 8, 23, .55); opacity: 0; transition: opacity .16s; padding: 20px;
+  overflow: auto;
 }
 .modal-mask.show { opacity: 1; }
 .modal {
-  width: min(420px, 100%); background: var(--card-solid); border: 1px solid var(--line);
+  width: min(420px, 100%); min-width: 0; max-width: 100%;
+  /* 内容比屏幕高时在弹窗内滚动，关闭按钮不会跑到屏幕外找不回来。
+     用 vh 不用 dvh：fnOS 的 WebView(CEF) 不支持 dvh。 */
+  max-height: calc(100vh - 40px); overflow-y: auto;
+  background: var(--card-solid); border: 1px solid var(--line);
   border-radius: var(--radius); padding: 18px; box-shadow: 0 24px 60px rgba(2, 8, 23, .6);
   transform: translateY(8px) scale(.98); transition: transform .18s;
 }
@@ -435,12 +445,13 @@ select {
 /* ── 赞助 / 反馈 弹层 ─────────────────────────────────── */
 .sheet-mask {
   position: fixed; inset: 0; z-index: 80; display: grid; place-items: center;
+  grid-template-columns: minmax(0, 1fr); grid-auto-rows: minmax(0, auto);
   background: rgba(2, 8, 23, .58); padding: 18px;
-  opacity: 0; transition: opacity .18s;
+  opacity: 0; transition: opacity .18s; overflow: auto;
 }
 .sheet-mask.show { opacity: 1; }
 .sheet {
-  width: min(460px, 100%); max-height: 88vh; overflow-y: auto;
+  width: min(460px, 100%); min-width: 0; max-width: 100%; max-height: calc(100vh - 36px); overflow-y: auto;
   background: var(--card-solid); border: 1px solid var(--line); border-radius: var(--radius);
   padding: 16px 18px 20px; box-shadow: 0 24px 60px rgba(2, 8, 23, .6);
   transform: translateY(10px) scale(.98); transition: transform .2s;
@@ -569,6 +580,14 @@ select {
   background: var(--bg-2); color: var(--text); font-size: 12px;
 }
 .log-tools input { flex: 1 1 160px; min-width: 0; }
+/* 日志弹窗走 flex 列：工具条与按钮不动，只有日志正文滚动 */
+.log-modal { display: flex; flex-direction: column; overflow: hidden; }
+.log-modal > h3, .log-modal > .log-tools, .log-modal > .modal-actions { flex: 0 0 auto; }
+.log-modal .log-pre {
+  flex: 1 1 auto; min-height: 0; min-width: 0; max-height: none;
+  height: min(46vh, 460px);   /* 理想高度；min-height:0 保证矮视口下能被压缩而不是顶出弹窗 */
+}
+
 .log-pre {
   margin: 0; padding: 10px; max-height: min(58vh, 460px); overflow: auto;
   background: #05080f; color: #cbd5e1; border: 1px solid var(--line); border-radius: var(--radius-sm);
@@ -636,3 +655,40 @@ select {
 }
 /* 卷百分比：与其它数字统一等宽右对齐 */
 .vol-pct { font-size: 12.5px; font-variant-numeric: tabular-nums; color: var(--text-dim); }
+
+/* ── 移动端：弹窗与宽表格 ────────────────────────────────────────────────
+   这一块必须放在文件最后：上方 @media (max-width: 760px) 里虽有同名规则，
+   但 .log-tools / .ptable 的基础样式写在它之后，同特异性下后写者胜，
+   移动端规则会被无声覆盖（症状：下拉框被挤成只剩箭头）。 */
+@media (max-width: 760px) {
+  /* 弹窗：满宽、内容超高时在窗内滚动、按钮等分 */
+  .modal-mask, .sheet-mask { padding: 10px; align-items: center; }
+  .modal, .modal.wide { width: 100%; max-width: 100%; max-height: calc(100vh - 20px); padding: 14px; }
+  .sheet { width: 100%; max-width: 100%; max-height: calc(100vh - 20px); padding: 14px 14px 18px; }
+  .modal h3 { font-size: 14.5px; }
+  .modal p { margin-bottom: 12px; }
+  .modal-actions { flex-wrap: wrap; gap: 10px; }
+  .modal-actions .btn { flex: 1 1 120px; justify-content: center; min-height: 38px; }
+  .modal-check { font-size: 12.5px; }
+
+  /* 日志筛选条：两个下拉各占半行（保住「最近 200 行」「全部级别」的文字），
+     关键字框与刷新按钮各占一行 */
+  .log-tools { gap: 6px; }
+  .log-tools select { flex: 1 1 40%; min-width: 0; }
+  .log-tools input { flex: 1 1 100%; min-width: 0; }
+  .log-tools .btn { flex: 1 1 100%; height: 34px; }
+  /* 手机看日志：长行折行，不用左右拖 */
+  .log-modal .log-pre {
+    font-size: 11px; height: 52vh; min-height: 0;
+    white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word;
+  }
+
+  /* 宽表格：把「操作」列钉在右侧，横滚到任何位置都能直接点 */
+  .ptable th:last-child, .ptable td:last-child {
+    position: sticky; right: 0; z-index: 2;
+    background: var(--card-solid);
+    box-shadow: -10px 0 12px -10px rgba(2, 8, 23, .45);
+  }
+  .ptable th:last-child { top: 0; z-index: 3; }
+  .ptable tbody tr:hover td:last-child { background: var(--card-solid); }
+}
