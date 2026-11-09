@@ -1693,6 +1693,46 @@ async function handle(req, res, pathname, query) {
     }
 
     // ── 进程追踪：只记录出现/消失，不执行任何命令 ────────────────────────
+    if (pathname === '/api/alerts/presets') {
+      // 规则模板：告警判据要填 metric/op/阈值/持续时长/冷却，手填容易填错方向
+      // （把「低于」填成「高于」这种）。给几个开箱可用的预设，点一下就落到表单里。
+      sendJSON(res, 200, {
+        presets: [
+          {
+            key: 'cpu-sustained', name: 'CPU 持续过高', metric: 'cpu', op: '>', threshold: 90,
+            durationSec: 180, cooldownSec: 900, level: 1,
+            desc: 'CPU 连续 3 分钟超过 90% 才提醒，避免瞬时尖峰刷屏',
+          },
+          {
+            key: 'mem-high', name: '内存使用率过高', metric: 'mem', op: '>', threshold: 90,
+            durationSec: 300, cooldownSec: 900, level: 1,
+            desc: '内存连续 5 分钟超过 90%',
+          },
+          {
+            key: 'swap-storm', name: 'Swap 使用率过高', metric: 'swap', op: '>', threshold: 50,
+            durationSec: 600, cooldownSec: 1800, level: 1,
+            desc: 'Swap 过半通常意味着内存不够，机器会明显卡',
+          },
+          {
+            key: 'disk-low', name: '磁盘空间不足', metric: 'disk', op: '>', threshold: 90,
+            durationSec: 600, cooldownSec: 3600, level: 2, needTarget: true,
+            desc: '指定挂载点使用率超过 90%（也就是可用不到一成）。磁盘满会让应用写日志失败、进程直接崩 —— 要盯多个卷就加多条',
+          },
+          {
+            key: 'oom', name: '发生 OOM 杀进程', metric: 'oom', op: '>', threshold: 0,
+            durationSec: 0, cooldownSec: 3600, level: 2,
+            desc: '内核因内存不足杀掉了进程，立即告警',
+          },
+          {
+            key: 'psi-mem', name: '内存压力过高', metric: 'psi_mem', op: '>', threshold: 10,
+            durationSec: 180, cooldownSec: 900, level: 1,
+            desc: '进程因内存不足开始排队等待（比「内存占用率」更早反映卡顿）',
+          },
+        ],
+      });
+      return;
+    }
+
     if (pathname === '/api/watches') {
       if (req.method === 'GET') {
         sendJSON(res, 200, {
@@ -1930,6 +1970,61 @@ async function handle(req, res, pathname, query) {
   }
 
   // ── 全部网络连接（不只是监听）────────────────────────────────────────────
+  if (pathname === '/api/users') {
+    // 按 UID 聚合：多用户 NAS 上「谁在吃资源」比「哪个进程在吃」更有意义
+    ensureFreshProcs();
+    const q = String(query.get('q') || '').toLowerCase().trim();
+    const cFilter = String(query.get('container') || '').toLowerCase().trim();
+    const pool = procs.filter((p) => {
+      if (cFilter && String((p.container && p.container.name) || '').toLowerCase() !== cFilter) return false;
+      if (!q) return true;
+      return String(p.name || '').toLowerCase().includes(q)
+        || String(p.cmd || '').toLowerCase().includes(q)
+        || String(p.user || '').toLowerCase().includes(q)
+        || String(p.pid) === q;
+    });
+    const byUser = new Map();
+    for (const p of pool) {
+      const key = p.user || '?';
+      let u = byUser.get(key);
+      if (!u) {
+        u = { user: key, uid: p.uid ?? null, procs: 0, cpuPct: 0, rss: 0, threads: 0, top: [] };
+        byUser.set(key, u);
+      }
+      u.procs += 1;
+      u.cpuPct += Number(p.cpuPct) || 0;
+      u.rss += Number(p.rss) || 0;
+      u.threads += Number(p.threads) || 0;
+      if (u.top.length < 5) u.top.push({ pid: p.pid, name: p.name, cpuPct: p.cpuPct, rss: p.rss });
+    }
+    const rows = [...byUser.values()].map((u) => ({
+      ...u,
+      cpuPct: r1(u.cpuPct),
+      top: u.top.sort((a, b) => (b.cpuPct - a.cpuPct) || (b.rss - a.rss)).slice(0, 5),
+    })).sort((a, b) => (b.cpuPct - a.cpuPct) || (b.rss - a.rss));
+    sendJSON(res, 200, { ts: Date.now(), total: rows.length, rows });
+    return;
+  }
+
+  if (pathname === '/api/io') {
+    // 磁盘 IO 排行：读 /proc/<pid>/io（每进程一个文件，400 个进程约 20ms）
+    ensureFreshProcs();
+    const rows = [];
+    for (const p of procs) {
+      // procIo() 自带 5 秒缓存，字段是 {read, write}（来自 read_bytes / write_bytes，
+      // 也就是真正落到磁盘的字节数，不是含页缓存的 rchar/wchar）
+      const io = procIo(p.pid);
+      if (!io) continue;
+      const rd = Number(io.read) || 0;
+      const wr = Number(io.write) || 0;
+      if (!rd && !wr) continue;
+      rows.push({ pid: p.pid, name: p.name, user: p.user, container: p.container ? p.container.name : '', rd, wr, total: rd + wr });
+    }
+    rows.sort((a, b) => b.total - a.total);
+    sendJSON(res, 200, { ts: Date.now(), total: rows.length, rows: rows.slice(0, 30) });
+    return;
+  }
+
   if (pathname === '/api/connections') {
     const stateFilter = String(query.get('state') || '').trim().toUpperCase();
     const pidFilter = num(query.get('pid')) || 0;

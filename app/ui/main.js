@@ -286,6 +286,11 @@ function renderKpis(s) {
 
   if (s.psi) renderPsi(s.psi);
   if (s.volumes) renderVolumes(s.volumes);
+  // IO 排行不跟着每秒刷：后端要读每个进程的 io 文件，30 秒一次足够看清趋势
+  if (!window.__ioTick || Date.now() - window.__ioTick > 30000) {
+    window.__ioTick = Date.now();
+    renderIo();
+  }
   $('ver').textContent = s.version;
   $('ts-line').textContent = '更新于 ' + new Date(s.ts).toLocaleTimeString();
   if (historyRange === '60s') {
@@ -404,6 +409,86 @@ function patchRow(p, r) {
     r.cmdEl.remove();
     r.cmdEl = null;
   }
+}
+
+// 磁盘 IO 排行：数据来自 /proc/<pid>/io，后端已排序取前 30
+async function renderIo() {
+    const tb = $('io-body');
+    if (!tb) return;
+    try {
+      const r = await fetch(API + '/io', { cache: 'no-store' });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const d = await r.json();
+      const rows = (d.rows || []).slice(0, 12);
+      tb.textContent = '';
+      const frag = document.createDocumentFragment();
+      for (const x of rows) {
+        const tr = el('tr');
+        const nm = el('td', 'pname');
+        nm.appendChild(el('span', 'nm', x.name));
+        nm.appendChild(el('span', 'cmd', `PID ${x.pid}`));
+        tr.appendChild(nm);
+        tr.appendChild(el('td', 'num mono', fmtBytes(x.rd)));
+        tr.appendChild(el('td', 'num mono', fmtBytes(x.wr)));
+        tr.appendChild(el('td', 'hide-sm', x.user || '—'));
+        tr.appendChild(el('td', 'hide-md hint', x.container || '—'));
+        frag.appendChild(tr);
+      }
+      tb.appendChild(frag);
+      if ($('io-empty')) $('io-empty').hidden = rows.length > 0;
+      if ($('io-hint')) {
+        $('io-hint').textContent = rows.length
+          ? `读写累计最多的 ${rows.length} 个进程 · 共 ${d.total} 个有 IO`
+          : '—';
+      }
+    } catch (e) {
+      console.warn('[io] 读取失败:', e.message);
+      if ($('io-hint')) $('io-hint').textContent = '读取失败';
+    }
+  }
+
+// 按用户聚合视图：多用户 NAS 上「谁在吃资源」比「哪个进程」更直接。
+// 数据由后端 /api/users 聚合（同一份进程快照，不额外扫 /proc）。
+async function renderUsers() {
+  const tb = $('userbody');
+  if (!tb) return;
+  const r = await fetch(API + '/users?q=' + encodeURIComponent(query || '')
+    + (containerFilter ? '&container=' + encodeURIComponent(containerFilter) : ''), { cache: 'no-store' });
+  if (!r.ok) throw new Error('用户聚合请求失败: HTTP ' + r.status);
+  const d = await r.json();
+  let rows = d.rows || [];
+  // 搜索词在后端只对进程过滤，这里按用户/进程名再过一遍，语义才和列表视图一致
+  if (query) {
+    const q = query.toLowerCase();
+    rows = rows.filter((u) => u.user.toLowerCase().includes(q)
+      || u.top.some((t) => String(t.name || '').toLowerCase().includes(q)));
+  }
+  tb.textContent = '';
+  const frag = document.createDocumentFragment();
+  const maxCpu = Math.max(1, ...rows.map((u) => u.cpuPct));
+  for (const u of rows) {
+    const tr = el('tr');
+    const nmTd = el('td', 'pname');
+    nmTd.appendChild(el('span', 'nm', u.user));
+    if (u.uid != null) nmTd.appendChild(el('span', 'cmd', 'uid ' + u.uid));
+    tr.appendChild(nmTd);
+    tr.appendChild(el('td', 'num mono', u.procs));
+    const cpuTd = el('td', 'num mono');
+    cpuTd.appendChild(el('span', 'cpuval', fmtPct(u.cpuPct)));
+    // 用一条细条表示相对占比，一眼看出「谁是大头」，不必逐个读数字
+    const bar = el('span', 'user-bar');
+    bar.style.width = Math.max(2, Math.round((u.cpuPct / maxCpu) * 46)) + 'px';
+    cpuTd.appendChild(bar);
+    tr.appendChild(cpuTd);
+    tr.appendChild(el('td', 'num mono', fmtBytes(u.rss)));
+    tr.appendChild(el('td', 'num mono hide-sm', u.threads));
+    const topTd = el('td', 'hide-md hint');
+    topTd.textContent = u.top.slice(0, 3).map((t) => `${t.name}(${t.pid})`).join('、') || '—';
+    tr.appendChild(topTd);
+    frag.appendChild(tr);
+  }
+  tb.appendChild(frag);
+  if ($('user-empty')) $('user-empty').hidden = rows.length > 0;
 }
 
 function renderTable(rows) {
@@ -916,6 +1001,44 @@ async function loadAlertEvents() {
 }
 
 // 规则编辑弹窗
+// 告警模板：判据要填 metric/op/阈值/持续/冷却，手填容易把「低于」填成「高于」。
+// 给几个开箱可用的预设，点一下整组填进表单（仍可继续改）。
+let alertPresets = [];
+async function loadPresets() {
+  if (alertPresets.length) return alertPresets;
+  try {
+    const r = await fetch(API + '/alerts/presets', { cache: 'no-store' });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const d = await r.json();
+    alertPresets = d.presets || [];
+    const box = $('preset-chips');
+    if (box && !box.childElementCount) {
+      for (const p of alertPresets) {
+        const b = el('button', 'preset-chip', p.name);
+        b.type = 'button';
+        b.dataset.preset = p.key;
+        b.title = p.desc || '';
+        box.appendChild(b);
+      }
+    }
+  } catch (e) { console.warn('[presets]', e.message); }
+  return alertPresets;
+}
+
+function applyPreset(key) {
+  const p = alertPresets.find((x) => x.key === key);
+  if (!p) return;
+  $('af-name').value = p.name;
+  $('af-metric').value = p.metric;
+  $('af-threshold').value = String(p.threshold);
+  $('af-duration').value = String(p.durationSec);
+  $('af-cooldown').value = String(p.cooldownSec);
+  $('af-level').value = String(p.level);
+  if (p.needTarget) { $('af-target').value = ''; $('af-target').focus(); }
+  syncAlertForm();
+  if ($('af-hint')) $('af-hint').textContent = p.desc || '';
+}
+
 function openAlertModal(rule) {
   editingAlertId = rule ? rule.id : 0;
   $('alert-modal-title').textContent = rule ? `编辑规则 #${rule.id}` : '新建告警规则';
@@ -940,7 +1063,8 @@ function openAlertModal(rule) {
   $('af-target').value = r.target || '';
   syncAlertForm();
   showMask($('alert-mask'));
-}
+  loadPresets();          // 首次打开时拉模板（失败也不影响手工填写）
+  }
 
 function closeAlertModal() {
   closeMask($('alert-mask'));
@@ -1583,10 +1707,42 @@ async function loadBoot() {
       $('boot-pre').textContent = [d.raw || '', '', '耗时最长的服务（systemd-analyze blame）：']
         .concat(d.blame || []).join('\n').trim();
     }
+    renderBootBars(d.kernelSec, d.userspaceSec, d.blame || []);
   } catch (e) {
     console.warn('[boot] 读取失败:', e.message);
     if ($('boot-hint')) $('boot-hint').textContent = '读取失败';
   }
+}
+
+// 开机耗时：把 «12.3s nginx.service» 这样的行画成横向条形，
+// 纯文本列表看不出「第二名其实只有第一名的一半」，条形一眼就有比例感。
+function renderBootBars(kernelSec, userspaceSec, blame) {
+  const box = $('boot-bars');
+  if (!box) return;
+  box.textContent = '';
+  const items = [];
+  for (const line of blame) {
+    const m = String(line).match(/^([\d.]+)(ms|s|min)\s+(.+)$/);
+    if (!m) continue;
+    let sec = Number(m[1]);
+    if (m[2] === 'ms') sec /= 1000;
+    else if (m[2] === 'min') sec *= 60;
+    if (!Number.isFinite(sec) || sec <= 0) continue;
+    items.push({ sec, unit: m[3].trim() });
+  }
+  // 内核 / 用户空间也放进同一条比例尺里，方便对照「总时间花在哪一段」
+  if (Number(kernelSec) > 0) items.unshift({ sec: Number(kernelSec), unit: '内核启动', cls: 'k' });
+  const max = Math.max(1, ...items.map((x) => x.sec));
+  for (const it of items.slice(0, 12)) {
+    const row = el('div', 'boot-row');
+    const nm = el('span', 'boot-name' + (it.cls ? ' ' + it.cls : ''), it.unit);
+    const bar = el('span', 'boot-bar' + (it.cls ? ' ' + it.cls : ''));
+    bar.style.width = Math.max(2, Math.round((it.sec / max) * 100)) + '%';
+    const val = el('span', 'boot-sec mono', it.sec >= 10 ? `${it.sec.toFixed(1)}s` : `${(Math.round(it.sec * 100) / 100)}s`);
+    row.append(nm, bar, val);
+    box.appendChild(row);
+  }
+  if (!items.length) box.appendChild(el('span', 'hint', '没有可用的开机耗时数据'));
 }
 
 // ── 一级 tab（功能分类）──────────────────────────────────────────────────
@@ -1611,10 +1767,12 @@ function setTab(name) {
 
 // 「进程」tab 内的子视图
 function setView(v) {
-  processView = v === 'tree' ? 'tree' : 'list';
+  processView = (v === 'tree' || v === 'user') ? v : 'list';
   for (const b of $('views').querySelectorAll('.vbtn')) b.classList.toggle('active', b.dataset.view === processView);
   $('view-list').hidden = processView !== 'list';
   $('view-tree').hidden = processView !== 'tree';
+  if ($('view-user')) $('view-user').hidden = processView !== 'user';
+  if (processView === 'user') $('batch-bar').hidden = true;   // 按用户视图里没有可勾选的行
   $('cfilter').hidden = !containerFilter;
   $('cfilter-name').textContent = containerFilter || '—';
   if (currentTab !== 'process') return setTab('process');
@@ -1647,6 +1805,7 @@ async function refreshView() {
     if (seq !== refreshSeq) return;
     rowsCache = d.rows || [];
     if (processView === 'tree') renderTree(rowsCache);
+    else if (processView === 'user') await renderUsers();
     else renderTable(rowsCache);
     updateBadges(rowsCache.length);
   } catch (e) {
@@ -2258,6 +2417,10 @@ function bindEvents() {
   $('alert-save').addEventListener('click', saveAlert);
   $('alert-test').addEventListener('click', testAlert);
   $('af-metric').addEventListener('change', syncAlertForm);
+  $('preset-chips').addEventListener('click', (e) => {
+    const b = e.target.closest('button[data-preset]');
+    if (b) applyPreset(b.dataset.preset);
+  });
   $('alert-mask').addEventListener('click', (e) => { if (e.target === $('alert-mask')) closeAlertModal(); });
   $('alert-level-filter').addEventListener('change', () => loadAlertEvents());
   $('alert-events-refresh').addEventListener('click', () => loadAlertEvents());

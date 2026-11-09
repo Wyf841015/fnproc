@@ -147,6 +147,18 @@
         <div class="card-head"><h2>卷用量</h2><span class="hint" id="vol-hint">—</span></div>
         <div class="vol-list" id="vol-list"><span class="hint">加载中…</span></div>
       </article>
+      <article class="card">
+        <div class="card-head"><h2>磁盘 IO 排行</h2><span class="hint" id="io-hint">—</span></div>
+        <div class="table-wrap">
+          <table class="ptable io-table">
+            <thead>
+              <tr><th>进程</th><th class="num">读</th><th class="num">写</th><th class="hide-sm">用户</th><th class="hide-md">容器</th></tr>
+            </thead>
+            <tbody id="io-body"></tbody>
+          </table>
+          <div class="empty" id="io-empty" hidden>这段时间没有明显的磁盘读写</div>
+        </div>
+      </article>
     </div>
   </section>
 
@@ -157,6 +169,7 @@
         <div class="views" id="views">
           <button class="vbtn active" data-view="list" type="button">列表</button>
           <button class="vbtn" data-view="tree" type="button">树</button>
+          <button class="vbtn" data-view="user" type="button">按用户</button>
         </div>
         <div class="procs-tools">
           <div class="search">
@@ -212,6 +225,23 @@
           <tbody id="ptbody"></tbody>
         </table>
         <div class="empty" id="empty" hidden>没有匹配的进程</div>
+      </div>
+
+      <div class="table-wrap" id="view-user" hidden>
+        <table class="ptable">
+          <thead>
+            <tr>
+              <th>用户</th>
+              <th class="num">进程数</th>
+              <th class="num">CPU%</th>
+              <th class="num">内存</th>
+              <th class="num hide-sm">线程</th>
+              <th class="hide-md">占用最高的进程</th>
+            </tr>
+          </thead>
+          <tbody id="userbody"></tbody>
+        </table>
+        <div class="empty" id="user-empty" hidden>没有数据</div>
       </div>
 
       <div class="table-wrap" id="view-tree" hidden>
@@ -291,7 +321,7 @@
         <span class="hint">按 docker 容器聚合进程占用</span>
       </div>
       <div class="table-wrap">
-        <table class="ptable">
+        <table class="ptable cardify">
           <thead>
             <tr>
               <th>容器</th>
@@ -327,7 +357,7 @@
         </div>
       </div>
       <div class="table-wrap">
-        <table class="ptable">
+        <table class="ptable cardify">
           <thead>
             <tr>
               <th class="pickcol" title="关注的服务会排在最前">关注</th>
@@ -369,7 +399,8 @@
         <article class="card">
         <details class="timers-block">
         <summary><h2>开机耗时</h2><span class="hint" id="boot-hint">—</span></summary>
-        <pre class="log-pre" id="boot-pre" style="max-height:260px">加载中…</pre>
+        <div class="boot-bars" id="boot-bars"></div>
+        <pre class="log-pre" id="boot-pre" style="max-height:200px">加载中…</pre>
         </details>
         </article>
         </section>
@@ -626,6 +657,10 @@
 <div class="modal-mask" id="alert-mask" hidden>
   <div class="modal wide" role="dialog" aria-modal="true" aria-label="告警规则">
     <h3 id="alert-modal-title">新建告警规则</h3>
+    <div class="preset-row">
+      <span class="hint">快速套用：</span>
+      <div class="preset-chips" id="preset-chips"></div>
+    </div>
     <div class="alert-form">
       <label class="fld"><span>名称</span><input id="af-name" type="text" maxlength="60" placeholder="例如：内存持续过高"></label>
       <label class="fld"><span>判据</span><select id="af-metric"></select></label>

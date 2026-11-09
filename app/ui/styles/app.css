@@ -726,3 +726,76 @@ select {
 .watch-events-block h3 { margin: 10px 0 6px; font-size: 14px; }
 .row-dim td { opacity: .6; }
 
+/* ── 按用户聚合 ───────────────────────────────────────── */
+.user-bar {
+  display: inline-block; height: 6px; margin-left: 8px; border-radius: 999px;
+  background: linear-gradient(90deg, rgba(56,189,248,.85), rgba(56,189,248,.35));
+  vertical-align: middle;
+}
+
+/* ── 磁盘 IO 排行 ─────────────────────────────────────── */
+.io-table td { white-space: nowrap; }
+
+/* ── 告警模板 ─────────────────────────────────────────── */
+.preset-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 4px 0 10px; }
+.preset-chips { display: flex; gap: 6px; flex-wrap: wrap; }
+.preset-chip {
+  border: 1px solid var(--line); background: var(--bg-2); color: var(--text-dim);
+  border-radius: 999px; padding: 4px 11px; font-size: 12px; cursor: pointer;
+  transition: color .15s, border-color .15s, background .15s;
+}
+.preset-chip:hover { color: var(--accent); border-color: var(--accent); background: rgba(56,189,248,.10); }
+
+/* ── 开机耗时条形图 ───────────────────────────────────── */
+.boot-bars { display: flex; flex-direction: column; gap: 5px; margin: 6px 0 10px; }
+.boot-row { display: grid; grid-template-columns: minmax(120px, 34%) 1fr auto; align-items: center; gap: 8px; }
+.boot-name { font-size: 12px; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.boot-name.k { color: var(--accent); font-weight: 600; }
+.boot-bar {
+  height: 8px; border-radius: 999px; min-width: 2px;
+  background: linear-gradient(90deg, rgba(52,211,153,.85), rgba(52,211,153,.30));
+}
+.boot-bar.k { background: linear-gradient(90deg, rgba(56,189,248,.9), rgba(56,189,248,.35)); }
+.boot-sec { font-size: 12px; color: var(--text-mute); }
+
+/* ── 移动端：容器 / 服务表改卡片式 ──────────────────────────────────────
+   360 屏上横向滚动找按钮很难用。只对「列少、语义清晰」的容器表与服务表
+   做卡片化；进程表列多，摊成卡片后信息密度反而更差，它继续用表格 +
+   操作列钉右（见上方 760 断点的 .ptable td:last-child sticky）。 */
+@media (max-width: 560px) {
+  .ptable.cardify thead { display: none; }
+  .ptable.cardify tbody tr {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    gap: 4px 8px;
+    padding: 10px;
+    border-bottom: 1px solid var(--line);
+    align-items: center;
+  }
+  .ptable.cardify tbody td {
+    display: block; padding: 0; border: none;
+    white-space: normal; min-width: 0;
+    grid-column: 1 / -1;          /* 默认独占一行 */
+  }
+  .ptable.cardify tbody td.num { text-align: left; }
+  /* 行首：关注星（服务表才有）或名称 */
+  .ptable.cardify tbody td.pickcol { grid-column: 1; grid-row: 1; }
+  .ptable.cardify tbody td.pname,
+  .ptable.cardify tbody td.svc-name {
+    grid-column: 2; grid-row: 1;
+    padding-left: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  /* 操作按钮独占一行靠左：服务行最多有 4 个按钮（启动/重启/停止/日志/自启），
+     塞在名称右侧会在 360 屏上贴到一起，且各行右边界参差不齐 */
+  .ptable.cardify tbody td.act {
+    grid-column: 1 / -1; grid-row: auto;
+    justify-self: stretch; align-self: center;
+    display: flex; gap: 6px; flex-wrap: wrap;
+    margin-top: 2px;
+  }
+  .ptable.cardify tbody td.act .btn { flex: 0 0 auto; min-height: 30px; }
+  .ptable.cardify tbody td.hide-sm,
+  .ptable.cardify tbody td.hide-md { display: none; }
+  .ptable.cardify .pname .cmd { white-space: normal; overflow-wrap: anywhere; }
+  .ptable.cardify .svc-desc { display: none; }
+}
