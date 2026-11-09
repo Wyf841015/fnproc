@@ -29,14 +29,18 @@
                 ]
             },
             {
-                "type": "checkbox",
+                "type": "radio",
                 "field": "wizard_clear_notify",
-                "label": "同时清理本应用产生的桌面通知",
-                "initValue": "true",
+                "label": "桌面通知",
+                "initValue": "yes",
                 "options": [
                     {
-                        "label": "删除「进程管家」在系统通知中心留下的告警通知（卸载后这些通知点了也无处可去）",
-                        "value": "true"
+                        "label": "同时清理系统通知中心里的告警通知（卸载后这些通知点了也无处可去）",
+                        "value": "yes"
+                    },
+                    {
+                        "label": "保留这些通知，稍后自己处理",
+                        "value": "no"
                     }
                 ]
             },
