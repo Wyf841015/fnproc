@@ -1852,6 +1852,55 @@ async function handle(req, res, pathname, query) {
     return;
   }
 
+  // ── 审计重放 ────────────────────────────────────────────────────────────
+  // 只放行「服务启停」这一类幂等动作。
+  // 为什么不做通用重放：重放一条 kill 就是真的再杀一次进程，重放一条
+  // service.enable 会改开机自启状态 —— 这些都需要人在现场判断「现在还是不是
+  // 当时那个情况」。启停是显式、可逆、且不改变持久配置的，重放才有意义。
+  if (pathname === '/api/audit/replay' && req.method === 'POST') {
+    const body = await readBody(req, res);
+    if (!body) return;
+    const client = clientOf(req);
+    const row = auditStore.getById(body.id);
+    if (!row) {
+      sendJSON(res, 404, { error: '找不到这条审计记录' });
+      return;
+    }
+    const REPLAYABLE = new Set(['service.start', 'service.stop', 'service.restart']);
+    if (!REPLAYABLE.has(String(row.action))) {
+      auditRecord({
+        action: 'service.replay', target: String(row.target || ''), result: 'rejected',
+        message: `不允许重放 ${row.action}（只支持服务启停）`, client,
+      });
+      sendJSON(res, 400, {
+        error: `只支持重放服务启动 / 停止 / 重启；「${row.action}」不提供重放`,
+        replayable: [...REPLAYABLE],
+      });
+      return;
+    }
+    if (String(row.result) !== 'ok') {
+      sendJSON(res, 400, { error: '只能重放当时执行成功的操作' });
+      return;
+    }
+    const act = String(row.action).slice('service.'.length);
+    const name = String(row.target || '');
+    const rr = await runServiceAction(name, act);
+    if (!rr.ok) {
+      const id = auditRecord({
+        action: 'service.replay', target: name, result: rr.kind || 'error',
+        message: `重放 #${row.id} 的 ${act} 失败: ${rr.error}`, client,
+      });
+      sendJSON(res, 400, { error: rr.error, id });
+      return;
+    }
+    const id = auditRecord({
+      action: 'service.replay', target: name, result: 'ok',
+      message: `重放 #${row.id} 的 ${row.action}`, client,
+    });
+    sendJSON(res, 200, { success: true, id, name, action: act, replayed: row.id });
+    return;
+  }
+
   // ── 告警：规则与事件 ────────────────────────────────────────────────────
   if (pathname === '/api/alerts' && req.method === 'GET') {
     sendJSON(res, 200, {
@@ -2592,7 +2641,7 @@ async function handle(req, res, pathname, query) {
     '/api/alerts/delete', '/api/alerts/test', '/api/watchdogs', '/api/watchdogs/delete',
     '/api/snapshot', '/api/snapshot/delete', '/api/container/action', '/api/tune',
     '/api/watches', '/api/watches/delete', '/api/service/pin', '/api/kill/batch',
-    '/api/settings']);
+    '/api/settings', '/api/audit/replay']);
   if (POST_ONLY.has(pathname)) {
     sendJSON(res, 405, { error: '该接口只接受 POST' });
     return;

@@ -811,3 +811,14 @@ select {
 .snap-auto-row .fld input[type="number"] { width: 88px; }
 .snap-auto-row .fld.chk { align-self: center; }
 .footer #btn-diagnose { margin-left: auto; }
+
+/* ── 审计行「重做」按钮 ───────────────────────────────── */
+.audit-replay {
+  margin-left: 6px;
+  padding: 1px 8px;
+  font-size: 11px;
+  line-height: 18px;
+  min-height: 0;
+  flex: 0 0 auto;
+}
+.audit li { align-items: center; }

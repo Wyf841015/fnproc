@@ -2253,6 +2253,7 @@ const ACTION_LABEL = {
 const RESULT_LABEL = { ok: '成功', rejected: '拒绝', error: '失败' };
 
 const auditState = { page: 0, pageSize: 50, action: '', result: '', q: '', total: 0 };
+let auditRowsCache = [];        // 当前页记录，供「重做」按钮查原记录做二次确认文案
 
 function fmtAuditTime(ts) {
   const t = new Date(ts);
@@ -2290,9 +2291,40 @@ async function loadAudit() {
   }
 }
 
+// 可重放的审计动作白名单（与后端 REPLAYABLE 保持一致）
+const REPLAYABLE_ACTIONS = new Set(['service.start', 'service.stop', 'service.restart']);
+
+function replayAudit(id) {
+  const row = (auditRowsCache || []).find((a) => String(a.id) === String(id));
+  const what = row ? `${actionLabel(row.action)} ${row.target}` : `#${id}`;
+  // confirmModal 是回调式（第 4 个参数才是确认后要做的事），不是 Promise
+  confirmModal(
+    '重做这个操作？',
+    `将重新执行一次：${what}\n\n执行时会重新走一遍完整校验（关键服务仍然只能启动）。`,
+    '执行',
+    async () => {
+      try {
+        const res = await fetch(API + '/audit/replay', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: Number(id) }),
+        });
+        const d = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(d.error || ('HTTP ' + res.status));
+        toast(`已重做：${d.action} ${d.name}`, 'ok');
+        loadAudit();
+        loadServices();
+      } catch (e) {
+        toast('重做失败：' + e.message, 'error');
+        loadAudit();
+      }
+    },
+  );
+}
+
 function renderAudit(d) {
   const ul = $('audit');
   const rows = d.actions || [];
+  auditRowsCache = rows;
   ul.textContent = '';
 
   // 顶部一行汇总：总数 + 结果分布 + 库状态
@@ -2336,6 +2368,15 @@ function renderAudit(d) {
       el('span', 'audit-res ' + a.result, RESULT_LABEL[a.result] || a.result),
     );
     li.title = `${new Date(a.ts).toLocaleString()}  ${actionLabel(a.action)}  ${main}\n${a.message || ''}\nclient: ${a.client || '-'}`;
+    // 只有「服务启停且当时成功」的记录可重放。
+    // 通用重放不可行：重放 kill 就是再杀一次进程，重放 service.enable 会改自启状态。
+    if (a.result === 'ok' && REPLAYABLE_ACTIONS.has(a.action)) {
+      const btn = el('button', 'btn tiny ghost audit-replay', '重做');
+      btn.type = 'button';
+      btn.dataset.replay = String(a.id);
+      btn.title = `重新执行一次：${actionLabel(a.action)} ${a.target}`;
+      li.appendChild(btn);
+    }
     ul.appendChild(li);
   }
 
@@ -2430,6 +2471,13 @@ function bindEvents() {
   if ($('audit-refresh')) $('audit-refresh').onclick = () => loadAudit();
   if ($('audit-prev')) $('audit-prev').onclick = () => { if (auditState.page > 0) { auditState.page -= 1; loadAudit(); } };
   if ($('audit-next')) $('audit-next').onclick = () => { auditState.page += 1; loadAudit(); };
+  // 重做按钮：用 DOM0 委托（fnOS WebView 对 addEventListener 不稳，见项目历史教训）
+  if ($('audit')) {
+    $('audit').onclick = (e) => {
+      const btn = e.target && e.target.closest ? e.target.closest('button[data-replay]') : null;
+      if (btn) { e.preventDefault(); replayAudit(btn.dataset.replay); }
+    };
+  }
   if ($('audit-q')) {
     let t = null;
     $('audit-q').oninput = (e) => {

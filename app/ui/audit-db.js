@@ -152,6 +152,14 @@ export function openAuditStore(dbPath, { version = '' } = {}) {
     return JSON.stringify({ _truncated: true, preview: s.slice(0, 3800) });
   }
 
+  // 按 id 取单条：审计重放要用它拿到「当时到底做了什么」（action/target/result）
+  function getById(id) {
+    if (!db) return null;
+    try {
+      return db.prepare('SELECT * FROM audit WHERE id = ?').get(Number(id) || 0) || null;
+    } catch { return null; }
+  }
+
   function list({ limit = 50, offset = 0, q = '', action = '', result = '', since = 0 } = {}) {
     if (!db) {
       const rows = pending.slice().reverse().map((r, i) => toLegacy({ ...r, id: pending.length - i }));
@@ -230,5 +238,5 @@ export function openAuditStore(dbPath, { version = '' } = {}) {
     db = null;
   }
 
-  return { record, list, stats, health, close, get enabled() { return !!db; } };
+  return { record, list, getById, stats, health, close, get enabled() { return !!db; } };
 }
