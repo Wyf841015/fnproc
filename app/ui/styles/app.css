@@ -694,6 +694,11 @@ select {
   }
   .ptable th:last-child { top: 0; z-index: 3; }
   .ptable tbody tr:hover td:last-child { background: var(--card-solid); }
+
+  /* 批量操作条与勾选列：窄屏改竖排，按钮等分 */
+  .batch-bar { flex-direction: column; align-items: stretch; gap: 8px; }
+  .batch-actions .btn { flex: 1 1 auto; }
+  .pickcol { width: 30px; }
 }
 
 /* ── 批量处置 ─────────────────────────────────────────── */
@@ -721,8 +726,3 @@ select {
 .watch-events-block h3 { margin: 10px 0 6px; font-size: 14px; }
 .row-dim td { opacity: .6; }
 
-@media (max-width: 760px) {
-  .batch-bar { flex-direction: column; align-items: stretch; gap: 8px; }
-  .batch-actions .btn { flex: 1 1 auto; }
-  .pickcol { width: 30px; }
-}
