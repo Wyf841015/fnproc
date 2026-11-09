@@ -610,6 +610,18 @@ select {
 .timers-block[open] > summary::before { content: '▾'; }
 .timers-block > summary h2 { margin: 0; font-size: 14px; }
 
+/* systemd 服务：改成和定时器一样的可折叠块后，状态筛选单独占一行 */
+.svc-filter-row {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 0 0 8px;
+}
+.svc-filter-row select {
+  padding: 4px 8px; font-size: 12px; border-radius: var(--radius-sm);
+  border: 1px solid var(--line); background: var(--bg-2); color: var(--text);
+}
+/* 折叠起来时不要留下空白内边距 */
+.timers-block:not([open]) > *:not(summary) { display: none; }
+
 /* ── PSI 压力 / 卷用量 ───────────────────────────────────── */
 .extra-row { margin-top: 12px; }
 .psi-grid { display: grid; gap: 10px; }

@@ -344,17 +344,15 @@
   <!-- ── 服务 ── -->
   <section class="tab-panel" id="panel-services" role="tabpanel" hidden>
     <article class="card">
-      <div class="card-head panel-head">
-        <h2>systemd 服务</h2>
-        <div class="procs-tools">
-          <span class="hint" id="svc-counts">—</span>
-          <select id="svc-state" title="状态筛选">
-            <option value="">全部状态</option>
-            <option value="running">运行中</option>
-            <option value="stopped">未运行</option>
-            <option value="failed">失败</option>
-          </select>
-        </div>
+      <details class="timers-block" id="services-block" open>
+      <summary><h2>systemd 服务</h2><span class="hint" id="svc-counts">—</span></summary>
+      <div class="svc-filter-row">
+        <select id="svc-state" title="状态筛选">
+          <option value="">全部状态</option>
+          <option value="running">运行中</option>
+          <option value="stopped">未运行</option>
+          <option value="failed">失败</option>
+        </select>
       </div>
       <div class="table-wrap">
         <table class="ptable cardify">
@@ -371,6 +369,7 @@
         </table>
         <div class="empty" id="services-empty" hidden>没有匹配的服务</div>
         </div>
+        </details>
         </article>
         <article class="card">
         <details class="timers-block">
